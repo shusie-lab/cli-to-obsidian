@@ -1,6 +1,6 @@
 # cli-to-obsidian
 
-Antigravity、Codex、Claude Code の会話履歴を、MarkdownファイルとしてObsidian保管庫へ保存するmacOS向けhookスクリプト群です。各スクリプトは標準ライブラリだけで動作する単一ファイルです。
+Antigravity、Codex、Claude Code、OpenCode の会話履歴を、MarkdownファイルとしてObsidian保管庫へ保存するmacOS向けhookスクリプト群です。各スクリプトは標準ライブラリだけで動作する単一ファイルです。
 
 > [!NOTE]
 > このプロジェクトは各CLI、ChatGPT、Antigravity、Claude CodeおよびObsidianの非公式ツールです。各サービスの開発元とは関係ありません。
@@ -10,6 +10,7 @@ Antigravity、Codex、Claude Code の会話履歴を、Markdownファイルと�
 - Codex CLIと、ChatGPTデスクトップアプリ内のCodexセッションに対応
 - Antigravity CLIとAntigravityアプリに対応
 - Claude Code CLIに対応
+- OpenCode の会話完了プラグイン（`chat.message`、`experimental.text.complete`、`session.idle`）に対応
 - 会話本文だけを抽出し、ツール実行結果などのノイズを除いて保存
 - ObsidianのYAML frontmatter、見出し、Calloutを使った読みやすい出力
 - Codexでは、会話ごとのquota変化とセッション全体のweekly quota消費量を記録
@@ -22,6 +23,7 @@ Antigravity、Codex、Claude Code の会話履歴を、Markdownファイルと�
 | Codex | 対応 | ChatGPTデスクトップアプリ内のCodexに対応 | 対応 |
 | Antigravity | 対応 | Antigravityアプリに対応 | なし |
 | Claude Code | 対応 | — | なし |
+| OpenCode | 対応（プラグイン） | 対応 | なし |
 
 ChatGPTの一般的な会話を保存する機能ではありません。対応するのは、ChatGPTデスクトップアプリ内で実行されるCodexセッションです。
 
@@ -36,10 +38,10 @@ Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_lim
 
 ## インストール元の取得
 
-リリース版の利用を推奨します。次の例では`v1.0.0`を取得します。
+リリース版の利用を推奨します。次の例では`v1.1.0`を取得します。
 
 ```bash
-git clone --branch v1.0.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
+git clone --branch v1.1.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
 cd cli-to-obsidian
 ```
 
@@ -148,6 +150,20 @@ cp claude_save.py ~/.claude/claude-obsidian/scripts/claude_save.py
 }
 ```
 
+## OpenCode
+
+OpenCode は会話完了プラグインから保存スクリプトへ渡します。`chat.message` と `experimental.text.complete` で単発実行の応答も保存し、`session.idle` で SDK から全履歴を再同期します。グローバルプラグインとして設置すると、OpenCode の全プロジェクトで有効になります。
+
+```bash
+mkdir -p ~/.config/opencode/scripts ~/.config/opencode/plugins
+cp opencode_save.py ~/.config/opencode/scripts/opencode_save.py
+cp opencode_obsidian.js ~/.config/opencode/plugins/opencode_obsidian.js
+```
+
+OpenCode を再起動するとプラグインが読み込まれます。`OBSIDIAN_VAULT` と `OBSIDIAN_OUTPUT_DIR` は OpenCode 起動時の環境変数を引き継ぎます。保存先は `生成AI/ChatLog/opencode/` です。
+
+保存スクリプトを別の場所へ置く場合は、プラグイン起動前に `OPENCODE_OBSIDIAN_SAVE_SCRIPT` へ絶対パスを指定してください。既定値は `~/.config/opencode/scripts/opencode_save.py` です。
+
 ## 出力例
 
 ```markdown
@@ -181,6 +197,12 @@ quota: 3.00
 > 問題を確認しました。原因は...
 ```
 
+ChatGPTからWorkへ移行した際に生成される構造化されたユーザー入力は、先頭が
+`## Referenced ChatGPT conversation:` または `# Files mentioned by the user:` で、
+コードフェンス外に `## My request:` が1つあり、後続本文が空でない場合に限って表示を分けます。
+依頼本文は通常のUser QUESTION calloutへ表示し、前置きの参照情報は内容を解釈せず、
+折りたたみ式の「参照情報（原文）」INFO calloutへ保存します。条件が曖昧な入力は従来どおり全文を保存します。
+
 AntigravityとClaude Codeの新規出力にはquota情報は含まれません。過去にquota対応版で保存したMarkdownのquota記録は、履歴情報として削除されません。
 
 ## 動作確認とトラブルシューティング
@@ -199,7 +221,7 @@ AntigravityとClaude Codeの新規出力にはquota情報は含まれません�
 
 ```bash
 /usr/bin/python3 -m unittest discover -s tests -v
-/usr/bin/python3 -X pycache_prefix=/tmp/cli_obsidian_save_pycache -m py_compile agy_save.py codex_save.py claude_save.py
+/usr/bin/python3 -X pycache_prefix=/tmp/cli_obsidian_save_pycache -m py_compile agy_save.py codex_save.py claude_save.py opencode_save.py
 ```
 
 テストでは、通常の追記、Codex quotaの解析と更新、連続発言の集約に加えて、cursor復旧、state消失時の既存Markdown再利用、書き込み途中のJSONL最終行の再試行、YAML文字列とstateファイル名の安全化、保存先相対パスの検証を確認しています。

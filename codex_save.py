@@ -8,7 +8,7 @@ Codex CLI の会話履歴を Obsidian に自動保存するフックスクリプ
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import json
 import re
@@ -58,6 +58,13 @@ LAST_LINE_PATTERN = re.compile(r"<!--\s*last_line:\s*(\d+)\s*-->")
 AGENT_NAME = "Codex"
 SAFE_SESSION_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 PROJECTLESS_LABEL = "projectless"
+STRUCTURED_USER_HEADERS = (
+    "## Referenced ChatGPT conversation:",
+    "# Files mentioned by the user:",
+)
+STRUCTURED_REQUEST_MARKER = "## My request:"
+REFERENCE_CALLOUT_HEADER = "> [!INFO]- 参照情報（原文）"
+MARKDOWN_FENCE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 # ============================================================
 # ロギング
@@ -270,6 +277,101 @@ def callout_lines(text: str) -> str:
         return line
 
     return "\n".join(f"> {_escape_line(line)}" if line else ">" for line in text.split("\n"))
+
+
+def _strip_blockquote_prefix(line: str) -> str:
+    """Markdownの通常行またはblockquote内行からblockquote記号を除く。"""
+    candidate = line.rstrip("\r\n")
+    while True:
+        match = re.match(r"^ {0,3}>[ \t]?", candidate)
+        if not match:
+            return candidate
+        candidate = candidate[match.end():]
+
+
+def _fence_marker(line: str) -> tuple[str, int, str] | None:
+    """行のMarkdownコードフェンスを、blockquote内も含めて返す。"""
+    match = MARKDOWN_FENCE_PATTERN.match(_strip_blockquote_prefix(line))
+    if not match:
+        return None
+    fence = match.group(1)
+    return fence[0], len(fence), match.group(2)
+
+
+def _iter_lines_outside_fences(text: str):
+    """Markdownコードフェンス内を除いた行を順に返す。"""
+    active_fence = None
+    for line in text.splitlines():
+        marker = _fence_marker(line)
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
+            continue
+        if marker is not None:
+            active_fence = marker[:2]
+            continue
+        yield line
+
+
+def split_structured_user_message(text: str) -> tuple[str, str | None]:
+    """既知形式の移行メッセージを依頼本文と前置き原文へ分ける。
+
+    構造を確実に確認できない場合は、入力全体を従来どおりの本文として返す。
+    """
+    lines = text.splitlines(keepends=True)
+    first_nonempty = next(
+        (line.rstrip("\r\n") for line in lines if line.rstrip("\r\n").strip()),
+        "",
+    )
+    if first_nonempty not in STRUCTURED_USER_HEADERS:
+        return text, None
+
+    marker_positions = []
+    active_fence = None
+    offset = 0
+    for line in lines:
+        content = line.rstrip("\r\n")
+        marker = _fence_marker(line)
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
+        elif content == STRUCTURED_REQUEST_MARKER:
+            marker_positions.append((offset, offset + len(line)))
+        elif marker is not None:
+            active_fence = marker[:2]
+        offset += len(line)
+
+    if len(marker_positions) != 1:
+        return text, None
+
+    marker_start, body_start = marker_positions[0]
+    request = text[body_start:]
+    if not request.strip():
+        return text, None
+    return request, text[:marker_start]
+
+
+def reference_callout(text: str) -> str:
+    """前置き原文を、内容を解釈せず折りたたみINFO calloutへ入れる。"""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    max_backticks = max(
+        (len(run) for run in re.findall(r"`+", normalized)),
+        default=0,
+    )
+    fence = "`" * max(3, max_backticks + 1)
+    raw_lines = (fence + "\n" + normalized + "\n" + fence).split("\n")
+    body = "\n".join(f"> {line}" if line else ">" for line in raw_lines)
+    return f"{REFERENCE_CALLOUT_HEADER}\n>\n{body}"
 
 
 def format_message_time(timestamp: object) -> str:
@@ -775,22 +877,20 @@ def is_callout_header_line(line: str) -> bool:
 
 
 def get_last_callout_header(content: str) -> str | None:
-    """Markdown コンテンツから最後の Callout ヘッダー文字列を抽出する"""
-    lines = content.splitlines()
-    header_indices = [i for i, line in enumerate(lines) if line.startswith("> [!")]
-    if not header_indices:
-        return None
-
-    last_start = header_indices[-1]
+    """Markdownコンテンツからコードフェンス外の最後のCalloutヘッダーを抽出する。"""
+    last_header = None
     header_lines = []
-    for i in range(last_start, len(lines)):
-        line = lines[i]
-        if is_callout_header_line(line):
+    for line in _iter_lines_outside_fences(content):
+        if line.startswith("> [!"):
+            header_lines = [line]
+            last_header = line
+        elif header_lines and is_callout_header_line(line):
             header_lines.append(line)
+            last_header = "\n".join(header_lines)
         else:
-            break
+            header_lines = []
 
-    return "\n".join(header_lines).strip() if header_lines else None
+    return last_header.strip() if last_header else None
 
 
 # ============================================================
@@ -856,16 +956,24 @@ def append_messages(
         time_part = format_message_time(msg.get("timestamp"))
 
         if m_type == "user_message":
-            # 発言の最初のテキスト行から見出しテキストを抽出
-            heading = user_heading(text)
+            display_text, reference_text = split_structured_user_message(text)
+            # 表示対象の発言の最初のテキスト行から見出しテキストを抽出
+            heading = user_heading(display_text)
             callout_header = f"> [!QUESTION] User\n{time_part}".strip()
 
             if callout_header == last_callout_header:
-                blocks.append(f"---\n\n{callout_lines(sanitize_markdown(text))}\n\n")
+                user_block = f"---\n\n{callout_lines(sanitize_markdown(display_text))}\n\n"
             else:
-                blocks.append(f"{heading}> [!QUESTION] User\n{time_part}{callout_lines(sanitize_markdown(text))}\n\n")
+                user_block = (
+                    f"{heading}> [!QUESTION] User\n{time_part}"
+                    f"{callout_lines(sanitize_markdown(display_text))}\n\n"
+                )
 
-            last_callout_header = callout_header
+            if reference_text is not None:
+                user_block += reference_callout(reference_text) + "\n\n"
+            blocks.append(user_block)
+
+            last_callout_header = REFERENCE_CALLOUT_HEADER if reference_text is not None else callout_header
             appended += 1
 
         elif m_type == "agent_message":
@@ -960,6 +1068,7 @@ def append_messages(
             r"<!--\s*last_line:.*?-->",
             f"<!-- last_line: {last_line} -->",
             body_text,
+            count=1,
         )
         final_content = "---\n" + "\n".join(new_fm_lines) + "\n---\n" + body_text
     else:

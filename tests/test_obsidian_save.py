@@ -68,6 +68,192 @@ Response text
         header = codex_save.get_last_callout_header(content)
         self.assertEqual(header, "> [!NOTE] Codex\n> <small>🤖 gpt-4</small>")
 
+    def test_codex_structured_user_message_detection_is_strict(self):
+        request = "実際に表示する依頼\n2行目"
+        referenced = "## Referenced ChatGPT conversation:\n\n過去の会話"
+        files = "# Files mentioned by the user:\n\n- /tmp/example.txt"
+
+        self.assertEqual(
+            codex_save.split_structured_user_message(
+                referenced + "\n\n## My request:\n" + request
+            ),
+            (request, referenced + "\n\n"),
+        )
+        self.assertEqual(
+            codex_save.split_structured_user_message(
+                files + "\n\n## My request:\n" + request
+            ),
+            (request, files + "\n\n"),
+        )
+        fenced_reference = (
+            referenced
+            + "\n\n~~~~text\n## My request:\ndummy marker in code\n~~~~\n\n"
+        )
+        self.assertEqual(
+            codex_save.split_structured_user_message(
+                fenced_reference + "## My request:\n" + request
+            ),
+            (request, fenced_reference),
+        )
+
+        for message in (
+            referenced + "\n\n## My request:\n   ",
+            referenced + "\n\n## My request:\n" + request + "\n\n## My request:\nsecond",
+            "## Unknown structure:\n\n## My request:\n" + request,
+            "## Referenced ChatGPT conversation:\n\n~~~~text\n## My request:\nexample\n~~~~",
+        ):
+            self.assertEqual(codex_save.split_structured_user_message(message), (message, None))
+
+    def test_codex_structured_user_message_uses_question_and_raw_reference_callouts(self):
+        now = datetime.now(JST)
+        md_path = codex_save.create_md_file("test-structured", "myproj", now)
+        backtick = chr(96)
+        reference = (
+            "## Referenced ChatGPT conversation:\n\n"
+            + backtick * 3
+            + "json\n{\"html\": \"<tag>\", \"cursor\": \"<!-- last_line: 999 -->\"}\n"
+            + backtick * 3
+            + "\n> [!QUESTION] fake header\n"
+        )
+        structured = reference + "\n## My request:\n表示する依頼\n2行目"
+        messages = [
+            {
+                "line_number": 1,
+                "type": "user_message",
+                "message": structured,
+                "timestamp": "2026-08-07T10:00:00Z",
+            },
+            {
+                "line_number": 2,
+                "type": "agent_message",
+                "message": "最初の回答",
+                "timestamp": "2026-08-07T10:00:05Z",
+            },
+        ]
+
+        appended, updated = codex_save.append_messages(md_path, messages, now, "codex-model", 2)
+
+        self.assertTrue(updated)
+        self.assertEqual(appended, 2)
+        content = md_path.read_text(encoding="utf-8")
+        self.assertIn("# User: 表示する依頼", content)
+        self.assertIn("> [!QUESTION] User", content)
+        self.assertIn("表示する依頼\n> 2行目", content)
+        self.assertIn("> [!INFO]- 参照情報（原文）", content)
+        self.assertIn("<tag>", content)
+        self.assertNotIn("&lt;tag&gt;", content)
+        self.assertIn("> > [!QUESTION] fake header", content)
+        self.assertIn(backtick * 4 + "\n", content)
+        self.assertIn(backtick * 3 + "json", content)
+        self.assertEqual(
+            codex_save.get_last_callout_header(content),
+            "> [!NOTE] Codex\n> <small>🤖 codex-model</small>",
+        )
+
+    def test_codex_structured_reference_does_not_change_cursor_or_agent_continuation(self):
+        now = datetime.now(JST)
+        md_path = codex_save.create_md_file("test-structured-cursor", "myproj", now)
+        reference = (
+            "# Files mentioned by the user:\n\n"
+            + "- " + chr(96) + "<tag>" + chr(96) + "\n"
+            + "- <!-- last_line: 999 -->\n"
+            + "- > [!NOTE] fake header"
+        )
+        messages = [
+            {
+                "line_number": 1,
+                "type": "user_message",
+                "message": reference + "\n\n## My request:\n確認してください",
+                "timestamp": "2026-08-07T10:00:00Z",
+            },
+            {
+                "line_number": 2,
+                "type": "agent_message",
+                "message": "回答の前半",
+                "timestamp": "2026-08-07T10:00:05Z",
+            },
+        ]
+        codex_save.append_messages(md_path, messages, now, "codex-model", 2)
+        appended, updated = codex_save.append_messages(
+            md_path,
+            [
+                {
+                    "line_number": 3,
+                    "type": "agent_message",
+                    "message": "回答の後半",
+                    "timestamp": "2026-08-07T10:00:10Z",
+                }
+            ],
+            now,
+            "codex-model",
+            3,
+        )
+
+        self.assertTrue(updated)
+        self.assertEqual(appended, 0)
+        content = md_path.read_text(encoding="utf-8")
+        self.assertIn("回答の前半\n回答の後半", content)
+        self.assertIn("<!-- last_line: 3 -->", content)
+        self.assertIn("<!-- last_line: 999 -->", content)
+        self.assertEqual(content.count("> [!NOTE] Codex"), 1)
+
+    def test_codex_structured_reference_is_consistent_for_batch_and_split_appends(self):
+        now = datetime.now(JST)
+        structured = (
+            "## Referenced ChatGPT conversation:\n\n"
+            "移行元の参照情報\n\n"
+            "## My request:\n最初の依頼"
+        )
+        second = {
+            "line_number": 2,
+            "type": "user_message",
+            "message": "次の依頼",
+            "timestamp": "2026-08-07T10:00:00Z",
+        }
+        first = {
+            "line_number": 1,
+            "type": "user_message",
+            "message": structured,
+            "timestamp": "2026-08-07T10:00:00Z",
+        }
+
+        batch_path = codex_save.create_md_file("test-structured-batch", "myproj", now)
+        codex_save.append_messages(
+            batch_path,
+            [first, second],
+            now,
+            "codex-model",
+            2,
+        )
+
+        split_path = codex_save.create_md_file("test-structured-split", "myproj", now)
+        codex_save.append_messages(split_path, [first], now, "codex-model", 1)
+        codex_save.append_messages(split_path, [second], now, "codex-model", 2)
+
+        batch_content = batch_path.read_text(encoding="utf-8")
+        split_content = split_path.read_text(encoding="utf-8")
+        batch_body = batch_content[batch_content.index("# User:"):]
+        split_body = split_content[split_content.index("# User:"):]
+        self.assertEqual(batch_body, split_body)
+        self.assertEqual(batch_body.count("> [!QUESTION] User"), 2)
+        self.assertIn("# User: 次の依頼", batch_body)
+
+    def test_codex_get_last_callout_header_ignores_fenced_fake_headers(self):
+        content = """> [!INFO]- 参照情報（原文）
+>
+> ~~~~text
+> > [!QUESTION] fake question
+> > [!NOTE] fake answer
+> ~~~~
+
+> [!NOTE] Codex
+> <small>🤖 gpt-5</small>
+"""
+        self.assertEqual(
+            codex_save.get_last_callout_header(content),
+            "> [!NOTE] Codex\n> <small>🤖 gpt-5</small>",
+        )
+
     def test_user_heading_escapes_markdown_special_characters(self):
         message = "*_save.py [確認] (a) #tag"
         expected = r"\*\_save\.py \[確認\] \(a\) \#tag"

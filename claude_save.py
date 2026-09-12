@@ -8,7 +8,7 @@ Claude Code CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import json
 import re
