@@ -638,6 +638,368 @@ Response text
         self.assertIn("quota: 5.00", updated)
         self.assertIn("- **Gemini**: W: 80.0% ➔ 75.0%", updated)
 
+    def test_agy_parses_official_quota_response(self):
+        response = {
+            "command": {
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [{
+                                "id": "gemini-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.8,
+                                "reset_time": "2026-08-14T00:00:00Z",
+                            }, {
+                                "id": "gemini-5h",
+                                "window": "5h",
+                                "remaining_fraction": 0.55,
+                            }],
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [{
+                                "id": "3p-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.6,
+                                "reset_time": "2026-08-15T00:00:00Z",
+                            }, {
+                                "id": "3p-5h",
+                                "window": "5h",
+                                "remaining_fraction": 0.35,
+                            }],
+                        },
+                    ],
+                },
+            },
+        }
+
+        quota = agy_save.parse_quota_data(response)
+
+        self.assertEqual(quota["gemini"]["weekly"]["remaining"], 80.0)
+        self.assertEqual(quota["gemini"]["5h"]["remaining"], 55.0)
+        self.assertEqual(quota["claude"]["weekly"]["remaining"], 60.0)
+        self.assertEqual(quota["claude"]["5h"]["remaining"], 35.0)
+        self.assertEqual(quota["gemini"]["weekly"]["reset"], "2026-08-14 09:00")
+
+    def test_agy_retrieve_quota_uses_read_only_official_command(self):
+        response = {
+            "status": "SUCCESS",
+            "num_turns": 0,
+            "command": {"data": {"groups": [{
+                "name": "Gemini Models",
+                "buckets": [{
+                    "id": "gemini-weekly",
+                    "window": "weekly",
+                    "remaining_fraction": 0.8,
+                }],
+            }]}},
+        }
+        completed = mock.Mock(returncode=0, stdout=json.dumps(response))
+
+        with mock.patch.object(agy_save.subprocess, "run", return_value=completed) as run:
+            quota = agy_save.retrieve_quota()
+
+        self.assertEqual(quota["gemini"]["weekly"]["remaining"], 80.0)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["agy", "--output-format", "json", "--print=/quota"],
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], agy_save.AGY_QUOTA_TIMEOUT_SECONDS)
+
+    def test_agy_rejects_malformed_quota_responses_without_raising(self):
+        malformed_values = [
+            [],
+            None,
+            {"command": {"data": {"groups": None}}},
+            {"command": {"data": {"groups": [{"name": "Gemini", "buckets": None}]}}},
+            {"command": {"data": {"groups": [{
+                "name": "Gemini",
+                "buckets": [{"id": "gemini-weekly", "remaining_fraction": "NaN"}],
+            }]}}},
+            {"command": {"data": {"groups": [{
+                "name": "Gemini",
+                "buckets": [{"id": "gemini-weekly", "remaining_fraction": "Infinity"}],
+            }]}}},
+        ]
+        for value in malformed_values:
+            self.assertEqual(agy_save.parse_quota_data(value), {})
+
+        for stdout in (b"\xff", "[]"):
+            completed = mock.Mock(returncode=0, stdout=stdout)
+            with mock.patch.object(agy_save.subprocess, "run", return_value=completed):
+                self.assertIsNone(agy_save.retrieve_quota())
+
+    def test_agy_malformed_quota_does_not_block_conversation_save(self):
+        transcript = self.test_dir / "agy-malformed-quota.jsonl"
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in [
+            {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>質問</USER_REQUEST>"},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "回答", "tool_calls": []},
+        ]), encoding="utf-8")
+        completed = mock.Mock(returncode=0, stdout=json.dumps([]))
+        hook = {
+            "conversationId": "agy-malformed-quota",
+            "transcriptPath": str(transcript),
+            "workspacePaths": [str(self.test_dir)],
+        }
+        with mock.patch.object(agy_save.subprocess, "run", return_value=completed):
+            agy_save.handle_stop_event(hook)
+
+        state = agy_save.load_state(hook["conversationId"])
+        content = Path(state["output_path"]).read_text(encoding="utf-8")
+        self.assertIn("質問", content)
+        self.assertIn("回答", content)
+        self.assertNotIn("📊 **Quota**:", content)
+
+    def test_agy_quota_is_saved_in_public_saver(self):
+        def quota_response(weekly_remaining, five_hour_remaining):
+            return mock.Mock(returncode=0, stdout=json.dumps({
+                "status": "SUCCESS",
+                "num_turns": 0,
+                "command": {"data": {"groups": [{
+                    "name": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-weekly",
+                            "window": "weekly",
+                            "remaining_fraction": weekly_remaining / 100,
+                        },
+                        {
+                            "id": "gemini-5h",
+                            "window": "5h",
+                            "remaining_fraction": five_hour_remaining / 100,
+                        },
+                    ],
+                }]}},
+            }))
+
+        transcript = self.test_dir / "agy_quota.jsonl"
+        rows = [
+            {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>質問</USER_REQUEST>"},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "回答", "tool_calls": []},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        hook = {"conversationId": "public-agy-quota", "transcriptPath": str(transcript)}
+
+        with mock.patch.object(
+            agy_save.subprocess,
+            "run",
+            side_effect=[quota_response(90, 60), quota_response(80, 50)],
+        ):
+            agy_save.handle_stop_event(hook)
+            rows.extend([
+                {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>次の質問</USER_REQUEST>"},
+                {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "次の回答", "tool_calls": []},
+            ])
+            transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            agy_save.handle_stop_event(hook)
+
+        state = agy_save.load_state(hook["conversationId"])
+        content = Path(state["output_path"]).read_text(encoding="utf-8")
+        self.assertEqual(state["initial_quota"]["gemini"]["weekly"]["remaining"], 90.0)
+        self.assertEqual(state["last_quota"]["gemini"]["weekly"]["remaining"], 80.0)
+        self.assertEqual(state["initial_quota"]["gemini"]["5h"]["remaining"], 60.0)
+        self.assertEqual(state["last_quota"]["gemini"]["5h"]["remaining"], 50.0)
+        self.assertIn("quota: 10.00", content)
+        self.assertIn("W: 90.0% ➔ 80.0% / 5h: 60.0% ➔ 50.0%", content)
+        self.assertEqual(
+            agy_save.quota_suffix("gemini", state["last_quota"], state["initial_quota"]),
+            " (Quota: W 80.0(-10.00)% / 5h 50.0(-10.00)%)",
+        )
+
+    def test_agy_without_new_messages_does_not_refresh_quota(self):
+        now = datetime.now(JST)
+        md_path = agy_save.create_md_file("agy-no-new", "myproj", now)
+        transcript = self.test_dir / "agy-no-new.jsonl"
+        transcript.write_text(
+            json.dumps({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "既存回答",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        hook = {
+            "conversationId": "agy-no-new",
+            "transcriptPath": str(transcript),
+            "workspacePaths": [str(self.test_dir)],
+        }
+        with mock.patch.object(agy_save, "retrieve_quota", return_value={"gemini": {
+            "weekly": {"remaining": 90.0, "reset": ""},
+        }}) as retrieve:
+            agy_save.handle_stop_event(hook)
+        self.assertEqual(retrieve.call_count, 1)
+        state = agy_save.load_state(hook["conversationId"])
+        content_before = Path(state["output_path"]).read_text(encoding="utf-8")
+
+        with mock.patch.object(agy_save, "retrieve_quota", side_effect=AssertionError("quota refresh")):
+            agy_save.handle_stop_event(hook)
+
+        state_after = agy_save.load_state(hook["conversationId"])
+        self.assertEqual(state_after.get("last_quota"), state.get("last_quota"))
+        self.assertEqual(Path(state_after["output_path"]).read_text(encoding="utf-8"), content_before)
+
+    def test_agy_recovers_current_and_legacy_claude_quota_history(self):
+        content = """---
+source: antigravity-cli
+session_id: \"recover-quota\"
+quota: 10.00
+quota_claude: 5.00
+---
+
+📊 **Quota**:
+- **Gemini**: W: 90.0% ➔ 80.0% / 5h: 60.0% ➔ 50.0%
+- <small>Claude: W: 70.0% / 5h: 40.0%</small>
+
+<!-- last_id: 4 -->
+"""
+        initial, final = agy_save.recover_quota_from_markdown(content)
+        self.assertEqual(initial["gemini"]["weekly"]["remaining"], 90.0)
+        self.assertEqual(final["gemini"]["5h"]["remaining"], 50.0)
+        self.assertEqual(initial["claude"]["weekly"]["remaining"], 75.0)
+        self.assertEqual(final["claude"]["weekly"]["remaining"], 70.0)
+        self.assertEqual(initial["claude"]["5h"]["remaining"], 40.0)
+        self.assertEqual(
+            agy_save.recover_quota_from_markdown(content.replace("quota: 10.00", "quota: 10.04")),
+            (None, None),
+        )
+
+    def test_agy_state_recovery_preserves_quota_initial_and_consumption(self):
+        session_id = "agy-quota-recovery"
+        transcript = self.test_dir / "agy-quota-recovery.jsonl"
+        rows = [
+            {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>最初の質問</USER_REQUEST>"},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "最初の回答", "tool_calls": []},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        hook = {
+            "conversationId": session_id,
+            "transcriptPath": str(transcript),
+            "workspacePaths": [str(self.test_dir)],
+        }
+
+        def quota_response(remaining):
+            return mock.Mock(returncode=0, stdout=json.dumps({
+                "status": "SUCCESS",
+                "num_turns": 0,
+                "command": {"data": {"groups": [{
+                    "name": "Gemini Models",
+                    "buckets": [{
+                        "id": "gemini-weekly",
+                        "window": "weekly",
+                        "remaining_fraction": remaining / 100,
+                    }],
+                }]}},
+            }))
+
+        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(90)):
+            agy_save.handle_stop_event(hook)
+        output_path = Path(agy_save.load_state(session_id)["output_path"])
+        agy_save.state_path(session_id).unlink()
+
+        rows.extend([
+            {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>次の質問</USER_REQUEST>"},
+            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "次の回答", "tool_calls": []},
+        ])
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(80)):
+            agy_save.handle_stop_event(hook)
+
+        state = agy_save.load_state(session_id)
+        content = output_path.read_text(encoding="utf-8")
+        self.assertEqual(state["initial_quota"]["gemini"]["weekly"]["remaining"], 90.0)
+        self.assertEqual(state["final_quota"]["gemini"]["weekly"]["remaining"], 80.0)
+        self.assertIn("quota: 10.00", content)
+        self.assertIn("W: 90.0% ➔ 80.0%", content)
+        self.assertEqual(content.count("W: 90.0% ➔ 80.0%"), 1)
+
+    def test_agy_quota_section_replacement_removes_old_rows(self):
+        content = """---
+source: antigravity-cli
+quota: 5.00
+---
+
+📊 **Quota**:
+- **Gemini**: W: 80.0% ➔ 75.0%
+
+本文
+"""
+        updated = agy_save.add_quota_metadata(
+            content,
+            {"gemini": {"weekly": {"remaining": 80.0, "reset": ""}}},
+            {"gemini": {"weekly": {"remaining": 70.0, "reset": ""}}},
+        )
+        self.assertNotIn("80.0% ➔ 75.0%", updated)
+        self.assertEqual(updated.count("- **Gemini**: W:"), 1)
+        self.assertIn("80.0% ➔ 70.0%", updated)
+
+    def test_agy_unreadable_quota_history_is_preserved(self):
+        fake_content = """---
+source: antigravity-cli
+quota: not-a-number
+---
+
+本文中の例:
+📊 **Quota**:
+- **Gemini**: W: 1.0%
+
+本文
+"""
+        self.assertEqual(agy_save.recover_quota_from_markdown(fake_content), (None, None))
+        body_only_fake = fake_content.replace("quota: not-a-number\n", "")
+        self.assertFalse(agy_save.has_quota_history(body_only_fake))
+
+        content = """---
+source: antigravity-cli
+quota: not-a-number
+---
+
+📊 **Quota**:
+- **Gemini**: W: unknown / 5h: unknown
+
+本文
+"""
+        self.assertEqual(agy_save.recover_quota_from_markdown(content), (None, None))
+        updated = agy_save.add_quota_metadata(
+            content,
+            None,
+            {"gemini": {"weekly": {"remaining": 70.0, "reset": ""}}},
+        )
+        self.assertEqual(updated, content)
+
+    def test_agy_partial_quota_history_is_preserved_after_state_loss(self):
+        session_id = "agy-partial-quota-recovery"
+        transcript = self.test_dir / "agy-partial-quota-recovery.jsonl"
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in [
+            {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>旧質問</USER_REQUEST>"},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "旧回答", "tool_calls": []},
+            {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>新質問</USER_REQUEST>"},
+            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "新回答", "tool_calls": []},
+        ]), encoding="utf-8")
+        existing = agy_save.create_md_file(session_id, str(self.test_dir), datetime.now(JST))
+        existing_content = existing.read_text(encoding="utf-8").replace(
+            "<!-- last_id: -->",
+            "📊 **Quota**:\n"
+            "- **Gemini**: W: 80.0% ➔ 70.0% / 5h: unavailable\n"
+            "\n<!-- last_id: 2 -->",
+        )
+        agy_save.atomic_write_md(existing, existing_content)
+        hook = {
+            "conversationId": session_id,
+            "transcriptPath": str(transcript),
+            "workspacePaths": [str(self.test_dir)],
+        }
+        current = {"gemini": {"weekly": {"remaining": 60.0, "reset": ""}}}
+        with mock.patch.object(agy_save, "retrieve_quota", return_value=current):
+            agy_save.handle_stop_event(hook)
+
+        state = agy_save.load_state(session_id)
+        updated = existing.read_text(encoding="utf-8")
+        self.assertTrue(state["preserve_quota_history"])
+        self.assertNotIn("quota: 0.00", updated)
+        self.assertIn("W: 80.0% ➔ 70.0% / 5h: unavailable", updated)
+        self.assertIn("新回答", updated)
+
     def test_agy_append_uses_single_atomic_markdown_write(self):
         now = datetime.now(JST)
         md_path = agy_save.create_md_file("atomic-agy", "project", now)

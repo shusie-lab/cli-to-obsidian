@@ -8,14 +8,16 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import json
+import math
 import re
 import sys
 import os
 import fcntl
 import hashlib
+import subprocess
 import tempfile
 from contextlib import contextmanager
 from functools import wraps
@@ -97,7 +99,7 @@ def setup_logger() -> logging.Logger:
 
 
 logger = setup_logger()
-METADATA_EXTENSION = None  # 個人用エントリーポイントからのみ設定する任意の拡張。
+AGY_QUOTA_TIMEOUT_SECONDS = 20
 
 
 # ============================================================
@@ -579,6 +581,308 @@ def get_new_messages(messages: list, last_id: str) -> list:
 
 
 # ============================================================
+# quota（agy の読み取り専用 /quota コマンド）
+# ============================================================
+def parse_quota_data(data: dict) -> dict:
+    """agy の ``/quota --output-format json`` 応答を保存用形式へ正規化する。"""
+    if not isinstance(data, dict):
+        return {}
+    command = data.get("command", {})
+    command_data = command.get("data", {}) if isinstance(command, dict) else {}
+    groups = command_data.get("groups", []) if isinstance(command_data, dict) else []
+    if not isinstance(groups, list):
+        return {}
+    quota = {}
+
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_name = str(group.get("name", ""))
+        group_name_lower = group_name.lower()
+        if "gemini" in group_name_lower:
+            key = "gemini"
+        elif "claude" in group_name_lower or "gpt" in group_name_lower:
+            key = "claude"
+        else:
+            continue
+
+        parsed_buckets = {}
+        buckets = group.get("buckets", [])
+        if not isinstance(buckets, list):
+            continue
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            try:
+                raw_remaining = bucket["remaining_fraction"]
+                if isinstance(raw_remaining, bool):
+                    continue
+                remaining_fraction = float(raw_remaining)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(remaining_fraction) or not 0 <= remaining_fraction <= 1:
+                continue
+            remaining = round(remaining_fraction * 100, 10)
+
+            window = str(bucket.get("window", "")).lower()
+            bucket_id = str(bucket.get("id", "")).lower()
+            if "week" in window or "week" in bucket_id:
+                window_key = "weekly"
+            elif "5" in window or "5" in bucket_id:
+                window_key = "5h"
+            else:
+                continue
+
+            reset = ""
+            reset_time = bucket.get("reset_time")
+            if reset_time:
+                try:
+                    reset_dt = datetime.fromisoformat(str(reset_time).replace("Z", "+00:00"))
+                    reset = reset_dt.astimezone(JST).strftime("%Y-%m-%d %H:%M")
+                except (TypeError, ValueError):
+                    logger.info("agy quota の reset_time をパースできませんでした")
+            parsed_buckets[window_key] = {"remaining": remaining, "reset": reset}
+
+        if parsed_buckets:
+            quota[key] = parsed_buckets
+    return quota
+
+
+def retrieve_quota() -> dict | None:
+    """公式の読み取り専用 ``agy /quota`` から quota を取得する。
+
+    このコマンドは会話ターンを作らず、quota も消費しない。失敗しても保存処理は続行する。
+    """
+    try:
+        completed = subprocess.run(
+            ["agy", "--output-format", "json", "--print=/quota"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=AGY_QUOTA_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"agy /quota が終了コード {completed.returncode} で失敗")
+        data = json.loads(completed.stdout)
+        if not isinstance(data, dict):
+            raise RuntimeError("agy /quota がJSONオブジェクトを返しませんでした")
+        if data.get("status") != "SUCCESS" or data.get("num_turns") != 0:
+            raise RuntimeError("agy /quota が読み取り専用の成功応答を返しませんでした")
+        quota = parse_quota_data(data)
+        if not quota:
+            raise RuntimeError("agy /quota 応答に利用可能な quota がありません")
+        return quota
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+    ) as error:
+        logger.info("Quota情報の取得に失敗しました: %s", type(error).__name__)
+        return None
+
+
+def format_reset_time(reset_jst: str) -> str:
+    if not reset_jst:
+        return ""
+    try:
+        reset_dt = datetime.strptime(reset_jst, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+        seconds = int((reset_dt - now_jst()).total_seconds())
+    except (TypeError, ValueError):
+        return reset_jst
+    if seconds <= 0:
+        return "now"
+    minutes = (seconds + 59) // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours >= 24:
+        days, hours = divmod(hours, 24)
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+
+
+def quota_value(quota: dict | None, group: str, window: str, field: str):
+    if not quota:
+        return None if field == "remaining" else ""
+    return quota.get(group, {}).get(window, {}).get(field, None if field == "remaining" else "")
+
+
+def build_quota_section(initial_quota: dict | None, final_quota: dict) -> str:
+    lines = ["📊 **Quota**:"]
+    for group, label in (("gemini", "Gemini"), ("claude", "Claude")):
+        values = []
+        for window, short_label in (("weekly", "W"), ("5h", "5h")):
+            initial = quota_value(initial_quota, group, window, "remaining")
+            final = quota_value(final_quota, group, window, "remaining")
+            if initial is None and final is None:
+                continue
+            reset = quota_value(final_quota, group, window, "reset") or quota_value(initial_quota, group, window, "reset")
+            reset_text = f" (⟳ {format_reset_time(reset)})" if reset else ""
+            if initial is not None and final is not None and abs(initial - final) > 1e-5:
+                value = f"{initial:.1f}% ➔ {final:.1f}%"
+            else:
+                value = f"{(final if final is not None else initial):.1f}%"
+            values.append(f"{short_label}: {value}{reset_text}")
+        if values:
+            lines.append(f"- **{label}**: " + " / ".join(values))
+    return "\n".join(lines) + "\n"
+
+
+def quota_consumption(initial_quota: dict | None, final_quota: dict, group: str) -> float | None:
+    initial = quota_value(initial_quota, group, "weekly", "remaining")
+    final = quota_value(final_quota, group, "weekly", "remaining")
+    if initial is None or final is None:
+        return None
+    return round(initial - final, 2)
+
+
+def quota_suffix(model_name: str, current_quota: dict | None, last_quota: dict | None) -> str:
+    group = "gemini" if "gemini" in model_name.lower() else "claude"
+    parts = []
+    for window, label in (("weekly", "W"), ("5h", "5h")):
+        current = quota_value(current_quota, group, window, "remaining")
+        if current is None:
+            continue
+        previous = quota_value(last_quota, group, window, "remaining")
+        diff = "" if previous is None else f"({current - previous:+.2f})"
+        parts.append(f"{label} {current:.1f}{diff}%")
+    return f" (Quota: {' / '.join(parts)})" if parts else ""
+
+
+def has_quota_history(content: str) -> bool:
+    """既存Markdownにquota履歴があるか判定する。"""
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if fm_match and re.search(r"(?m)^(?:quota|quota_claude):\s*", fm_match.group(1)):
+        return True
+    if not fm_match:
+        return False
+    body = content[fm_match.end():]
+    return bool(re.match(r"^(?:[ \t]*\n)*📊 \*\*Quota\*\*:", body))
+
+
+def recover_quota_from_markdown(content: str) -> tuple[dict | None, dict | None]:
+    """既存Markdownのquota表示から初期値と最終値を復旧する。
+
+    現行の矢印形式に加え、旧個人版の ``<small>Claude: ...</small>`` を受け付ける。
+    数値を安全に読み取れない履歴は呼び出し側が保守的に保持するため、Noneを返す。
+    """
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not fm_match:
+        return None, None
+
+    consumption = {}
+    invalid_consumption_groups = set()
+    for line in fm_match.group(1).splitlines():
+        key_match = re.match(r"^(quota|quota_claude):\s*(.*)$", line)
+        if not key_match:
+            continue
+        group = "gemini" if key_match.group(1) == "quota" else "claude"
+        value_text = key_match.group(2).strip()
+        try:
+            value = float(value_text)
+        except (TypeError, ValueError, OverflowError):
+            invalid_consumption_groups.add(group)
+            continue
+        if math.isfinite(value):
+            consumption[group] = value
+        else:
+            invalid_consumption_groups.add(group)
+
+    body = content[fm_match.end():]
+    section_match = re.match(
+        r"^(?:[ \t]*\n)*📊 \*\*Quota\*\*:(?:[ \t]*N/A)?\n",
+        body,
+    )
+    if not section_match or body[section_match.start():].lstrip().startswith("📊 **Quota**: N/A"):
+        return None, None
+    body_lines = body[section_match.end():].splitlines()
+
+    group_pattern = re.compile(
+        r"^\s*-\s+(?:<small>)?(?:\*\*)?(Gemini|Claude)(?:\*\*)?:\s*(.*?)(?:</small>)?\s*$",
+        re.IGNORECASE,
+    )
+    number_pattern = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))%"
+    initial_quota = {}
+    final_quota = {}
+    for line in body_lines:
+        if not line.lstrip().startswith("-"):
+            break
+        group_match = group_pattern.match(line)
+        if not group_match:
+            return None, None
+        group = group_match.group(1).lower()
+        details = group_match.group(2)
+        found_bucket = False
+        for window, label in (("weekly", "W"), ("5h", "5h")):
+            if not re.search(rf"\b{re.escape(label)}\s*:", details, re.IGNORECASE):
+                continue
+            bucket_match = re.search(
+                rf"\b{re.escape(label)}\s*:\s*{number_pattern}"
+                rf"(?:\s*➔\s*{number_pattern})?",
+                details,
+                re.IGNORECASE,
+            )
+            if not bucket_match:
+                return None, None
+            try:
+                first = float(bucket_match.group(1))
+                second = float(bucket_match.group(2)) if bucket_match.group(2) is not None else None
+            except (TypeError, ValueError, OverflowError):
+                return None, None
+            if not all(math.isfinite(value) for value in (first, second) if value is not None):
+                return None, None
+            final = round(second if second is not None else first, 2)
+            initial = round(first, 2)
+            if second is None and window == "weekly" and group in consumption:
+                initial = final + consumption[group]
+            elif second is None and window == "weekly" and group in invalid_consumption_groups:
+                return None, None
+            initial_quota.setdefault(group, {})[window] = {"remaining": initial, "reset": ""}
+            final_quota.setdefault(group, {})[window] = {"remaining": final, "reset": ""}
+            found_bucket = True
+        if not found_bucket:
+            return None, None
+
+    if not final_quota:
+        return None, None
+    for group, recorded_consumption in consumption.items():
+        weekly_initial = initial_quota.get(group, {}).get("weekly", {}).get("remaining")
+        weekly_final = final_quota.get(group, {}).get("weekly", {}).get("remaining")
+        if weekly_initial is None or weekly_final is None:
+            return None, None
+        if round(weekly_initial - weekly_final, 2) != round(recorded_consumption, 2):
+            logger.info("既存Markdownのquota消費量と表示値が一致しないため復旧を見送ります")
+            return None, None
+    return initial_quota, final_quota
+
+
+def add_quota_metadata(content: str, initial_quota: dict | None, final_quota: dict) -> str:
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        return content
+    if not initial_quota and has_quota_history(content):
+        return content
+    frontmatter, body = match.group(1), content[match.end():]
+    for group, key in (("gemini", "quota"), ("claude", "quota_claude")):
+        consumption = quota_consumption(initial_quota, final_quota, group)
+        if consumption is not None:
+            frontmatter = re.sub(rf"(?m)^{key}:.*\n?", "", frontmatter).rstrip()
+            frontmatter += f"\n{key}: {consumption:.2f}"
+    section = build_quota_section(initial_quota, final_quota)
+    pattern = r"\A[ \t]*📊 \*\*Quota\*\*:(?:[ \t]*N/A)?\n(?:[ \t]*-[^\n]*(?:\n|$))*"
+    if re.search(pattern, body):
+        body = re.sub(pattern, lambda _: section, body, count=1)
+    else:
+        body = section + "\n" + body.lstrip()
+    return "---\n" + frontmatter + "\n---\n" + body
+
+
+# ============================================================
 # Markdownファイル生成・操作
 # ============================================================
 def build_frontmatter(
@@ -713,6 +1017,8 @@ def update_markdown_metadata(
     appended: int,
     last_id: str,
     content: str | None = None,
+    initial_quota: dict | None = None,
+    current_quota: dict | None = None,
 ) -> None:
     if content is None:
         content = path.read_text(encoding="utf-8")
@@ -767,8 +1073,8 @@ def update_markdown_metadata(
     )
 
     new_content = "---\n" + "\n".join(new_fm_lines) + "\n---\n" + body_text
-    if METADATA_EXTENSION is not None:
-        new_content = METADATA_EXTENSION.transform_markdown(new_content)
+    if current_quota:
+        new_content = add_quota_metadata(new_content, initial_quota, current_quota)
     atomic_write_md(path, new_content)
 
 
@@ -825,6 +1131,9 @@ def append_messages(
     path: Path,
     messages: list,
     modified_dt: datetime,
+    current_quota: dict | None = None,
+    last_quota: dict | None = None,
+    initial_quota: dict | None = None,
 ) -> tuple[str, int, bool]:
     content = path.read_text(encoding="utf-8")
 
@@ -859,8 +1168,7 @@ def append_messages(
             appended += 1
 
         elif m_type == "agent_message":
-            if METADATA_EXTENSION is not None:
-                m_model += METADATA_EXTENSION.message_suffix(m_model)
+            m_model += quota_suffix(m_model, current_quota, last_quota) if m_model else ""
             meta_part = f"> <small>🤖 {m_model}</small>\n" if m_model else ""
             meta_line = f"> <small>🤖 {m_model}</small>" if m_model else ""
             callout_header = f"> [!NOTE] {AGENT_NAME}\n{meta_line}".strip() if meta_line else f"> [!NOTE] {AGENT_NAME}"
@@ -894,6 +1202,8 @@ def append_messages(
         appended,
         last_id,
         content=content,
+        initial_quota=initial_quota,
+        current_quota=current_quota,
     )
 
     return last_id, appended, True
@@ -940,11 +1250,23 @@ def handle_stop_event(hook_input: dict) -> None:
                 "last_id": recovered_last_id,
                 "message_count": 0,
             }
+            try:
+                recovered_content = recovered_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                state["preserve_quota_history"] = True
+                logger.warning(f"既存Markdownのquota履歴を読み取れないため保持します: {error}")
+            else:
+                recovered_initial, recovered_final = recover_quota_from_markdown(recovered_content)
+                state["preserve_quota_history"] = (
+                    has_quota_history(recovered_content) and recovered_initial is None
+                )
+                if recovered_initial is not None:
+                    state["initial_quota"] = recovered_initial
+                if recovered_final is not None:
+                    state["final_quota"] = recovered_final
+                    state["last_quota"] = recovered_final
             save_state(session_id, state)
             logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
-
-    if METADATA_EXTENSION is not None:
-        METADATA_EXTENSION.prepare(state, is_app)
 
     if not state or "output_path" not in state:
         start_dt = now_jst()
@@ -1002,17 +1324,24 @@ def handle_stop_event(hook_input: dict) -> None:
 
     all_messages = load_jsonl_messages(jsonl_path)
     new_messages = get_new_messages(all_messages, last_id)
-
     if new_messages:
+        current_quota = retrieve_quota()
+        if current_quota:
+            if not state.get("initial_quota") and not state.get("preserve_quota_history"):
+                state["initial_quota"] = current_quota
+            state["final_quota"] = current_quota
         new_last_id, appended, updated = append_messages(
             path,
             new_messages,
             now_jst(),
+            current_quota=current_quota,
+            last_quota=state.get("last_quota"),
+            initial_quota=state.get("initial_quota"),
         )
         if new_last_id:
             state["last_id"] = new_last_id
-        if updated and METADATA_EXTENSION is not None:
-            METADATA_EXTENSION.after_append()
+        if updated and current_quota:
+            state["last_quota"] = current_quota
         save_state(session_id, state)
         logger.info(f"{appended}件追記完了 {session_id[:8]}")
     else:

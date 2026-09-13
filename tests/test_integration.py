@@ -5,6 +5,7 @@ import unittest
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/.."))
 
@@ -448,10 +449,12 @@ class TestIntegration(unittest.TestCase):
             "workspacePaths": [str(self.test_dir)],
         }
 
-        agy_save.handle_stop_event(hook_input)
+        with mock.patch.object(agy_save, "retrieve_quota", return_value=None):
+            agy_save.handle_stop_event(hook_input)
         output_path = Path(agy_save.load_state(session_id)["output_path"])
         agy_save.state_path(session_id).unlink()
-        agy_save.handle_stop_event(hook_input)
+        with mock.patch.object(agy_save, "retrieve_quota", return_value=None):
+            agy_save.handle_stop_event(hook_input)
 
         self.assertEqual(Path(agy_save.load_state(session_id)["output_path"]), output_path)
         self.assertEqual(output_path.read_text(encoding="utf-8").count("AGY recovery answer"), 1)

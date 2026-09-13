@@ -13,7 +13,7 @@ Antigravity、Codex、Claude Code、OpenCode の会話履歴を、Markdownファ
 - OpenCode の会話完了プラグイン（`chat.message`、`experimental.text.complete`、`session.idle`）に対応
 - 会話本文だけを抽出し、ツール実行結果などのノイズを除いて保存
 - ObsidianのYAML frontmatter、見出し、Calloutを使った読みやすい出力
-- Codexでは、会話ごとのquota変化とセッション全体のweekly quota消費量を記録
+- CodexとAntigravityでは、会話ごとのquota変化とセッション全体のweekly quota消費量を記録
 - 外部パッケージ不要で、hookから直接呼び出せる単一ファイル構成
 
 ### 対応状況
@@ -21,7 +21,7 @@ Antigravity、Codex、Claude Code、OpenCode の会話履歴を、Markdownファ
 | 対象 | CLI | アプリ | quota記録 |
 | --- | --- | --- | --- |
 | Codex | 対応 | ChatGPTデスクトップアプリ内のCodexに対応 | 対応 |
-| Antigravity | 対応 | Antigravityアプリに対応 | なし |
+| Antigravity | 対応 | Antigravityアプリに対応 | 対応 |
 | Claude Code | 対応 | — | なし |
 | OpenCode | 対応（プラグイン） | 対応 | なし |
 
@@ -38,10 +38,10 @@ Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_lim
 
 ## インストール元の取得
 
-リリース版の利用を推奨します。次の例では`v1.2.0`を取得します。
+リリース版の利用を推奨します。次の例では`v1.3.0`を取得します。
 
 ```bash
-git clone --branch v1.2.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
+git clone --branch v1.3.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
 cd cli-to-obsidian
 ```
 
@@ -103,7 +103,10 @@ Codexのtranscriptに`session_meta.source`が`cli`なら`source: codex-cli`、`v
 
 ## Antigravity CLIとアプリ
 
-Antigravity CLIおよびAntigravityアプリのStop hookから会話履歴を保存します。quota取得は公開版には含めません。
+Antigravity CLIおよびAntigravityアプリのStop hookから会話履歴を保存します。
+quotaは、公式の読み取り専用コマンド `agy --output-format json --print='/quota'`
+から取得します。このコマンドは会話ターンを作らず、quotaを消費しません。`agy` が
+見つからない、または quota を返さない場合でも、会話保存は継続します。
 
 ```bash
 mkdir -p ~/.gemini/agy-obsidian/scripts
@@ -206,7 +209,10 @@ ChatGPTからWorkへ移行した際に生成される構造化されたユーザ
 依頼本文は通常のUser QUESTION calloutへ表示し、前置きの参照情報は内容を解釈せず、
 折りたたみ式の「参照情報（原文）」INFO calloutへ保存します。条件が曖昧な入力は従来どおり全文を保存します。
 
-AntigravityとClaude Codeの新規出力にはquota情報は含まれません。過去にquota対応版で保存したMarkdownのquota記録は、履歴情報として削除されません。
+Claude Codeの新規出力にはquota情報は含まれません。Antigravityでは公式の`/quota`出力が
+提供する範囲（アカウントによってweekly、5hなど）を記録します。5h quotaが契約上提供
+されないアカウントでは、その項目は表示されません。過去に保存したMarkdownのquota記録は、
+履歴情報として削除されません。
 
 ## 動作確認とトラブルシューティング
 
@@ -228,7 +234,7 @@ AntigravityとClaude Codeの新規出力にはquota情報は含まれません�
 /usr/bin/python3 -X pycache_prefix=/tmp/cli_obsidian_save_pycache -m py_compile agy_save.py codex_save.py claude_save.py opencode_save.py
 ```
 
-テストでは、通常の追記、Codex quotaの解析と更新、連続発言の集約に加えて、cursor復旧、state消失時の既存Markdown再利用、書き込み途中のJSONL最終行の再試行、YAML文字列とstateファイル名の安全化、保存先相対パスの検証を確認しています。
+テストでは、通常の追記、CodexとAntigravityのquota解析・更新、連続発言の集約に加えて、cursor復旧、state消失時の既存Markdown再利用、書き込み途中のJSONL最終行の再試行、YAML文字列とstateファイル名の安全化、保存先相対パスの検証を確認しています。
 
 ## 実装上の特徴
 

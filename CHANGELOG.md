@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-13
+
+### Added
+
+- Antigravityの公式読み取り専用`agy /quota` JSON出力を用いたquota記録を`agy_save.py`へ追加
+- Antigravityのweekly quota残量・リセット時刻・セッション中の消費量をMarkdownとstateへ記録
+
 ## [1.2.0] - 2026-09-13
 
 ### Changed
@@ -38,7 +45,8 @@
 - `OBSIDIAN_OUTPUT_DIR`による保管庫内の保存先カスタマイズに対応
 - macOS 標準 Python 3.9 で実行できる標準ライブラリのみの構成
 
-[Unreleased]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/shusie1969/cli-to-obsidian/releases/tag/v1.0.0
