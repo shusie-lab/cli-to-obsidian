@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/.."))
 import agy_save
 import claude_save
 import codex_save
+import opencode_save
 
 JST = timezone(timedelta(hours=9))
 
@@ -23,6 +24,9 @@ class TestSaveScripts(unittest.TestCase):
         codex_save.OUTPUT_BASE = self.test_dir / "codex"
         claude_save.OUTPUT_BASE = self.test_dir / "claude"
         agy_save.OUTPUT_BASE = self.test_dir / "agy"
+        codex_save.STATE_DIR = self.test_dir / "codex_state"
+        claude_save.STATE_DIR = self.test_dir / "claude_state"
+        agy_save.STATE_DIR = self.test_dir / "agy_state"
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -31,11 +35,11 @@ class TestSaveScripts(unittest.TestCase):
         version = (Path(__file__).parent.parent / "VERSION").read_text(
             encoding="utf-8"
         ).strip()
-        for save_module in (codex_save, claude_save, agy_save):
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
             self.assertEqual(save_module.__version__, version)
 
     def test_output_dir_defaults_to_vault_relative_path(self):
-        for save_module in (codex_save, claude_save, agy_save):
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("OBSIDIAN_OUTPUT_DIR", None)
                 self.assertEqual(save_module.resolve_output_dir(), Path("生成AI/ChatLog"))
@@ -658,6 +662,107 @@ Response text
         content = md_path.read_text(encoding="utf-8")
         self.assertIn("Atomic response", content)
         self.assertIn("<!-- last_id: 1 -->", content)
+
+    def test_session_id_collision_avoidance_across_scripts(self):
+        now = datetime.now(JST)
+        for module, name in ((codex_save, "codex"), (claude_save, "claude"), (agy_save, "agy")):
+            ses_a = "test_col_00000001"
+            ses_b = "test_col_00000002"
+            path_a = module.create_md_file(ses_a, "myproj", now)
+            path_b = module.create_md_file(ses_b, "myproj", now)
+            self.assertNotEqual(path_a, path_b, f"{name} should not collide for sessions with same 8-char prefix")
+            self.assertTrue(path_a.name.endswith(f"{module.safe_session_key(ses_a)}.md"))
+            self.assertTrue(path_b.name.endswith(f"{module.safe_session_key(ses_b)}.md"))
+
+    def test_find_existing_md_supports_legacy_short_id(self):
+        for module, source in ((codex_save, "codex-cli"), (claude_save, "claude-code"), (agy_save, "antigravity-cli")):
+            session_id = f"legacy_session_{module.__name__}"
+            short_id = module.safe_filename_component(session_id[:8])
+            legacy_filename = f"20260101_120000_myproj_{short_id}.md"
+            legacy_path = module.OUTPUT_BASE / legacy_filename
+            content = (
+                "---\n"
+                f"source: {source}\n"
+                f"session_id: {module.yaml_quote(session_id)}\n"
+                "---\n"
+            )
+            module.OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+            module.atomic_write_text(legacy_path, content)
+
+            found = module.find_existing_md(session_id)
+            self.assertEqual(found, legacy_path, f"{module.__name__} should find legacy short-id file")
+
+    def test_find_existing_md_error_handling(self):
+        for module in (codex_save, claude_save, agy_save):
+            session_id = f"err_session_{module.__name__}"
+            module.OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+
+            # 1. glob が OSError を起こした場合は ExistingMarkdownSearchError
+            with mock.patch.object(module.Path, "iterdir", side_effect=OSError("directory failure")):
+                with self.assertRaises(module.ExistingMarkdownSearchError):
+                    module.find_existing_md(session_id)
+
+            # 2. 読めない候補が存在し、他に一致候補がない場合は ExistingMarkdownSearchError
+            bad_path = module.OUTPUT_BASE / f"20260101_120000_myproj_{module.safe_session_key(session_id)}.md"
+            bad_path.write_text("dummy", encoding="utf-8")
+            with mock.patch.object(module.Path, "read_text", side_effect=OSError("permission denied")):
+                with self.assertRaises(module.ExistingMarkdownSearchError):
+                    module.find_existing_md(session_id)
+            bad_path.unlink()
+
+            # 3. 読めない候補があっても別の候補で一致が確認できれば正常復帰
+            matching_path = module.OUTPUT_BASE / f"20260102_120000_myproj_{module.safe_session_key(session_id)}.md"
+            matching_path.write_text(f"---\nsession_id: {module.yaml_quote(session_id)}\n---\n", encoding="utf-8")
+            other_bad_path = module.OUTPUT_BASE / f"20260101_120000_myproj_{module.safe_filename_component(session_id[:8])}.md"
+            other_bad_path.write_text("dummy", encoding="utf-8")
+            os.chmod(other_bad_path, 0o000)
+
+            try:
+                found = module.find_existing_md(session_id)
+                self.assertEqual(found, matching_path)
+            finally:
+                os.chmod(other_bad_path, 0o644)
+                matching_path.unlink(missing_ok=True)
+                other_bad_path.unlink(missing_ok=True)
+
+    def test_cleanup_old_states_and_locks(self):
+        import fcntl
+        for module in (codex_save, claude_save, agy_save):
+            module.STATE_DIR.mkdir(parents=True, exist_ok=True)
+            old_time = (datetime.now(JST) - timedelta(days=35)).isoformat()
+            new_time = (datetime.now(JST) - timedelta(days=5)).isoformat()
+
+            # 1. 削除対象の古い state
+            old_ses = f"old_ses_{module.__name__}"
+            old_state_file = module.state_path(old_ses)
+            old_state_file.write_text(json.dumps({"last_used_at": old_time}), encoding="utf-8")
+            os.utime(old_state_file, (1000000, 1000000))
+
+            # 2. 保持対象の新しい state
+            new_ses = f"new_ses_{module.__name__}"
+            new_state_file = module.state_path(new_ses)
+            new_state_file.write_text(json.dumps({"last_used_at": new_time}), encoding="utf-8")
+
+            # 3. 古いがロック中の state
+            locked_ses = f"locked_ses_{module.__name__}"
+            locked_state_file = module.state_path(locked_ses)
+            locked_state_file.write_text(json.dumps({"last_used_at": old_time}), encoding="utf-8")
+            os.utime(locked_state_file, (1000000, 1000000))
+
+            lock_dir = module.STATE_DIR / ".locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_dir / f"{module.safe_session_key(locked_ses)}.lock"
+            with open(lock_path, "a", encoding="utf-8") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                module.cleanup_old_states()
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+            self.assertFalse(old_state_file.exists(), f"Old state should be deleted for {module.__name__}")
+            self.assertTrue(new_state_file.exists(), f"New state should be kept for {module.__name__}")
+            self.assertTrue(locked_state_file.exists(), f"Locked state should be protected for {module.__name__}")
+
+            new_state_file.unlink(missing_ok=True)
+            locked_state_file.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

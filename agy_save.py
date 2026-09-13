@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import json
 import re
@@ -142,6 +142,10 @@ def atomic_write_text(path: Path, content: str) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
+class ExistingMarkdownSearchError(Exception):
+    """既存Markdown探索中のI/Oエラー。誤上書き・重複作成を防ぐために使用。"""
+
+
 @contextmanager
 def session_lock(session_id: str):
     """同一セッションの hook 実行を直列化する。"""
@@ -154,6 +158,33 @@ def session_lock(session_id: str):
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def try_session_lock(session_id: str, *, is_key: bool = False):
+    """同一セッションの hook 実行を非ブロッキングで試みる。取得できなければ False を yield。"""
+    lock_dir = STATE_DIR / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{session_id if is_key else safe_session_key(session_id)}.lock"
+    try:
+        lock_file = open(lock_path, "a", encoding="utf-8")
+    except OSError:
+        yield False
+        return
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        lock_file.close()
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()
 
 
 def session_locked(input_key: str):
@@ -183,6 +214,7 @@ def load_state(session_id: str) -> dict:
 
 def save_state(session_id: str, state: dict) -> None:
     """atomicに保存（temp→rename）"""
+    state["last_used_at"] = format_iso(now_jst())
     path = state_path(session_id)
     atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
 
@@ -193,20 +225,37 @@ def cleanup_old_states() -> None:
         return
     cutoff = datetime.now(JST) - timedelta(days=STATE_RETENTION_DAYS)
     removed = 0
-    for f in STATE_DIR.glob("*.json"):
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            start_time_str = data.get("start_time", "")
-            if not start_time_str:
+    try:
+        candidates = list(STATE_DIR.glob("*.json"))
+    except OSError as e:
+        logger.warning("state探索に失敗したためクリーンアップを見送ります: %s", e)
+        return
+    for f in candidates:
+        session_key = f.stem
+        with try_session_lock(session_key, is_key=True) as acquired:
+            if not acquired:
                 continue
-            start = datetime.fromisoformat(start_time_str)
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=JST)
-            if start < cutoff:
-                f.unlink()
-                removed += 1
-        except Exception as e:
-            logger.info(f"stateファイルのクリーンアップ中にスキップ: {f.name}: {e}")
+            try:
+                if not f.exists():
+                    continue
+                data = json.loads(f.read_text(encoding="utf-8"))
+                last_used_str = data.get("last_used_at")
+                last_used = None
+                if last_used_str:
+                    try:
+                        last_used = datetime.fromisoformat(str(last_used_str))
+                        if last_used.tzinfo is None:
+                            last_used = last_used.replace(tzinfo=JST)
+                    except ValueError:
+                        pass
+                if last_used is None:
+                    last_used = datetime.fromtimestamp(f.stat().st_mtime, tz=JST)
+
+                if last_used < cutoff:
+                    f.unlink()
+                    removed += 1
+            except Exception as e:
+                logger.info(f"stateファイルのクリーンアップ中にスキップ: {f.name}: {e}")
     if removed > 0:
         logger.info(f"古いstateファイル {removed} 件を削除しました")
 
@@ -567,8 +616,8 @@ def create_md_file(
 ) -> Path:
     date_dir = start_dt.strftime("%Y%m%d")
     time_prefix = start_dt.strftime("%H%M%S")
-    short_id = safe_filename_component(session_id[:8]) if session_id else "unknown"
-    short_id = short_id or "unknown"
+    session_key = safe_session_key(session_id) if session_id else "unknown"
+    session_key = session_key or "unknown"
 
     # プロジェクト名の取得
     project_name = safe_filename_component(Path(cwd).name) if cwd else ""
@@ -577,9 +626,9 @@ def create_md_file(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if project_name:
-        filename = f"{date_dir}_{time_prefix}_{project_name}_{short_id}.md"
+        filename = f"{date_dir}_{time_prefix}_{project_name}_{session_key}.md"
     else:
-        filename = f"{date_dir}_{time_prefix}_{short_id}.md"
+        filename = f"{date_dir}_{time_prefix}_{session_key}.md"
 
     path = output_dir / filename
     fm = build_frontmatter(
@@ -598,28 +647,62 @@ def find_existing_md(session_id: str) -> Path | None:
     """state消失時に frontmatter の session_id から既存Markdownを探す。"""
     if not OUTPUT_BASE.exists():
         return None
-    short_id = safe_filename_component(session_id[:8]) or "unknown"
+    identifiers = []
+    full_key = safe_session_key(session_id)
+    short_key = safe_filename_component(session_id[:8]) if session_id else ""
+    if full_key:
+        identifiers.append(full_key)
+    if short_key and short_key not in identifiers:
+        identifiers.append(short_key)
+    if not identifiers:
+        identifiers.append("unknown")
+
     expected = {
         f"session_id: {yaml_quote(session_id)}",
         f"session_id: {session_id}",  # 旧形式との互換性
     }
+
+    candidates = set()
     try:
-        candidates = sorted(
-            OUTPUT_BASE.glob(f"*_{short_id}.md"),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        )
+        # globは一部の読み取りエラーを抑制するため、ディレクトリを直接列挙する。
+        for path in OUTPUT_BASE.iterdir():
+            if any(path.name.endswith(f"_{identifier}.md") for identifier in identifiers):
+                candidates.add(path)
     except OSError as e:
-        logger.warning(f"既存Markdownの探索に失敗: {e}")
-        return None
+        raise ExistingMarkdownSearchError(f"既存Markdown候補の列挙に失敗しました: {e}")
+
+    candidate_entries = []
     for candidate in candidates:
         try:
+            candidate_entries.append((candidate, candidate.stat().st_mtime))
+        except OSError as e:
+            raise ExistingMarkdownSearchError(f"既存Markdown候補の情報取得に失敗しました: {candidate}: {e}")
+
+    candidate_entries.sort(key=lambda item: item[1], reverse=True)
+
+    had_read_error = False
+    last_read_error = None
+    for candidate, _ in candidate_entries:
+        try:
             content = candidate.read_text(encoding="utf-8")
-            frontmatter = content.split("---", 2)[1]
-            if any(line in frontmatter.splitlines() for line in expected):
-                return candidate
-        except (OSError, IndexError, UnicodeError):
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                frontmatter_lines = [line.strip() for line in parts[1].splitlines()]
+                if any(exp in frontmatter_lines for exp in expected):
+                    return candidate
+        except (OSError, UnicodeError) as e:
+            had_read_error = True
+            last_read_error = e
+            logger.warning(f"既存Markdown候補の読み込みに失敗したためスキップします: {candidate}: {e}")
             continue
+        except IndexError:
+            continue
+
+    if had_read_error:
+        raise ExistingMarkdownSearchError(
+            f"既存Markdown候補の読み取りに失敗したファイルが存在し、一致を確認できなかったため探索を中断します: {last_read_error}"
+        )
+
     return None
 
 
@@ -837,7 +920,11 @@ def handle_stop_event(hook_input: dict) -> None:
     state = load_state(session_id)
     if not state:
         cleanup_old_states()
-        recovered_path = find_existing_md(session_id)
+        try:
+            recovered_path = find_existing_md(session_id)
+        except ExistingMarkdownSearchError as e:
+            logger.error(f"既存Markdownの探索中にエラーが発生したため保存を見送ります: {e}")
+            return
         if recovered_path is not None:
             recovered_last_id = read_last_id_from_md(recovered_path) or ""
             start_dt = datetime.fromtimestamp(recovered_path.stat().st_mtime, tz=JST)

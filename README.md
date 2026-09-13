@@ -38,10 +38,10 @@ Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_lim
 
 ## インストール元の取得
 
-リリース版の利用を推奨します。次の例では`v1.1.0`を取得します。
+リリース版の利用を推奨します。次の例では`v1.2.0`を取得します。
 
 ```bash
-git clone --branch v1.1.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
+git clone --branch v1.2.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
 cd cli-to-obsidian
 ```
 
@@ -64,6 +64,7 @@ export OBSIDIAN_OUTPUT_DIR="AI/Conversations"
 $OBSIDIAN_VAULT/AI/Conversations/codex-cli/
 $OBSIDIAN_VAULT/AI/Conversations/antigravity-cli/
 $OBSIDIAN_VAULT/AI/Conversations/claude-code/
+$OBSIDIAN_VAULT/AI/Conversations/opencode/
 ```
 
 ### ファイル名
@@ -71,8 +72,10 @@ $OBSIDIAN_VAULT/AI/Conversations/claude-code/
 保存ファイル名は次の形式です。
 
 ```text
-{YYYYMMDD}_{HHMMSS}_{project}_{session_id先頭8文字}.md
+{YYYYMMDD}_{HHMMSS}_{project}_{session_id}.md
 ```
+
+プロジェクト名がない場合は `{YYYYMMDD}_{HHMMSS}_{session_id}.md` です。`session_id` はファイル名として安全な文字に変換されます。過去に保存された先頭8文字形式のファイルも自動探索され、追記が継続されます。
 
 ## Codex CLIとChatGPTデスクトップアプリ
 
@@ -212,6 +215,7 @@ AntigravityとClaude Codeの新規出力にはquota情報は含まれません�
 - Codex: `~/.codex/codex-obsidian/log/codex_obsidian_save.log`
 - Antigravity: `~/.gemini/agy-obsidian/log/obsidian_save.log`
 - Claude Code: `~/.claude/claude-obsidian/log/claude_obsidian_save.log`
+- OpenCode: `~/.local/state/opencode-obsidian/opencode_obsidian_save.log`
 
 詳細ログが必要な場合は、hookを起動する環境で`DEBUG=1`を設定します。`OBSIDIAN_VAULT`が存在しない場合は自動作成されますが、親ディレクトリへの書き込み権限が必要です。
 
@@ -234,7 +238,7 @@ AntigravityとClaude Codeの新規出力にはquota情報は含まれません�
 - **Atomic書き込み**: Markdownとstateを同一ディレクトリの一時ファイルへ書いてからrenameします。
 - **同時実行への対応**: セッション単位のファイルロックでhookの重複実行を防ぎます。
 - **安全なメタデータとファイル名**: YAML文字列、session ID、プロジェクト名を安全な形式に変換します。
-- **古いstateのクリーンアップ**: 30日以上経過したstateファイルを自動的に削除します。
+- **古いstateのクリーンアップ**: 30日間利用されていないstateファイルを自動的に削除します（非ブロッキングロックで実行中セッションを保護）。
 
 ## 謝辞
 

@@ -3,13 +3,14 @@ from __future__ import annotations
 
 """OpenCode プラグインから渡された会話を Obsidian に保存する。"""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import fcntl
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import tempfile
@@ -35,6 +36,7 @@ def resolve_output_dir(value: Optional[str] = None) -> Path:
 OUTPUT_BASE = OBSIDIAN_VAULT / resolve_output_dir() / "opencode"
 STATE_DIR = Path.home() / ".local" / "state" / "opencode-obsidian"
 LOG_FILE = STATE_DIR / "opencode_obsidian_save.log"
+STATE_RETENTION_DAYS = 30
 SAFE_SESSION_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -44,20 +46,32 @@ def setup_logger() -> logging.Logger:
         return logger
     logger.setLevel(logging.DEBUG if os.environ.get("DEBUG") else logging.INFO)
     formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    file_log_error = None
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        handler = RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=5 * 1024 * 1024,  # 5MB
+            backupCount=3,
+            encoding="utf-8",
+        )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-    except OSError:
-        pass
+    except OSError as e:
+        file_log_error = e
     stderr = logging.StreamHandler()
     stderr.setFormatter(formatter)
     logger.addHandler(stderr)
+    if file_log_error is not None:
+        logger.warning("ファイルログを初期化できないためstderrのみ使用します: %s", file_log_error)
     return logger
 
 
 logger = setup_logger()
+
+
+class ExistingMarkdownSearchError(Exception):
+    """既存Markdown探索中のI/Oエラー。誤上書き・重複作成を防ぐために使用。"""
 
 
 @contextmanager
@@ -71,6 +85,33 @@ def session_lock(session_id: str):
             yield
         finally:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def try_session_lock(session_id: str, *, is_key: bool = False):
+    """同一セッションの hook 実行を非ブロッキングで試みる。取得できなければ False を yield。"""
+    lock_dir = STATE_DIR / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{session_id if is_key else safe_session_key(session_id)}.lock"
+    try:
+        stream = open(lock_path, "a", encoding="utf-8")
+    except OSError:
+        yield False
+        return
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        stream.close()
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        stream.close()
 
 
 def safe_session_key(session_id: str) -> str:
@@ -114,7 +155,49 @@ def load_state(session_id: str) -> Dict[str, Any]:
 
 
 def save_state(session_id: str, state: Dict[str, Any]) -> None:
+    state["last_used_at"] = format_iso(datetime.now(JST))
     atomic_write(state_path(session_id), json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def cleanup_old_states() -> None:
+    """STATE_RETENTION_DAYS日以上前のstateファイルを削除"""
+    if not STATE_DIR.exists():
+        return
+    cutoff = datetime.now(JST) - timedelta(days=STATE_RETENTION_DAYS)
+    removed = 0
+    try:
+        candidates = list(STATE_DIR.glob("*.json"))
+    except OSError as e:
+        logger.warning("state探索に失敗したためクリーンアップを見送ります: %s", e)
+        return
+    for f in candidates:
+        session_key = f.stem
+        with try_session_lock(session_key, is_key=True) as acquired:
+            if not acquired:
+                continue
+            try:
+                if not f.exists():
+                    continue
+                data = json.loads(f.read_text(encoding="utf-8"))
+                last_used_str = data.get("last_used_at")
+                last_used = None
+                if last_used_str:
+                    try:
+                        last_used = datetime.fromisoformat(str(last_used_str))
+                        if last_used.tzinfo is None:
+                            last_used = last_used.replace(tzinfo=JST)
+                    except ValueError:
+                        pass
+                if last_used is None:
+                    last_used = datetime.fromtimestamp(f.stat().st_mtime, tz=JST)
+
+                if last_used < cutoff:
+                    f.unlink()
+                    removed += 1
+            except Exception as e:
+                logger.info("stateファイルのクリーンアップ中にスキップ: %s: %s", f.name, e)
+    if removed > 0:
+        logger.info("古いstateファイル %d 件を削除しました", removed)
 
 
 def yaml_quote(value: Any) -> str:
@@ -390,20 +473,64 @@ def merge_messages(
 
 
 def find_existing_md(session_id: str) -> Optional[Path]:
-    identifiers = [safe_session_key(session_id), safe_filename_component(session_id[:8]) or "unknown"]
     if not OUTPUT_BASE.exists():
         return None
-    candidates = {
-        path
-        for identifier in identifiers
-        for path in OUTPUT_BASE.glob(f"*_{identifier}.md")
+    identifiers = []
+    full_key = safe_session_key(session_id)
+    short_key = safe_filename_component(session_id[:8]) if session_id else ""
+    if full_key:
+        identifiers.append(full_key)
+    if short_key and short_key not in identifiers:
+        identifiers.append(short_key)
+    if not identifiers:
+        identifiers.append("unknown")
+
+    expected = {
+        f"session_id: {yaml_quote(session_id)}",
+        f"session_id: {session_id}",
     }
-    for path in sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True):
+
+    candidates = set()
+    try:
+        # globは一部の読み取りエラーを抑制するため、ディレクトリを直接列挙する。
+        for path in OUTPUT_BASE.iterdir():
+            if any(path.name.endswith(f"_{identifier}.md") for identifier in identifiers):
+                candidates.add(path)
+    except OSError as e:
+        raise ExistingMarkdownSearchError(f"既存Markdown候補の列挙に失敗しました: {e}")
+
+    candidate_entries = []
+    for candidate in candidates:
         try:
-            if f"session_id: {yaml_quote(session_id)}" in path.read_text(encoding="utf-8").split("---", 2)[1]:
-                return path
-        except (OSError, IndexError, UnicodeError):
+            candidate_entries.append((candidate, candidate.stat().st_mtime))
+        except OSError as e:
+            raise ExistingMarkdownSearchError(f"既存Markdown候補の情報取得に失敗しました: {candidate}: {e}")
+
+    candidate_entries.sort(key=lambda item: item[1], reverse=True)
+
+    had_read_error = False
+    last_read_error = None
+    for candidate, _ in candidate_entries:
+        try:
+            content = candidate.read_text(encoding="utf-8")
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                frontmatter_lines = [line.strip() for line in parts[1].splitlines()]
+                if any(exp in frontmatter_lines for exp in expected):
+                    return candidate
+        except (OSError, UnicodeError) as e:
+            had_read_error = True
+            last_read_error = e
+            logger.warning(f"既存Markdown候補の読み込みに失敗したためスキップします: {candidate}: {e}")
             continue
+        except IndexError:
+            continue
+
+    if had_read_error:
+        raise ExistingMarkdownSearchError(
+            f"既存Markdown候補の読み取りに失敗したファイルが存在し、一致を確認できなかったため探索を中断します: {last_read_error}"
+        )
+
     return None
 
 
@@ -526,7 +653,13 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
     cwd = str(payload.get("cwd", "") or os.getcwd())
     messages = extract_messages(payload.get("messages") or [])
     state = load_state(session_id)
-    output_path = Path(state["output_path"]) if state.get("output_path") else find_existing_md(session_id)
+    if not state:
+        cleanup_old_states()
+    try:
+        output_path = Path(state["output_path"]) if state.get("output_path") else find_existing_md(session_id)
+    except ExistingMarkdownSearchError as e:
+        logger.error("既存Markdownの探索中にエラーが発生したため保存を見送ります: %s", e)
+        return None
     stored_messages = state.get("messages") if isinstance(state.get("messages"), list) else []
     if not stored_messages and output_path is not None:
         stored_messages = parse_existing_markdown(output_path)
@@ -549,13 +682,17 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
     ).hexdigest()
     if state.get("payload_hash") == payload_hash and output_path is not None and output_path.exists():
         logger.debug("同じ payload のため保存をスキップ %s", session_id[:8])
+        save_state(session_id, state)
         return output_path
     if output_path is None:
         created = parse_datetime(payload.get("created"))
-        project = safe_filename_component(Path(cwd).name) or "project"
-        short_id = safe_session_key(session_id)
+        project = safe_filename_component(Path(cwd).name) if cwd else ""
+        session_key = safe_session_key(session_id) or "unknown"
         OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
-        output_path = OUTPUT_BASE / f"{created:%Y%m%d}_{created:%H%M%S}_{project}_{short_id}.md"
+        if project:
+            output_path = OUTPUT_BASE / f"{created:%Y%m%d}_{created:%H%M%S}_{project}_{session_key}.md"
+        else:
+            output_path = OUTPUT_BASE / f"{created:%Y%m%d}_{created:%H%M%S}_{session_key}.md"
         state = {"output_path": str(output_path), "created": format_iso(created), "cwd": cwd}
     else:
         fallback_created = datetime.now(JST)

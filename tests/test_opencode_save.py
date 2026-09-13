@@ -269,6 +269,195 @@ class TestOpenCodeSave(unittest.TestCase):
         self.assertEqual(opencode_save.resolve_output_dir("/tmp/out"), Path("生成AI/ChatLog"))
         self.assertEqual(opencode_save.resolve_output_dir("AI/../out"), Path("生成AI/ChatLog"))
 
+    def test_opencode_find_existing_md_supports_legacy_short_id(self):
+        session_id = "ses_legacy_opencode_test"
+        short_id = opencode_save.safe_filename_component(session_id[:8])
+        legacy_filename = f"20260101_120000_myproj_{short_id}.md"
+        legacy_path = opencode_save.OUTPUT_BASE / legacy_filename
+        content = (
+            "---\n"
+            "source: opencode\n"
+            f"session_id: {opencode_save.yaml_quote(session_id)}\n"
+            "---\n\n"
+            "# User: 過去の質問\n"
+            "> [!QUESTION] User\n"
+            "> 過去の質問\n\n"
+            "> [!NOTE] OpenCode\n\n"
+            "過去の回答\n\n"
+        )
+        opencode_save.OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+        opencode_save.atomic_write(legacy_path, content)
+
+        found = opencode_save.find_existing_md(session_id)
+        self.assertEqual(found, legacy_path)
+
+        payload = {
+            "session_id": session_id,
+            "cwd": "/tmp/myproj",
+            "messages": [
+                {"info": {"id": "u2", "role": "user", "time": {"created": 1722988860000}}, "parts": [{"type": "text", "text": "新しい質問"}]},
+                {"info": {"id": "a2", "role": "assistant", "time": {"created": 1722988865000}}, "parts": [{"type": "text", "text": "新しい回答"}]},
+            ],
+        }
+        res_path = opencode_save.handle_payload(payload)
+        self.assertEqual(res_path, legacy_path)
+        saved_text = legacy_path.read_text(encoding="utf-8")
+        self.assertIn("過去の質問", saved_text)
+        self.assertIn("新しい質問", saved_text)
+
+    def test_opencode_cleanup_old_states_and_locked_session(self):
+        import fcntl
+        import json
+        from datetime import datetime, timezone, timedelta
+        jst = timezone(timedelta(hours=9))
+        opencode_save.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        old_time = (datetime.now(jst) - timedelta(days=35)).isoformat()
+        new_time = (datetime.now(jst) - timedelta(days=5)).isoformat()
+
+        # 1. 削除対象の古い state
+        old_ses = "old_opencode_ses"
+        old_file = opencode_save.state_path(old_ses)
+        old_file.write_text(json.dumps({"last_used_at": old_time}), encoding="utf-8")
+        os.utime(old_file, (1000000, 1000000))
+
+        # 2. 保持対象の新しい state
+        new_ses = "new_opencode_ses"
+        new_file = opencode_save.state_path(new_ses)
+        new_file.write_text(json.dumps({"last_used_at": new_time}), encoding="utf-8")
+
+        # 3. 古いがロック中の state
+        locked_ses = "locked_opencode_ses"
+        locked_file = opencode_save.state_path(locked_ses)
+        locked_file.write_text(json.dumps({"last_used_at": old_time}), encoding="utf-8")
+        os.utime(locked_file, (1000000, 1000000))
+
+        lock_dir = opencode_save.STATE_DIR / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{opencode_save.safe_session_key(locked_ses)}.lock"
+        with open(lock_path, "a", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            opencode_save.cleanup_old_states()
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+        self.assertFalse(old_file.exists())
+        self.assertTrue(new_file.exists())
+        self.assertTrue(locked_file.exists())
+
+        new_file.unlink(missing_ok=True)
+        locked_file.unlink(missing_ok=True)
+
+    def test_opencode_identical_payload_updates_last_used_at(self):
+        import json
+        payload = {
+            "session_id": "ses_payload_repeat",
+            "cwd": "/tmp/example",
+            "messages": [{"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "同じ内容"}]}],
+        }
+        opencode_save.handle_payload(payload)
+        state1 = opencode_save.load_state("ses_payload_repeat")
+        self.assertIn("last_used_at", state1)
+
+        state1["last_used_at"] = "2026-01-01T00:00:00+09:00"
+        opencode_save.atomic_write(opencode_save.state_path("ses_payload_repeat"), json.dumps(state1))
+
+        opencode_save.handle_payload(payload)
+        state2 = opencode_save.load_state("ses_payload_repeat")
+        self.assertNotEqual(state2["last_used_at"], "2026-01-01T00:00:00+09:00")
+
+    def test_opencode_find_existing_md_error_handling(self):
+        from unittest import mock
+        session_id = "ses_err_opencode"
+        opencode_save.OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.object(opencode_save.Path, "iterdir", side_effect=OSError("directory error")):
+            with self.assertRaises(opencode_save.ExistingMarkdownSearchError):
+                opencode_save.find_existing_md(session_id)
+
+            payload = {"session_id": session_id, "cwd": "/tmp/example", "messages": [{"info": {"role": "user"}, "parts": [{"type": "text", "text": "テスト"}]}]}
+            res = opencode_save.handle_payload(payload)
+            self.assertIsNone(res)
+
+        bad_path = opencode_save.OUTPUT_BASE / f"20260101_120000_myproj_{opencode_save.safe_session_key(session_id)}.md"
+        bad_path.write_text("dummy", encoding="utf-8")
+        os.chmod(bad_path, 0o000)
+        try:
+            with self.assertRaises(opencode_save.ExistingMarkdownSearchError):
+                opencode_save.find_existing_md(session_id)
+        finally:
+            os.chmod(bad_path, 0o644)
+            bad_path.unlink(missing_ok=True)
+
+    def test_opencode_resume_after_state_cleaned_up(self):
+        session_id = "ses_resume_after_cleanup"
+        first_payload = {
+            "session_id": session_id,
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user", "time": {"created": 1722988800000}}, "parts": [{"type": "text", "text": "1回目の質問"}]},
+                {"info": {"id": "a1", "role": "assistant", "time": {"created": 1722988805000}}, "parts": [{"type": "text", "text": "1回目の回答"}]},
+            ],
+        }
+        md_path = opencode_save.handle_payload(first_payload)
+        self.assertIsNotNone(md_path)
+
+        import json
+        from datetime import datetime, timedelta
+        old_state = opencode_save.load_state(session_id)
+        old_state["last_used_at"] = (datetime.now(opencode_save.JST) - timedelta(days=35)).isoformat()
+        opencode_save.state_path(session_id).write_text(json.dumps(old_state), encoding="utf-8")
+        opencode_save.cleanup_old_states()
+        self.assertFalse(opencode_save.state_path(session_id).exists())
+
+        second_payload = {
+            "session_id": session_id,
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u2", "role": "user", "time": {"created": 1722988860000}}, "parts": [{"type": "text", "text": "2回目の質問"}]},
+                {"info": {"id": "a2", "role": "assistant", "time": {"created": 1722988865000}}, "parts": [{"type": "text", "text": "2回目の回答"}]},
+            ],
+        }
+        res_path = opencode_save.handle_payload(second_payload)
+        self.assertEqual(res_path, md_path)
+        content = md_path.read_text(encoding="utf-8")
+        self.assertIn("1回目の質問", content)
+        self.assertIn("1回目の回答", content)
+        self.assertIn("2回目の質問", content)
+        self.assertIn("2回目の回答", content)
+        self.assertIn("message_count: 4", content)
+
+
+class TestSharedStateRetention(unittest.TestCase):
+    def test_last_use_and_mtime_fallback_across_all_scripts(self):
+        import json
+        from datetime import datetime, timedelta
+        from unittest.mock import patch
+        import codex_save
+        import claude_save
+        import agy_save
+
+        for module in (codex_save, claude_save, agy_save, opencode_save):
+            with self.subTest(script=module.__name__), tempfile.TemporaryDirectory() as root:
+                with patch.object(module, "STATE_DIR", Path(root)):
+                    now = datetime.now(module.JST)
+                    old = now - timedelta(days=35)
+                    expired = module.state_path("expired")
+                    expired.write_text(json.dumps({"last_used_at": old.isoformat()}))
+                    legacy = module.state_path("legacy")
+                    legacy.write_text(json.dumps({"created": now.isoformat(), "start_time": now.isoformat()}))
+                    os.utime(legacy, (old.timestamp(), old.timestamp()))
+                    active = module.state_path("active")
+                    active.write_text(json.dumps({"last_used_at": now.isoformat()}))
+                    os.utime(active, (old.timestamp(), old.timestamp()))
+                    long_id = "x" * 120
+                    locked = module.state_path(long_id)
+                    locked.write_text(json.dumps({"last_used_at": old.isoformat()}))
+                    with module.session_lock(long_id):
+                        module.cleanup_old_states()
+                    self.assertFalse(expired.exists())
+                    self.assertFalse(legacy.exists())
+                    self.assertTrue(active.exists())
+                    self.assertTrue(locked.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
