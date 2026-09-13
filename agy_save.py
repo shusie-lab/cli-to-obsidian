@@ -97,6 +97,7 @@ def setup_logger() -> logging.Logger:
 
 
 logger = setup_logger()
+METADATA_EXTENSION = None  # 個人用エントリーポイントからのみ設定する任意の拡張。
 
 
 # ============================================================
@@ -766,6 +767,8 @@ def update_markdown_metadata(
     )
 
     new_content = "---\n" + "\n".join(new_fm_lines) + "\n---\n" + body_text
+    if METADATA_EXTENSION is not None:
+        new_content = METADATA_EXTENSION.transform_markdown(new_content)
     atomic_write_md(path, new_content)
 
 
@@ -856,6 +859,8 @@ def append_messages(
             appended += 1
 
         elif m_type == "agent_message":
+            if METADATA_EXTENSION is not None:
+                m_model += METADATA_EXTENSION.message_suffix(m_model)
             meta_part = f"> <small>🤖 {m_model}</small>\n" if m_model else ""
             meta_line = f"> <small>🤖 {m_model}</small>" if m_model else ""
             callout_header = f"> [!NOTE] {AGENT_NAME}\n{meta_line}".strip() if meta_line else f"> [!NOTE] {AGENT_NAME}"
@@ -938,6 +943,9 @@ def handle_stop_event(hook_input: dict) -> None:
             save_state(session_id, state)
             logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
 
+    if METADATA_EXTENSION is not None:
+        METADATA_EXTENSION.prepare(state, is_app)
+
     if not state or "output_path" not in state:
         start_dt = now_jst()
         path = create_md_file(
@@ -1003,8 +1011,12 @@ def handle_stop_event(hook_input: dict) -> None:
         )
         if new_last_id:
             state["last_id"] = new_last_id
+        if updated and METADATA_EXTENSION is not None:
+            METADATA_EXTENSION.after_append()
         save_state(session_id, state)
         logger.info(f"{appended}件追記完了 {session_id[:8]}")
+    else:
+        save_state(session_id, state)
 
 
 
