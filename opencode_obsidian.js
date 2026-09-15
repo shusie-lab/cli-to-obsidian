@@ -72,6 +72,7 @@ const OpenCodeObsidianPlugin = async ({ client, directory, $ }) => {
         cwd: directory || process.cwd(),
         created: Date.now(),
         modelID: input.model?.modelID || "",
+        providerID: input.model?.providerID || input.providerID || "",
         messages: [{
           info: {
             role: "user",
@@ -86,7 +87,13 @@ const OpenCodeObsidianPlugin = async ({ client, directory, $ }) => {
       const draft = drafts.get(input.sessionID)
       if (!draft || !output.text?.trim()) return
       draft.messages.push({
-        info: { role: "assistant", modelID: draft.modelID, time: { created: Date.now() }, id: input.messageID },
+        info: {
+          role: "assistant",
+          modelID: draft.modelID,
+          providerID: draft.providerID,
+          time: { created: Date.now() },
+          id: input.messageID,
+        },
         parts: [{ type: "text", text: output.text }],
       })
       await enqueueSave(input.sessionID, async () => draft)

@@ -2,7 +2,9 @@ import os
 import sys
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/.."))
 import opencode_save
@@ -50,6 +52,327 @@ class TestOpenCodeSave(unittest.TestCase):
         self.assertIn("2024-08-07 09:00:00", opencode_save.format_message_time(messages[0]["timestamp"]))
         self.assertEqual(opencode_save.format_message_time("invalid timestamp"), "")
 
+    def test_extracts_provider_id_from_opencode_messages(self):
+        messages = opencode_save.extract_messages([
+            {
+                "info": {"role": "assistant", "providerID": "openrouter", "modelID": "test-model"},
+                "parts": [{"type": "text", "text": "回答"}],
+            },
+            {
+                "type": "assistant",
+                "model": {"providerID": "anthropic", "modelID": "claude"},
+                "content": [{"type": "text", "text": "別の回答"}],
+            },
+        ])
+        self.assertEqual([item["provider"] for item in messages], ["openrouter", "anthropic"])
+
+    def test_render_markdown_full_snapshot_with_fixed_modified_time(self):
+        created = opencode_save.datetime(2026, 9, 14, 10, 0, tzinfo=opencode_save.JST)
+        modified = opencode_save.datetime(2026, 9, 14, 10, 5, tzinfo=opencode_save.JST)
+        messages = [
+            {
+                "type": "user",
+                "text": "Snapshot question",
+                "timestamp": "2026-09-14T10:00:00+09:00",
+            },
+            {
+                "type": "assistant",
+                "text": "Snapshot answer",
+                "timestamp": "2026-09-14T10:00:01+09:00",
+                "model": "snapshot-model",
+            },
+        ]
+
+        actual = opencode_save.render_markdown(
+            "snapshot-session",
+            "/tmp/example",
+            created,
+            messages,
+            modified=modified,
+        )
+
+        expected = (
+            "---\n"
+            "source: opencode\n"
+            'title: "Snapshot question"\n'
+            'session_id: "snapshot-session"\n'
+            'project: "/tmp/example"\n'
+            'created: "2026-09-14T10:00:00+09:00"\n'
+            'modified: "2026-09-14T10:05:00+09:00"\n'
+            "tags:\n"
+            "  - ai-conversation\n"
+            "  - opencode\n"
+            "message_count: 2\n"
+            "---\n\n"
+            "# Snapshot question\n"
+            "> [!QUESTION] User\n"
+            "> <small>⏱ 2026-09-14 10:00:00</small>\n"
+            ">\n"
+            "> Snapshot question\n\n"
+            "> [!NOTE] OpenCode\n"
+            "> <small>🤖 snapshot-model</small>\n\n"
+            "Snapshot answer\n\n"
+        )
+        self.assertEqual(actual, expected)
+
+    def test_openrouter_balance_is_recorded_once_per_answer(self):
+        payload = {
+            "session_id": "ses_openrouter_balance",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                {
+                    "info": {
+                        "id": "a1",
+                        "role": "assistant",
+                        "providerID": "openrouter",
+                        "modelID": "test-model",
+                    },
+                    "parts": [{"type": "text", "text": "回答"}],
+                },
+            ],
+        }
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request,
+            "urlopen",
+            return_value=BytesIO(b'{"data":{"total_credits":10,"total_usage":1.25}}'),
+        ) as urlopen:
+            path = opencode_save.handle_payload(payload)
+            opencode_save.handle_payload(payload)
+
+        self.assertEqual(urlopen.call_count, 1)
+        state = opencode_save.load_state("ses_openrouter_balance")
+        answer = state["messages"][1]
+        self.assertEqual(answer["provider"], "openrouter")
+        self.assertEqual(answer["openrouter_balance_usd"], 8.75)
+        self.assertTrue(answer["openrouter_balance_retrieved_at"])
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("OpenRouter balance: $8.75 USD", content)
+        self.assertIn("openrouter_balance_usd: 8.75", content)
+        self.assertIn("openrouter_balance_retrieved_at:", content)
+        recovered = opencode_save.parse_existing_markdown(path)
+        self.assertEqual(recovered[1]["text"], "回答")
+        self.assertEqual(recovered[1]["openrouter_balance_usd"], 8.75)
+
+    def test_other_provider_and_latest_non_openrouter_do_not_fetch_balance(self):
+        payload = {
+            "session_id": "ses_other_provider",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                {
+                    "info": {"id": "a1", "role": "assistant", "providerID": "openrouter"},
+                    "parts": [{"type": "text", "text": "過去の回答"}],
+                },
+                {"info": {"id": "u2", "role": "user"}, "parts": [{"type": "text", "text": "質問2"}]},
+                {
+                    "info": {"id": "a2", "role": "assistant", "providerID": "anthropic"},
+                    "parts": [{"type": "text", "text": "最新の回答"}],
+                },
+            ],
+            "full_sync": True,
+        }
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request, "urlopen"
+        ) as urlopen:
+            opencode_save.handle_payload(payload)
+        urlopen.assert_not_called()
+        state = opencode_save.load_state("ses_other_provider")
+        self.assertNotIn("openrouter_balance_usd", state["messages"][1])
+        self.assertEqual(state["messages"][3]["provider"], "anthropic")
+
+    def test_full_sync_fetches_only_newest_openrouter_answer(self):
+        first = {
+            "session_id": "ses_full_openrouter_balance",
+            "cwd": "/tmp/example",
+            "full_sync": True,
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問1"}]},
+                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答1"}]},
+                {"info": {"id": "u_old", "role": "user"}, "parts": [{"type": "text", "text": "質問別provider"}]},
+                {"info": {"id": "a_old", "role": "assistant", "providerID": "anthropic"}, "parts": [{"type": "text", "text": "回答別provider"}]},
+            ],
+        }
+        second = {
+            **first,
+            "messages": first["messages"] + [
+                {"info": {"id": "u2", "role": "user"}, "parts": [{"type": "text", "text": "質問2"}]},
+                {"info": {"id": "a2", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答2"}]},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request,
+            "urlopen",
+            return_value=BytesIO(b'{"data":{"total_credits":10,"total_usage":2}}'),
+        ) as urlopen:
+            opencode_save.handle_payload(first)
+            opencode_save.handle_payload(second)
+        self.assertEqual(urlopen.call_count, 1)
+        messages = opencode_save.load_state("ses_full_openrouter_balance")["messages"]
+        self.assertNotIn("openrouter_balance_usd", messages[1])
+        self.assertEqual(messages[5]["openrouter_balance_usd"], 8.0)
+
+    def test_state_loss_does_not_attach_new_balance_to_old_answer(self):
+        payload = {
+            "session_id": "ses_openrouter_state_loss",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答"}]},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request,
+            "urlopen",
+            side_effect=[
+                BytesIO(b'{"data":{"total_credits":10,"total_usage":1}}'),
+                BytesIO(b'{"data":{"total_credits":10,"total_usage":2}}'),
+            ],
+        ) as urlopen:
+            path = opencode_save.handle_payload(payload)
+            opencode_save.state_path("ses_openrouter_state_loss").unlink()
+            opencode_save.handle_payload(payload)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertIn("OpenRouter balance: $9 USD", path.read_text(encoding="utf-8"))
+        self.assertNotIn("$8 USD", path.read_text(encoding="utf-8"))
+
+    def test_state_loss_same_text_new_timestamp_gets_balance_only_on_new_answer(self):
+        def payload(user_id, assistant_id, timestamp):
+            return {
+                "session_id": "ses_openrouter_same_text_new_turn",
+                "cwd": "/tmp/example",
+                "messages": [
+                    {
+                        "info": {"id": user_id, "role": "user", "time": {"created": timestamp}},
+                        "parts": [{"type": "text", "text": "同じ質問"}],
+                    },
+                    {
+                        "info": {
+                            "id": assistant_id,
+                            "role": "assistant",
+                            "providerID": "openrouter",
+                            "time": {"created": timestamp + 5000},
+                        },
+                        "parts": [{"type": "text", "text": "同じ回答"}],
+                    },
+                ],
+            }
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            path = opencode_save.handle_payload(payload("u1", "a1", 1722988800000))
+        opencode_save.state_path("ses_openrouter_same_text_new_turn").unlink()
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request,
+            "urlopen",
+            return_value=BytesIO(b'{"data":{"total_credits":10,"total_usage":2}}'),
+        ) as urlopen:
+            opencode_save.handle_payload(payload("u2", "a2", 1722988860000))
+
+        self.assertEqual(urlopen.call_count, 1)
+        state_messages = opencode_save.load_state("ses_openrouter_same_text_new_turn")["messages"]
+        self.assertEqual(len(state_messages), 4)
+        self.assertNotIn("openrouter_balance_usd", state_messages[1])
+        self.assertEqual(state_messages[3]["openrouter_balance_usd"], 8.0)
+        self.assertIn("message_count: 4", path.read_text(encoding="utf-8"))
+
+    def test_old_markdown_without_balance_is_not_refreshed_on_duplicate_recovery(self):
+        payload = {
+            "session_id": "ses_openrouter_old_markdown",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "過去の質問"}]},
+                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "過去の回答"}]},
+            ],
+        }
+        with mock.patch.dict(os.environ, {}, clear=True):
+            path = opencode_save.handle_payload(payload)
+        opencode_save.state_path("ses_openrouter_old_markdown").unlink()
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request, "urlopen"
+        ) as urlopen:
+            opencode_save.handle_payload(payload)
+        urlopen.assert_not_called()
+        self.assertNotIn("OpenRouter balance", path.read_text(encoding="utf-8"))
+
+    def test_invalid_openrouter_credits_do_not_break_save(self):
+        invalid_responses = (
+            b'{"data":{"total_credits":true,"total_usage":0}}',
+            b'{"data":{"total_credits":"10","total_usage":0}}',
+            b'{"data":{"total_credits":NaN,"total_usage":0}}',
+            b'{"data":{"total_credits":Infinity,"total_usage":0}}',
+            b'{"data":{"total_credits":10,"total_usage":Infinity}}',
+            b'{"data":{"total_credits":10,"total_usage":0}',
+            b"not-json",
+        )
+        for response in invalid_responses:
+            with self.subTest(response=response), mock.patch.dict(
+                os.environ, {"OPENROUTER_API_KEY": "test-secret"}
+            ), mock.patch.object(opencode_save.urllib_request, "urlopen", return_value=BytesIO(response)):
+                self.assertIsNone(opencode_save.fetch_openrouter_balance())
+
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request, "urlopen", side_effect=TimeoutError("timed out")
+        ):
+            self.assertIsNone(opencode_save.fetch_openrouter_balance())
+
+        huge_int = b'{"data":{"total_credits":' + (b"9" * 5000) + b',"total_usage":0}}'
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request, "urlopen", return_value=BytesIO(huge_int)
+        ):
+            self.assertIsNone(opencode_save.fetch_openrouter_balance())
+
+    def test_missing_key_and_http_403_do_not_call_or_record_balance(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            opencode_save.urllib_request, "urlopen"
+        ) as urlopen:
+            self.assertIsNone(opencode_save.fetch_openrouter_balance())
+        urlopen.assert_not_called()
+
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request,
+            "urlopen",
+            side_effect=opencode_save.urllib_error.HTTPError(
+                opencode_save.OPENROUTER_CREDITS_URL, 403, "forbidden", {}, None
+            ),
+        ):
+            self.assertIsNone(opencode_save.fetch_openrouter_balance())
+
+    def test_api_failure_still_saves_answer_without_secret(self):
+        payload = {
+            "session_id": "ses_openrouter_failure",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答"}]},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
+            opencode_save.urllib_request, "urlopen", side_effect=TimeoutError("timed out")
+        ):
+            path = opencode_save.handle_payload(payload)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("回答", content)
+        self.assertNotIn("test-secret", content)
+        self.assertNotIn("openrouter_balance_usd", content)
+
+    def test_provider_change_is_in_payload_hash(self):
+        def payload(provider):
+            return {
+                "session_id": "ses_provider_hash",
+                "cwd": "/tmp/example",
+                "full_sync": True,
+                "messages": [
+                    {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                    {"info": {"id": "a1", "role": "assistant", "providerID": provider}, "parts": [{"type": "text", "text": "回答"}]},
+                ],
+            }
+
+        opencode_save.handle_payload(payload("anthropic"))
+        first_hash = opencode_save.load_state("ses_provider_hash")["payload_hash"]
+        opencode_save.handle_payload(payload("openrouter"))
+        second_hash = opencode_save.load_state("ses_provider_hash")["payload_hash"]
+        self.assertNotEqual(first_hash, second_hash)
+
     def test_save_is_repeatable_without_duplicate_messages(self):
         payload = {
             "session_id": "ses_test_123",
@@ -66,7 +389,8 @@ class TestOpenCodeSave(unittest.TestCase):
         content = path.read_text(encoding="utf-8")
         self.assertIn("source: opencode", content)
         self.assertIn("message_count: 2", content)
-        self.assertEqual(content.count("質問"), 2)
+        self.assertEqual(content.count("質問"), 3)
+        self.assertIn('title: "質問"', content)
         self.assertEqual(content.count("回答"), 1)
         self.assertIn("payload_hash", opencode_save.load_state("ses_test_123"))
 

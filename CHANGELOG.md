@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-15
+
+### Added
+
+- 最初のユーザー発話を短い見出しとfrontmatterの`title`へ記録
+- OpenRouter接続のOpenCode回答に、回答時点のUSD残高と取得日時を記録
+
+### Fixed
+
+- frontmatterの`title`にMarkdown見出し用のエスケープが残る問題を修正
+
 ## [1.3.0] - 2026-09-13
 
 ### Added
@@ -45,7 +56,8 @@
 - `OBSIDIAN_OUTPUT_DIR`による保管庫内の保存先カスタマイズに対応
 - macOS 標準 Python 3.9 で実行できる標準ライブラリのみの構成
 
-[Unreleased]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.0.0...v1.1.0

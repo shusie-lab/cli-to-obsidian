@@ -140,7 +140,8 @@ Response text
         self.assertTrue(updated)
         self.assertEqual(appended, 2)
         content = md_path.read_text(encoding="utf-8")
-        self.assertIn("# User: 表示する依頼", content)
+        self.assertIn("# 表示する依頼", content)
+        self.assertIn('title: "表示する依頼"', content)
         self.assertIn("> [!QUESTION] User", content)
         self.assertIn("表示する依頼\n> 2行目", content)
         self.assertIn("> [!INFO]- 参照情報（原文）", content)
@@ -236,45 +237,144 @@ Response text
 
         batch_content = batch_path.read_text(encoding="utf-8")
         split_content = split_path.read_text(encoding="utf-8")
-        batch_body = batch_content[batch_content.index("# User:"):]
-        split_body = split_content[split_content.index("# User:"):]
+        batch_body = batch_content[batch_content.index("# "):]
+        split_body = split_content[split_content.index("# "):]
         self.assertEqual(batch_body, split_body)
         self.assertEqual(batch_body.count("> [!QUESTION] User"), 2)
-        self.assertIn("# User: 次の依頼", batch_body)
+        self.assertIn("# 次の依頼", batch_body)
 
-    def test_codex_get_last_callout_header_ignores_fenced_fake_headers(self):
-        content = """> [!INFO]- 参照情報（原文）
->
-> ~~~~text
-> > [!QUESTION] fake question
-> > [!NOTE] fake answer
-> ~~~~
-
-> [!NOTE] Codex
+    def test_incremental_savers_ignore_fenced_fake_callout_headers(self):
+        content = """> [!NOTE] Codex
 > <small>🤖 gpt-5</small>
+
+```markdown
+> [!QUESTION] fake question
+> [!NOTE] fake answer
+```
 """
-        self.assertEqual(
-            codex_save.get_last_callout_header(content),
-            "> [!NOTE] Codex\n> <small>🤖 gpt-5</small>",
-        )
+        for save_module in (codex_save, claude_save, agy_save):
+            self.assertEqual(
+                save_module.get_last_callout_header(content),
+                "> [!NOTE] Codex\n> <small>🤖 gpt-5</small>",
+            )
 
     def test_user_heading_escapes_markdown_special_characters(self):
         message = "*_save.py [確認] (a) #tag"
         expected = r"\*\_save\.py \[確認\] \(a\) \#tag"
 
-        for save_module in (codex_save, claude_save, agy_save):
-            self.assertEqual(save_module.escape_markdown_heading(message), expected)
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
+            escape_heading = (
+                save_module.escape_markdown_heading
+                if hasattr(save_module, "escape_markdown_heading")
+                else save_module.escape_heading
+            )
+            self.assertEqual(escape_heading(message), expected)
 
     def test_common_message_metadata_formatters(self):
-        for save_module in (codex_save, claude_save, agy_save):
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
             self.assertEqual(
                 save_module.format_message_time("2026-08-07T10:00:00"),
                 "> <small>⏱ 2026-08-07 19:00:00</small>\n>\n",
             )
             self.assertEqual(
                 save_module.user_heading("\n*_save.py [確認]"),
-                "# User: \\*\\_save\\.py \\[確認\\]\n",
+                "# \\*\\_save\\.py \\[確認\\]\n",
             )
+            self.assertEqual(save_module.user_heading(r"\[確認\]"), "# \\[確認\\]\n")
+            self.assertEqual(
+                save_module.callout_lines("<tag>\n  > quoted\n"),
+                "> &lt;tag>\n>   &gt; quoted\n>",
+            )
+            self.assertEqual(save_module.user_heading("\n"), "# User\n")
+
+    def test_common_message_blocks_have_the_same_contract(self):
+        expected_user = (
+            "# \*確認\*\n"
+            "> [!QUESTION] User\n"
+            "> <small>⏱ 2026-08-07 19:00:00</small>\n"
+            ">\n"
+            "> *確認*\n\n"
+        )
+        expected_assistant = (
+            "> [!NOTE] Agent\n"
+            "> <small>🤖 model</small>\n\n"
+            "回答\n\n"
+        )
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
+            self.assertEqual(
+                save_module.render_user_message_block("*確認*", "2026-08-07T10:00:00"),
+                expected_user,
+            )
+            self.assertEqual(
+                save_module.render_assistant_message_block("回答", "Agent", ["🤖 model"]),
+                expected_assistant,
+            )
+            self.assertEqual(
+                save_module.render_assistant_message_block(
+                    "回答",
+                    "Agent",
+                    ["🤖 model"],
+                    extra_blank_line=True,
+                ),
+                expected_assistant.replace("</small>\n\n", "</small>\n\n\n"),
+            )
+
+    def test_title_comes_from_first_user_heading(self):
+        now = datetime(2026, 8, 7, 10, 0, tzinfo=JST)
+        content = (
+            "---\n"
+            "source: claude-code\n"
+            "message_count: 0\n"
+            "---\n\n"
+            "<!-- last_line: 0 -->\n\n"
+            "# 最初の発話です\n"
+            "> [!QUESTION] User\n"
+            "> 本文\n\n"
+        )
+        updated = claude_save.update_markdown_metadata(content, now, 1, 1)
+        self.assertIn('title: "最初の発話です"', updated)
+        self.assertNotIn('title: "User:', updated)
+
+    def test_title_does_not_use_markdown_heading_escaping(self):
+        message = "修正対象: foo-bar *確認* [重要]"
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
+            self.assertEqual(save_module.heading_title(message), message)
+            self.assertEqual(save_module.heading_title("\n"), "User")
+            self.assertEqual(
+                save_module.user_heading(message),
+                r"# 修正対象: foo\-bar \*確認\* \[重要\]" + "\n",
+            )
+
+        content = (
+            "---\n"
+            "source: claude-code\n"
+            "message_count: 0\n"
+            "---\n\n"
+            "# 修正対象: foo\\-bar \\*確認\\* \\[重要\\]\n"
+        )
+        updated = claude_save.update_markdown_metadata(content, datetime.now(JST), 1, 1)
+        self.assertIn('title: "修正対象: foo-bar *確認* [重要]"', updated)
+
+    def test_incremental_metadata_updates_are_pure(self):
+        content = (
+            "---\n"
+            'modified: "old"\n'
+            "message_count: 1\n"
+            "---\n"
+            "<!-- last_line: 1 -->\n"
+            "<!-- last_id: 1 -->\n\n"
+            "body\n"
+        )
+        modified = datetime(2026, 8, 7, 10, 0, tzinfo=JST)
+        codex_result = codex_save.update_markdown_metadata(content, modified, 2, 3, None, None)
+        claude_result = claude_save.update_markdown_metadata(content, modified, 2, 3)
+        agy_result = agy_save.update_markdown_metadata(content, modified, 2, "3")
+        for result in (codex_result, claude_result, agy_result):
+            self.assertIn("message_count: 3", result)
+            self.assertIn('modified: "2026-08-07T10:00:00+09:00"', result)
+        self.assertIn("<!-- last_line: 3 -->", codex_result)
+        self.assertIn("<!-- last_line: 3 -->", claude_result)
+        self.assertIn("<!-- last_id: 3 -->", agy_result)
 
     def test_atomic_write_preserves_existing_permissions(self):
         for index, save_module in enumerate((codex_save, claude_save, agy_save)):
@@ -1000,30 +1100,52 @@ quota: not-a-number
         self.assertIn("W: 80.0% ➔ 70.0% / 5h: unavailable", updated)
         self.assertIn("新回答", updated)
 
-    def test_agy_append_uses_single_atomic_markdown_write(self):
+    def test_incremental_savers_append_with_single_atomic_markdown_write(self):
         now = datetime.now(JST)
-        md_path = agy_save.create_md_file("atomic-agy", "project", now)
-        messages = [
+        base_message = {
+            "type": "agent_message",
+            "message": "Atomic response",
+            "model": "test-model",
+            "timestamp": "2026-08-07T10:00:05Z",
+        }
+        cases = [
             {
-                "step_index": 1,
-                "type": "agent_message",
-                "message": "Atomic response",
-                "model": "gemini-test",
-                "timestamp": "2026-08-07T10:00:05Z",
-            }
+                "module": codex_save,
+                "path": codex_save.create_md_file("atomic-codex", "project", now),
+                "messages": [{**base_message, "line_number": 1}],
+                "append": lambda path, messages: codex_save.append_messages(
+                    path, messages, now, "test-model", 1
+                ),
+                "cursor": "<!-- last_line: 1 -->",
+            },
+            {
+                "module": claude_save,
+                "path": claude_save.create_md_file("atomic-claude", "project", now),
+                "messages": [{**base_message, "line_number": 1}],
+                "append": lambda path, messages: claude_save.append_messages(path, messages, now, 1),
+                "cursor": "<!-- last_line: 1 -->",
+            },
+            {
+                "module": agy_save,
+                "path": agy_save.create_md_file("atomic-agy", "project", now),
+                "messages": [{**base_message, "step_index": 1}],
+                "append": lambda path, messages: agy_save.append_messages(path, messages, now),
+                "cursor": "<!-- last_id: 1 -->",
+            },
         ]
-
-        with mock.patch.object(
-            agy_save,
-            "atomic_write_md",
-            wraps=agy_save.atomic_write_md,
-        ) as atomic_write:
-            agy_save.append_messages(md_path, messages, now)
-
-        self.assertEqual(atomic_write.call_count, 1)
-        content = md_path.read_text(encoding="utf-8")
-        self.assertIn("Atomic response", content)
-        self.assertIn("<!-- last_id: 1 -->", content)
+        for case in cases:
+            with self.subTest(module=case["module"].__name__):
+                with mock.patch.object(
+                    case["module"],
+                    "atomic_write_md",
+                    wraps=case["module"].atomic_write_md,
+                ) as atomic_write:
+                    case["append"](case["path"], case["messages"])
+                self.assertEqual(atomic_write.call_count, 1)
+                content = case["path"].read_text(encoding="utf-8")
+                self.assertIn("Atomic response", content)
+                self.assertIn(case["cursor"], content)
+                self.assertIn("> <small>🤖 test-model</small>\n\n\nAtomic response", content)
 
     def test_session_id_collision_avoidance_across_scripts(self):
         now = datetime.now(JST)

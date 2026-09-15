@@ -8,7 +8,7 @@ Codex CLI の会話履歴を Obsidian に自動保存するフックスクリプ
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import json
 import re
@@ -38,6 +38,7 @@ OBSIDIAN_VAULT = Path(
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
 
 
+# BEGIN GENERATED: output-directory
 def resolve_output_dir(value: str | None = None) -> Path:
     """保管庫からの相対保存先を検証し、不正なら既定値を返す。"""
     raw = os.environ.get("OBSIDIAN_OUTPUT_DIR", DEFAULT_OUTPUT_DIR) if value is None else value
@@ -45,6 +46,7 @@ def resolve_output_dir(value: str | None = None) -> Path:
     if candidate.is_absolute() or ".." in candidate.parts:
         return Path(DEFAULT_OUTPUT_DIR)
     return candidate
+# END GENERATED: output-directory
 
 
 OBSIDIAN_OUTPUT_DIR = resolve_output_dir()
@@ -64,7 +66,6 @@ STRUCTURED_USER_HEADERS = (
 )
 STRUCTURED_REQUEST_MARKER = "## My request:"
 REFERENCE_CALLOUT_HEADER = "> [!INFO]- 参照情報（原文）"
-MARKDOWN_FENCE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 # ============================================================
 # ロギング
@@ -108,8 +109,9 @@ logger = setup_logger()
 # ============================================================
 # 状態（State）ファイル操作
 # ============================================================
+# BEGIN GENERATED: session-storage
 def safe_session_key(session_id: str) -> str:
-    """session_id をパストラバーサルできないファイル名へ変換する。"""
+    """session_idをパストラバーサルできないファイル名へ変換する。"""
     raw = str(session_id)
     safe = SAFE_SESSION_CHARS.sub("_", raw).strip("._")[:80]
     if safe and safe == raw:
@@ -123,7 +125,7 @@ def state_path(session_id: str) -> Path:
 
 
 def atomic_write_text(path: Path, content: str) -> None:
-    """同じディレクトリの一時ファイルを rename して文字列を保存する。"""
+    """同じディレクトリの一時ファイルをrenameして文字列を保存する。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = None
     try:
@@ -154,7 +156,7 @@ class ExistingMarkdownSearchError(Exception):
 
 @contextmanager
 def session_lock(session_id: str):
-    """同一セッションの hook 実行を直列化する。"""
+    """同一セッションのhook実行を直列化する。"""
     lock_dir = STATE_DIR / ".locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{safe_session_key(session_id)}.lock"
@@ -168,7 +170,7 @@ def session_lock(session_id: str):
 
 @contextmanager
 def try_session_lock(session_id: str, *, is_key: bool = False):
-    """同一セッションの hook 実行を非ブロッキングで試みる。取得できなければ False を yield。"""
+    """非ブロッキングでセッションロックを試み、取得結果をyieldする。"""
     lock_dir = STATE_DIR / ".locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{session_id if is_key else safe_session_key(session_id)}.lock"
@@ -194,7 +196,7 @@ def try_session_lock(session_id: str, *, is_key: bool = False):
 
 
 def session_locked(input_key: str):
-    """hook input 内の session id を使って関数を排他実行する。"""
+    """hook input内のsession idを使って関数を排他実行する。"""
     def decorator(func):
         @wraps(func)
         def wrapper(hook_input: dict):
@@ -212,69 +214,68 @@ def load_state(session_id: str) -> dict:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.info(f"stateファイルの読み込みに失敗しました（破損の可能性）: {path}: {e}")
+        except Exception as error:
+            logger.info("stateファイルの読み込みに失敗しました（破損の可能性）: %s: %s", path, error)
             return {}
     return {}
 
 
 def save_state(session_id: str, state: dict) -> None:
-    """atomicに保存（temp→rename）"""
+    """stateをatomicに保存する。"""
     state["last_used_at"] = format_iso(now_jst())
-    path = state_path(session_id)
-    atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
+    atomic_write_text(state_path(session_id), json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def cleanup_old_states() -> None:
-    """STATE_RETENTION_DAYS日以上前のstateファイルを削除"""
+    """保持期間を過ぎたstateを、実行中セッションを保護しながら削除する。"""
     if not STATE_DIR.exists():
         return
     cutoff = datetime.now(JST) - timedelta(days=STATE_RETENTION_DAYS)
     removed = 0
     try:
         candidates = list(STATE_DIR.glob("*.json"))
-    except OSError as e:
-        logger.warning("state探索に失敗したためクリーンアップを見送ります: %s", e)
+    except OSError as error:
+        logger.warning("state探索に失敗したためクリーンアップを見送ります: %s", error)
         return
-    for f in candidates:
-        session_key = f.stem
-        with try_session_lock(session_key, is_key=True) as acquired:
+    for path in candidates:
+        with try_session_lock(path.stem, is_key=True) as acquired:
             if not acquired:
                 continue
             try:
-                if not f.exists():
+                if not path.exists():
                     continue
-                data = json.loads(f.read_text(encoding="utf-8"))
-                last_used_str = data.get("last_used_at")
+                data = json.loads(path.read_text(encoding="utf-8"))
                 last_used = None
-                if last_used_str:
+                if data.get("last_used_at"):
                     try:
-                        last_used = datetime.fromisoformat(str(last_used_str))
+                        last_used = datetime.fromisoformat(str(data["last_used_at"]))
                         if last_used.tzinfo is None:
                             last_used = last_used.replace(tzinfo=JST)
                     except ValueError:
                         pass
                 if last_used is None:
-                    last_used = datetime.fromtimestamp(f.stat().st_mtime, tz=JST)
-
+                    last_used = datetime.fromtimestamp(path.stat().st_mtime, tz=JST)
                 if last_used < cutoff:
-                    f.unlink()
+                    path.unlink()
                     removed += 1
-            except Exception as e:
-                logger.info(f"stateファイルのクリーンアップ中にスキップ: {f.name}: {e}")
+            except Exception as error:
+                logger.info("stateファイルのクリーンアップ中にスキップ: %s: %s", path.name, error)
     if removed > 0:
-        logger.info(f"古いstateファイル {removed} 件を削除しました")
+        logger.info("古いstateファイル %d 件を削除しました", removed)
+# END GENERATED: session-storage
 
 # ============================================================
 # ユーティリティ
 # ============================================================
+# BEGIN GENERATED: incremental-utilities
 def read_stdin() -> dict:
+    """hookの標準入力を読み、空入力や不正JSONでは空のdictを返す。"""
     try:
         data = sys.stdin.read()
         if data.strip():
             return json.loads(data)
-    except Exception as e:
-        logger.info(f"stdinの読み込みまたはJSONパースに失敗しました: {e}")
+    except Exception as error:
+        logger.info("stdinの読み込みまたはJSONパースに失敗しました: %s", error)
     return {}
 
 
@@ -282,25 +283,24 @@ def now_jst() -> datetime:
     return datetime.now(JST)
 
 
-def format_iso(dt: datetime) -> str:
-    return dt.isoformat(timespec="seconds")
+def format_iso(value: datetime) -> str:
+    return value.isoformat(timespec="seconds")
 
 
 def yaml_quote(value: object) -> str:
-    """JSON互換の引用形式で YAML 文字列を安全に生成する。"""
+    """JSON互換の引用形式でYAML文字列を安全に生成する。"""
     return json.dumps(str(value), ensure_ascii=False)
 
 
 def safe_filename_component(value: str) -> str:
-    """プロジェクト名を単一の安全なファイル名要素へ変換する。"""
+    """値を単一の安全なファイル名要素へ変換する。"""
     return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
+# END GENERATED: incremental-utilities
 
 
+# BEGIN GENERATED: markdown-formatting
 def sanitize_markdown(text: str) -> str:
-    """
-    会話本文の Markdown 記述（リンクや強調等）を維持するため、
-    過剰なエスケープは行わずテキストをそのまま返します。
-    """
+    """会話本文のMarkdown記述を維持し、空値を空文字列へそろえる。"""
     return text if text else ""
 
 
@@ -309,23 +309,36 @@ def escape_markdown_heading(text: str) -> str:
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~])", r"\\\1", text)
 
 
-def callout_lines(text: str) -> str:
-    """テキストをcallout block内の行形式に変換（> プレフィックス付き）。
-    - HTML タグ誤認識による Callout の表示破損を防ぐため < は &lt; にエスケープする。
-    - 行頭（インデント空白含む）の > は callout の入れ子を避けるため &gt; にエスケープする。
-    """
-    def _escape_line(line: str) -> str:
-        # 1. HTML タグ解釈の誤作動を防ぐため < を &lt; に置換
-        line = line.replace("<", "&lt;")
+def unescape_markdown_heading(text: str) -> str:
+    """見出し用に追加したMarkdownエスケープを取り除く。"""
+    escaped_chars = r"\\`*_{}[]()#+-.!|<>~"
+    result = []
+    index = 0
+    while index < len(text):
+        if text[index] == "\\" and index + 1 < len(text) and text[index + 1] in escaped_chars:
+            result.append(text[index + 1])
+            index += 2
+        else:
+            result.append(text[index])
+            index += 1
+    return "".join(result)
 
-        # 2. 行頭（インデント含む）の > を &gt; に置換
+
+def callout_lines(text: str) -> str:
+    """本文をObsidian callout内の行へ変換する。"""
+    lines = []
+    for raw_line in str(text).split("\n"):
+        line = raw_line.replace("<", "&lt;")
         stripped = line.lstrip()
         if stripped.startswith(">"):
-            indent = line[: len(line) - len(stripped)]
-            return indent + "&gt;" + stripped[1:]
-        return line
+            line = line[: len(line) - len(stripped)] + "&gt;" + stripped[1:]
+        lines.append(f"> {line}" if line else ">")
+    return "\n".join(lines)
+# END GENERATED: markdown-formatting
 
-    return "\n".join(f"> {_escape_line(line)}" if line else ">" for line in text.split("\n"))
+
+# BEGIN GENERATED: incremental-callout
+MARKDOWN_FENCE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _strip_blockquote_prefix(line: str) -> str:
@@ -365,6 +378,7 @@ def _iter_lines_outside_fences(text: str):
             active_fence = marker[:2]
             continue
         yield line
+# END GENERATED: incremental-callout
 
 
 def split_structured_user_message(text: str) -> tuple[str, str | None]:
@@ -423,31 +437,86 @@ def reference_callout(text: str) -> str:
     return f"{REFERENCE_CALLOUT_HEADER}\n>\n{body}"
 
 
+# BEGIN GENERATED: message-metadata
 def format_message_time(timestamp: object) -> str:
-    """ISO timestamp を JST の共通メタデータ行へ変換する。"""
-    if not timestamp:
+    """ISO日時またはUnix epoch millisecondsをJSTの共通メタデータ行へ変換する。"""
+    if timestamp in (None, ""):
         return ""
     try:
-        value = str(timestamp)
-        dt = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        value = int(timestamp) if isinstance(timestamp, str) and timestamp.isdigit() else timestamp
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc)
+        else:
+            text = str(value)
+            dt = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
         return f"> <small>⏱ {dt.astimezone(JST):%Y-%m-%d %H:%M:%S}</small>\n>\n"
-    except (TypeError, ValueError) as e:
-        logger.warning(f"timestampのパース失敗: {timestamp}: {e}")
+    except (OSError, OverflowError, TypeError, ValueError) as error:
+        logger.warning("timestampのパース失敗: %s: %s", timestamp, error)
         return ""
 
 
-def user_heading(text: str) -> str:
-    """ユーザー発言の先頭非空行から安全な共通見出しを作る。"""
+def _heading_text(text: str) -> str:
+    """ユーザー発言から見出し・タイトル共通の短縮済み文字列を返す。"""
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
     first_line = first_line.replace("\\\\", "\\")
     for escaped, plain in ((r"\[", "["), (r"\]", "]"), (r"\_", "_"), (r"\*", "*")):
         first_line = first_line.replace(escaped, plain)
     if len(first_line) > 40:
         first_line = first_line[:40] + "..."
+    return first_line
+
+
+def user_heading(text: str) -> str:
+    """ユーザー発言の先頭非空行から安全な共通見出しを作る。"""
+    first_line = _heading_text(text)
     escaped = escape_markdown_heading(first_line)
-    return f"# User: {escaped}\n" if escaped else "# User\n"
+    return f"# {escaped}\n" if escaped else "# User\n"
+
+
+def heading_title(text: str) -> str:
+    """ユーザー発話から、frontmatter titleに使う見出し文字列を返す。"""
+    return _heading_text(text) or "User"
+# END GENERATED: message-metadata
+
+
+# BEGIN GENERATED: markdown-rendering
+def user_callout_header(timestamp: object) -> str:
+    """連続発言の判定にも使うUser calloutヘッダーを生成する。"""
+    return f"> [!QUESTION] User\n{format_message_time(timestamp)}".strip()
+
+
+def render_user_message_block(text: str, timestamp: object, *, continued: bool = False) -> str:
+    """User発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
+    body = callout_lines(text)
+    if continued:
+        return f"---\n\n{body}\n\n"
+    return f"{user_heading(text)}> [!QUESTION] User\n{format_message_time(timestamp)}{body}\n\n"
+
+
+def assistant_callout_header(agent_name: str, metadata: list[str]) -> str:
+    """連続回答の判定にも使うAssistant calloutヘッダーを生成する。"""
+    lines = [f"> [!NOTE] {agent_name}"]
+    lines.extend(f"> <small>{item}</small>" for item in metadata if item)
+    return "\n".join(lines)
+
+
+def render_assistant_message_block(
+    text: str,
+    agent_name: str,
+    metadata: list[str],
+    *,
+    continued: bool = False,
+    extra_blank_line: bool = False,
+) -> str:
+    """Assistant発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
+    body = text
+    if continued:
+        return body
+    separator = "\n\n\n" if extra_blank_line else "\n\n"
+    return f"{assistant_callout_header(agent_name, metadata)}{separator}{body}\n\n"
+# END GENERATED: markdown-rendering
 
 
 # ============================================================
@@ -803,11 +872,13 @@ def build_frontmatter(
     source: str = "codex-cli",
     initial_quota: dict | None = None,
     final_quota: dict | None = None,
+    title: str | None = None,
 ) -> str:
     ts = format_iso(start_dt)
     fm_lines = [
         "---",
         f"source: {source}",
+        *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
         f"session_id: {yaml_quote(session_id)}",
         f"project: {yaml_quote(cwd)}",
         f"created: {yaml_quote(ts)}",
@@ -830,6 +901,7 @@ def create_md_file(
     start_dt: datetime,
     initial_quota: dict | None = None,
     source: str = "codex-cli",
+    title: str | None = None,
 ) -> Path:
     date_dir = start_dt.strftime("%Y%m%d")
     time_prefix = start_dt.strftime("%H%M%S")
@@ -854,6 +926,7 @@ def create_md_file(
         source=source,
         initial_quota=initial_quota,
         final_quota=initial_quota,
+        title=title,
     )
     quota_sec = build_quota_section(initial_quota, initial_quota)
     content = fm + quota_sec + "\n<!-- last_line: 0 -->\n\n"
@@ -861,8 +934,9 @@ def create_md_file(
     return path
 
 
+# BEGIN GENERATED: find-existing-markdown
 def find_existing_md(session_id: str) -> Path | None:
-    """state消失時に frontmatter の session_id から既存Markdownを探す。"""
+    """state消失時にfrontmatterのsession_idから既存Markdownを探す。"""
     if not OUTPUT_BASE.exists():
         return None
     identifiers = []
@@ -877,28 +951,26 @@ def find_existing_md(session_id: str) -> Path | None:
 
     expected = {
         f"session_id: {yaml_quote(session_id)}",
-        f"session_id: {session_id}",  # 旧形式との互換性
+        f"session_id: {session_id}",
     }
-
     candidates = set()
     try:
-        # globは一部の読み取りエラーを抑制するため、ディレクトリを直接列挙する。
         for path in OUTPUT_BASE.iterdir():
             if any(path.name.endswith(f"_{identifier}.md") for identifier in identifiers):
                 candidates.add(path)
-    except OSError as e:
-        raise ExistingMarkdownSearchError(f"既存Markdown候補の列挙に失敗しました: {e}")
+    except OSError as error:
+        raise ExistingMarkdownSearchError(f"既存Markdown候補の列挙に失敗しました: {error}")
 
     candidate_entries = []
     for candidate in candidates:
         try:
             candidate_entries.append((candidate, candidate.stat().st_mtime))
-        except OSError as e:
-            raise ExistingMarkdownSearchError(f"既存Markdown候補の情報取得に失敗しました: {candidate}: {e}")
-
+        except OSError as error:
+            raise ExistingMarkdownSearchError(
+                f"既存Markdown候補の情報取得に失敗しました: {candidate}: {error}"
+            )
     candidate_entries.sort(key=lambda item: item[1], reverse=True)
 
-    had_read_error = False
     last_read_error = None
     for candidate, _ in candidate_entries:
         try:
@@ -906,61 +978,58 @@ def find_existing_md(session_id: str) -> Path | None:
             parts = content.split("---", 2)
             if len(parts) >= 3:
                 frontmatter_lines = [line.strip() for line in parts[1].splitlines()]
-                if any(exp in frontmatter_lines for exp in expected):
+                if any(item in frontmatter_lines for item in expected):
                     return candidate
-        except (OSError, UnicodeError) as e:
-            had_read_error = True
-            last_read_error = e
-            logger.warning(f"既存Markdown候補の読み込みに失敗したためスキップします: {candidate}: {e}")
-            continue
+        except (OSError, UnicodeError) as error:
+            last_read_error = error
+            logger.warning("既存Markdown候補の読み込みに失敗したためスキップします: %s: %s", candidate, error)
         except IndexError:
             continue
-
-    if had_read_error:
+    if last_read_error is not None:
         raise ExistingMarkdownSearchError(
-            f"既存Markdown候補の読み取りに失敗したファイルが存在し、一致を確認できなかったため探索を中断します: {last_read_error}"
+            "既存Markdown候補の読み取りに失敗したファイルが存在し、"
+            f"一致を確認できなかったため探索を中断します: {last_read_error}"
         )
-
     return None
+# END GENERATED: find-existing-markdown
 
 
+# BEGIN GENERATED: atomic-markdown-write
+def atomic_write_md(path: Path, content: str) -> None:
+    """Markdown全文を一時ファイル経由でatomicに保存する。"""
+    atomic_write_text(path, content)
+# END GENERATED: atomic-markdown-write
+
+
+# BEGIN GENERATED: line-cursor
 def read_last_line_from_md(path: Path) -> int | None:
     try:
         content = path.read_text(encoding="utf-8")
-        m = LAST_LINE_PATTERN.search(content)
-        if m:
-            return int(m.group(1))
-        logger.debug(f"MDファイルに last_line コメントが見つかりません: {path}")
-    except Exception as e:
-        logger.warning(f"MDファイルからの last_line 読み取りに失敗: {path}: {e}")
+        match = LAST_LINE_PATTERN.search(content)
+        if match:
+            return int(match.group(1))
+        logger.debug("MDファイルに last_line コメントが見つかりません: %s", path)
+    except Exception as error:
+        logger.warning("MDファイルからの last_line 読み取りに失敗: %s: %s", path, error)
     return None
 
 
-def atomic_write_md(path: Path, content: str) -> None:
-    """atomicに保存（temp→rename）"""
-    atomic_write_text(path, content)
-
-
 def advance_last_line(path: Path, last_line: int) -> None:
-    """会話がない行だけでも Markdown 側の cursor を atomic に進める。"""
+    """会話がない行だけでもMarkdown側のcursorをatomicに進める。"""
     content = path.read_text(encoding="utf-8")
     updated, count = LAST_LINE_PATTERN.subn(f"<!-- last_line: {last_line} -->", content, count=1)
     if count:
         atomic_write_md(path, updated)
+# END GENERATED: line-cursor
 
 
+# BEGIN GENERATED: callout-header
 def is_callout_header_line(line: str) -> bool:
-    if line.startswith("> [!"):
-        return True
-    if line.startswith("> <small>"):
-        return True
-    if line == ">":
-        return True
-    return False
+    return line.startswith("> [!") or line.startswith("> <small>") or line == ">"
 
 
 def get_last_callout_header(content: str) -> str | None:
-    """Markdownコンテンツからコードフェンス外の最後のCalloutヘッダーを抽出する。"""
+    """コードフェンス外にある最後のCalloutヘッダーを抽出する。"""
     last_header = None
     header_lines = []
     for line in _iter_lines_outside_fences(content):
@@ -972,8 +1041,66 @@ def get_last_callout_header(content: str) -> str | None:
             last_header = "\n".join(header_lines)
         else:
             header_lines = []
-
     return last_header.strip() if last_header else None
+# END GENERATED: callout-header
+
+# BEGIN GENERATED: frontmatter-update
+def update_frontmatter_fields(
+    content: str,
+    modified_dt: datetime,
+    appended: int,
+    *,
+    extra_removed_keys: tuple[str, ...] = (),
+    extra_fields: tuple[str, ...] = (),
+) -> tuple[list[str], str] | None:
+    """frontmatterの共通項目を更新し、項目行と本文を返す。"""
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not fm_match:
+        return None
+
+    fm_lines = fm_match.group(1).splitlines()
+    body_text = content[fm_match.end():]
+    title_match = re.search(r"(?m)^# (?:User: )?(.+?)\s*$", body_text)
+    title = unescape_markdown_heading(title_match.group(1)) if title_match else None
+    keys_to_remove = {"modified", "message_count", *extra_removed_keys}
+    if title is not None:
+        keys_to_remove.add("title")
+    new_fm_lines = []
+    skip_list = False
+    old_count = 0
+    for line in fm_lines:
+        if line.startswith("message_count:"):
+            try:
+                old_count = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        key_match = re.match(r"^([a-zA-Z0-9_-]+):", line)
+        if key_match:
+            if key_match.group(1) in keys_to_remove:
+                skip_list = True
+                continue
+            skip_list = False
+            new_fm_lines.append(line)
+            continue
+        if line.startswith("  - ") or line.startswith("    - "):
+            if skip_list:
+                continue
+        else:
+            skip_list = False
+        new_fm_lines.append(line)
+
+    if title is not None:
+        new_fm_lines.append(f"title: {yaml_quote(title)}")
+    new_fm_lines.append(f"modified: {yaml_quote(format_iso(modified_dt))}")
+    new_fm_lines.append(f"message_count: {old_count + appended}")
+    new_fm_lines.extend(extra_fields)
+    return new_fm_lines, body_text
+
+
+def compose_markdown(new_fm_lines: list[str], body_text: str) -> str:
+    """更新済みfrontmatterと本文をMarkdown全文へ戻す。"""
+    return "---\n" + "\n".join(new_fm_lines) + "\n---\n" + body_text
+# END GENERATED: frontmatter-update
 
 
 # ============================================================
@@ -1010,6 +1137,47 @@ def get_quota_diff_str(model_name: str, current_quota: dict | None, last_quota: 
     return f" (Quota: {' / '.join(parts)})" if parts else ""
 
 
+def update_markdown_metadata(
+    content: str,
+    modified_dt: datetime,
+    appended: int,
+    last_line: int,
+    initial_quota: dict | None,
+    current_quota: dict | None,
+) -> str:
+    """本文のfrontmatter・cursor・quotaを更新し、書き込み前の全文を返す。"""
+    consumption = quota_consumption(initial_quota, current_quota)
+    updated = update_frontmatter_fields(
+        content,
+        modified_dt,
+        appended,
+        extra_removed_keys=("quota",) if consumption is not None else (),
+        extra_fields=(f"quota: {consumption:.2f}",) if consumption is not None else (),
+    )
+    if updated is None:
+        return content
+    new_fm_lines, body_text = updated
+
+    new_quota_sec = build_quota_section(initial_quota, current_quota)
+    quota_pattern = r"(?m)^📊 \*\*Quota\*\*:(?:\s*N/A)?\n(?:^- .*\n?)*"
+    if re.search(quota_pattern, body_text):
+        body_text = re.sub(
+            quota_pattern,
+            new_quota_sec.rstrip("\n") + "\n",
+            body_text,
+            count=1,
+        )
+    else:
+        body_text = new_quota_sec + "\n" + body_text.lstrip()
+    body_text = re.sub(
+        r"<!--\s*last_line:.*?-->",
+        f"<!-- last_line: {last_line} -->",
+        body_text,
+        count=1,
+    )
+    return compose_markdown(new_fm_lines, body_text)
+
+
 def append_messages(
     path: Path,
     messages: list[dict],
@@ -1036,21 +1204,14 @@ def append_messages(
         if not text.strip():
             continue
 
-        time_part = format_message_time(msg.get("timestamp"))
-
         if m_type == "user_message":
             display_text, reference_text = split_structured_user_message(text)
-            # 表示対象の発言の最初のテキスト行から見出しテキストを抽出
-            heading = user_heading(display_text)
-            callout_header = f"> [!QUESTION] User\n{time_part}".strip()
-
-            if callout_header == last_callout_header:
-                user_block = f"---\n\n{callout_lines(sanitize_markdown(display_text))}\n\n"
-            else:
-                user_block = (
-                    f"{heading}> [!QUESTION] User\n{time_part}"
-                    f"{callout_lines(sanitize_markdown(display_text))}\n\n"
-                )
+            callout_header = user_callout_header(msg.get("timestamp"))
+            user_block = render_user_message_block(
+                display_text,
+                msg.get("timestamp"),
+                continued=callout_header == last_callout_header,
+            )
 
             if reference_text is not None:
                 user_block += reference_callout(reference_text) + "\n\n"
@@ -1065,23 +1226,33 @@ def append_messages(
             if not m_quota and display_model and current_quota:
                 m_quota = get_quota_diff_str(display_model, current_quota, last_quota)
             quota_part = f"{m_quota}" if m_quota else ""
-            meta_part = f"> <small>🤖 {display_model}{quota_part}</small>\n" if display_model else ""
-            meta_line = f"> <small>🤖 {display_model}{quota_part}</small>" if display_model else ""
-            callout_header = f"> [!NOTE] {AGENT_NAME}\n{meta_line}".strip() if meta_line else f"> [!NOTE] {AGENT_NAME}"
+            metadata = [f"🤖 {display_model}{quota_part}"] if display_model else []
+            callout_header = assistant_callout_header(AGENT_NAME, metadata)
 
             if callout_header == last_callout_header:
                 # Codex のストリーミング結果が複数の agent_message に分割される
                 # ことがある。同じ callout の続きは区切り線を入れず、改行を残して連結し、
                 # 1つの回答として message_count に加算する。
-                fragment = sanitize_markdown(text)
+                fragment = render_assistant_message_block(
+                    text,
+                    AGENT_NAME,
+                    metadata,
+                    continued=True,
+                )
                 if blocks:
                     blocks[-1] = blocks[-1].rstrip("\n") + "\n" + fragment + "\n\n"
                 else:
                     content = content.rstrip("\n") + "\n"
                     blocks.append(fragment + "\n\n")
             else:
-                callout_block = f"> [!NOTE] {AGENT_NAME}\n{meta_part}" if meta_part else f"> [!NOTE] {AGENT_NAME}\n"
-                blocks.append(f"{callout_block}\n\n{sanitize_markdown(text)}\n\n")
+                blocks.append(
+                    render_assistant_message_block(
+                        text,
+                        AGENT_NAME,
+                        metadata,
+                        extra_blank_line=True,
+                    )
+                )
                 appended += 1
 
             last_callout_header = callout_header
@@ -1089,75 +1260,16 @@ def append_messages(
     if not blocks:
         return 0, False
 
-    # 本文追記とメタデータ更新を一括で行い、atomic_write_md 1回で完結させる
-    # （2段階書き込みによるクラッシュ時の不整合を防ぐ）
     new_content = content + "".join(blocks)
-
-    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", new_content, re.DOTALL)
-    if fm_match:
-        fm_text = fm_match.group(1)
-        body_text = new_content[fm_match.end():]
-
-        fm_lines = fm_text.splitlines()
-        new_fm_lines = []
-        keys_to_remove = {"modified", "message_count"}
-        consumption = quota_consumption(initial_quota, current_quota)
-        if consumption is not None:
-            keys_to_remove.add("quota")
-        skip_list = False
-        old_count = 0
-        for line in fm_lines:
-            if line.startswith("message_count:"):
-                try:
-                    old_count = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-            key_match = re.match(r"^([a-zA-Z0-9_-]+):", line)
-            if key_match:
-                key = key_match.group(1)
-                if key in keys_to_remove:
-                    skip_list = True
-                    continue
-                else:
-                    skip_list = False
-                    new_fm_lines.append(line)
-                    continue
-            if line.startswith("  - ") or line.startswith("    - "):
-                if skip_list:
-                    continue
-            else:
-                skip_list = False
-            new_fm_lines.append(line)
-
-        new_count = old_count + appended
-        new_fm_lines.append(f'modified: "{format_iso(modified_dt)}"')
-        new_fm_lines.append(f"message_count: {new_count}")
-        if consumption is not None:
-            new_fm_lines.append(f"quota: {consumption:.2f}")
-
-        new_quota_sec = build_quota_section(initial_quota, current_quota)
-        quota_pattern = r"(?m)^📊 \*\*Quota\*\*:(?:\s*N/A)?\n(?:^- .*\n?)*"
-        if re.search(quota_pattern, body_text):
-            body_text = re.sub(
-                quota_pattern,
-                new_quota_sec.rstrip("\n") + "\n",
-                body_text,
-                count=1,
-            )
-        else:
-            body_text = new_quota_sec + "\n" + body_text.lstrip()
-
-        body_text = re.sub(
-            r"<!--\s*last_line:.*?-->",
-            f"<!-- last_line: {last_line} -->",
-            body_text,
-            count=1,
-        )
-        final_content = "---\n" + "\n".join(new_fm_lines) + "\n---\n" + body_text
-    else:
-        # フロントマターが見つからない場合は本文だけ書き込む
-        final_content = new_content
-
+    final_content = update_markdown_metadata(
+        new_content,
+        modified_dt,
+        appended,
+        last_line,
+        initial_quota,
+        current_quota,
+    )
+    # 本文とメタデータを1回のatomic writeで確定する。
     atomic_write_md(path, final_content)
     return appended, True
 
@@ -1311,10 +1423,12 @@ def handle_stop_event(hook_input: dict) -> None:
 # ============================================================
 # メイン
 # ============================================================
+# BEGIN GENERATED: incremental-main
 def main() -> None:
     hook_input = read_stdin()
     handle_stop_event(hook_input)
     print("{}")
+# END GENERATED: incremental-main
 
 
 if __name__ == "__main__":

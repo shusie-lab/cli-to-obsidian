@@ -372,7 +372,7 @@ class TestIntegration(unittest.TestCase):
         codex_save.save_state(session_id, state)
         codex_save.handle_stop_event(hook_input)
         content = output_path.read_text(encoding="utf-8")
-        self.assertEqual(content.count("Recovery question"), 2)  # 見出しと本文
+        self.assertEqual(content.count("Recovery question"), 3)  # title、見出し、本文
         self.assertEqual(content.count("Recovery answer"), 1)
         self.assertEqual(codex_save.load_state(session_id)["last_line"], 2)
 

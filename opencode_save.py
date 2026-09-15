@@ -3,13 +3,14 @@ from __future__ import annotations
 
 """OpenCode プラグインから渡された会話を Obsidian に保存する。"""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import argparse
 import fcntl
 import hashlib
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 import re
@@ -18,6 +19,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 JST = timezone(timedelta(hours=9))
@@ -25,12 +28,15 @@ OBSIDIAN_VAULT = Path(os.environ.get("OBSIDIAN_VAULT", str(Path.home() / "obsidi
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
 
 
-def resolve_output_dir(value: Optional[str] = None) -> Path:
+# BEGIN GENERATED: output-directory
+def resolve_output_dir(value: str | None = None) -> Path:
+    """保管庫からの相対保存先を検証し、不正なら既定値を返す。"""
     raw = os.environ.get("OBSIDIAN_OUTPUT_DIR", DEFAULT_OUTPUT_DIR) if value is None else value
     candidate = Path(raw) if str(raw).strip() else Path(DEFAULT_OUTPUT_DIR)
     if candidate.is_absolute() or ".." in candidate.parts:
         return Path(DEFAULT_OUTPUT_DIR)
     return candidate
+# END GENERATED: output-directory
 
 
 OUTPUT_BASE = OBSIDIAN_VAULT / resolve_output_dir() / "opencode"
@@ -38,6 +44,9 @@ STATE_DIR = Path.home() / ".local" / "state" / "opencode-obsidian"
 LOG_FILE = STATE_DIR / "opencode_obsidian_save.log"
 STATE_RETENTION_DAYS = 30
 SAFE_SESSION_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+OPENROUTER_PROVIDER = "openrouter"
+OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+OPENROUTER_TIMEOUT_SECONDS = 5
 
 
 def setup_logger() -> logging.Logger:
@@ -235,37 +244,176 @@ def format_iso(value: datetime) -> str:
     return value.astimezone(JST).isoformat(timespec="seconds")
 
 
-def format_message_time(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    if isinstance(value, str) and value.isdigit():
-        value = int(value)
-    parsed = _try_parse_datetime(value)
-    if parsed is None:
-        return ""
-    return f"> <small>⏱ {parsed:%Y-%m-%d %H:%M:%S}</small>\n>\n"
+def _finite_number(value: Any) -> Optional[float]:
+    """APIレスポンスの数値を厳密に検証する。boolやNaN/Infinityは受け付けない。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def fetch_openrouter_balance() -> Optional[Dict[str, Any]]:
+    """OpenRouterの残高を1回取得する。失敗時は会話保存を止めずNoneを返す。"""
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    request = urllib_request.Request(
+        OPENROUTER_CREDITS_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=OPENROUTER_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", None)
+            if status is not None and not (200 <= int(status) < 300):
+                raise urllib_error.HTTPError(OPENROUTER_CREDITS_URL, int(status), "HTTP error", None, None)
+            data = json.load(response)
+        if not isinstance(data, dict):
+            raise ValueError("response is not an object")
+        data = data.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("response data is invalid")
+        total_credits = _finite_number(data.get("total_credits"))
+        total_usage = _finite_number(data.get("total_usage"))
+        if total_credits is None or total_usage is None:
+            raise ValueError("credits fields are invalid")
+        balance = total_credits - total_usage
+        if not math.isfinite(balance):
+            raise ValueError("balance is invalid")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # APIキーやレスポンス本文をログへ出さない。
+        logger.warning("OpenRouter残高を取得できませんでした")
+        return None
+
+    return {
+        "openrouter_balance_usd": balance,
+        "openrouter_balance_retrieved_at": format_iso(datetime.now(JST)),
+    }
+
+
+# BEGIN GENERATED: markdown-formatting
+def sanitize_markdown(text: str) -> str:
+    """会話本文のMarkdown記述を維持し、空値を空文字列へそろえる。"""
+    return text if text else ""
+
+
+def escape_markdown_heading(text: str) -> str:
+    """見出し内でMarkdown構文として解釈される文字をエスケープする。"""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~])", r"\\\1", text)
+
+
+def unescape_markdown_heading(text: str) -> str:
+    """見出し用に追加したMarkdownエスケープを取り除く。"""
+    escaped_chars = r"\\`*_{}[]()#+-.!|<>~"
+    result = []
+    index = 0
+    while index < len(text):
+        if text[index] == "\\" and index + 1 < len(text) and text[index + 1] in escaped_chars:
+            result.append(text[index + 1])
+            index += 2
+        else:
+            result.append(text[index])
+            index += 1
+    return "".join(result)
 
 
 def callout_lines(text: str) -> str:
+    """本文をObsidian callout内の行へ変換する。"""
     lines = []
-    for line in str(text).split("\n"):
-        line = line.replace("<", "&lt;")
+    for raw_line in str(text).split("\n"):
+        line = raw_line.replace("<", "&lt;")
         stripped = line.lstrip()
         if stripped.startswith(">"):
             line = line[: len(line) - len(stripped)] + "&gt;" + stripped[1:]
         lines.append(f"> {line}" if line else ">")
     return "\n".join(lines)
+# END GENERATED: markdown-formatting
 
 
-def escape_heading(text: str) -> str:
-    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~])", r"\\\1", text)
+# BEGIN GENERATED: message-metadata
+def format_message_time(timestamp: object) -> str:
+    """ISO日時またはUnix epoch millisecondsをJSTの共通メタデータ行へ変換する。"""
+    if timestamp in (None, ""):
+        return ""
+    try:
+        value = int(timestamp) if isinstance(timestamp, str) and timestamp.isdigit() else timestamp
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc)
+        else:
+            text = str(value)
+            dt = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return f"> <small>⏱ {dt.astimezone(JST):%Y-%m-%d %H:%M:%S}</small>\n>\n"
+    except (OSError, OverflowError, TypeError, ValueError) as error:
+        logger.warning("timestampのパース失敗: %s: %s", timestamp, error)
+        return ""
+
+
+def _heading_text(text: str) -> str:
+    """ユーザー発言から見出し・タイトル共通の短縮済み文字列を返す。"""
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    first_line = first_line.replace("\\\\", "\\")
+    for escaped, plain in ((r"\[", "["), (r"\]", "]"), (r"\_", "_"), (r"\*", "*")):
+        first_line = first_line.replace(escaped, plain)
+    if len(first_line) > 40:
+        first_line = first_line[:40] + "..."
+    return first_line
 
 
 def user_heading(text: str) -> str:
-    first = next((line.strip() for line in text.splitlines() if line.strip()), "User")
-    if len(first) > 40:
-        first = first[:40] + "..."
-    return f"# User: {escape_heading(first)}\n"
+    """ユーザー発言の先頭非空行から安全な共通見出しを作る。"""
+    first_line = _heading_text(text)
+    escaped = escape_markdown_heading(first_line)
+    return f"# {escaped}\n" if escaped else "# User\n"
+
+
+def heading_title(text: str) -> str:
+    """ユーザー発話から、frontmatter titleに使う見出し文字列を返す。"""
+    return _heading_text(text) or "User"
+# END GENERATED: message-metadata
+
+
+# BEGIN GENERATED: markdown-rendering
+def user_callout_header(timestamp: object) -> str:
+    """連続発言の判定にも使うUser calloutヘッダーを生成する。"""
+    return f"> [!QUESTION] User\n{format_message_time(timestamp)}".strip()
+
+
+def render_user_message_block(text: str, timestamp: object, *, continued: bool = False) -> str:
+    """User発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
+    body = callout_lines(text)
+    if continued:
+        return f"---\n\n{body}\n\n"
+    return f"{user_heading(text)}> [!QUESTION] User\n{format_message_time(timestamp)}{body}\n\n"
+
+
+def assistant_callout_header(agent_name: str, metadata: list[str]) -> str:
+    """連続回答の判定にも使うAssistant calloutヘッダーを生成する。"""
+    lines = [f"> [!NOTE] {agent_name}"]
+    lines.extend(f"> <small>{item}</small>" for item in metadata if item)
+    return "\n".join(lines)
+
+
+def render_assistant_message_block(
+    text: str,
+    agent_name: str,
+    metadata: list[str],
+    *,
+    continued: bool = False,
+    extra_blank_line: bool = False,
+) -> str:
+    """Assistant発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
+    body = text
+    if continued:
+        return body
+    separator = "\n\n\n" if extra_blank_line else "\n\n"
+    return f"{assistant_callout_header(agent_name, metadata)}{separator}{body}\n\n"
+# END GENERATED: markdown-rendering
 
 
 def _message_text(envelope: Dict[str, Any]) -> str:
@@ -316,8 +464,12 @@ def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, A
             timestamp = message_time
         if isinstance(raw_model, dict):
             model = str(raw_model.get("modelID") or raw_model.get("id") or "")
+            provider = str(raw_model.get("providerID") or raw_model.get("provider") or "")
         else:
             model = str(raw_model)
+            provider = ""
+        if isinstance(info, dict):
+            provider = str(info.get("providerID") or info.get("provider") or provider)
         messages.append(
             {
                 "id": str(message_id),
@@ -325,6 +477,7 @@ def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, A
                 "text": text,
                 "timestamp": timestamp,
                 "model": model,
+                "provider": provider,
             }
         )
     return messages
@@ -348,7 +501,51 @@ def _message_content_key(message: Dict[str, Any]) -> Tuple[str, ...]:
         str(message.get("type", "")),
         str(message.get("text", "")),
         str(message.get("model", "")),
+        str(message.get("provider", "")),
     )
+
+
+def _recovery_content_matches(existing: Dict[str, Any], incoming: Dict[str, Any]) -> bool:
+    if _message_content_key(existing) == _message_content_key(incoming):
+        return True
+    # 旧Markdown/stateにはproviderがないため、provider追加後も本文で復旧する。
+    return (
+        not _message_provider(existing)
+        and str(existing.get("type", "")) == str(incoming.get("type", ""))
+        and str(existing.get("text", "")) == str(incoming.get("text", ""))
+        and str(existing.get("model", "")) == str(incoming.get("model", ""))
+    )
+
+
+def _message_records_match(existing: Dict[str, Any], incoming: Dict[str, Any]) -> bool:
+    if _message_key(existing) == _message_key(incoming):
+        return True
+    if existing.get("id"):
+        return False
+    if existing.get("type") == "user" or incoming.get("type") == "user":
+        return _messages_match_for_recovery(existing, incoming)
+    return _recovery_content_matches(existing, incoming)
+
+
+def _message_provider(message: Dict[str, Any]) -> str:
+    return str(message.get("provider") or message.get("providerID") or "")
+
+
+def _merge_message(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    merged = {**existing, **incoming}
+    old_provider = _message_provider(existing)
+    new_provider = _message_provider(incoming)
+    if old_provider and new_provider and old_provider != new_provider:
+        merged.pop("openrouter_balance_usd", None)
+        merged.pop("openrouter_balance_retrieved_at", None)
+        merged.pop("openrouter_balance_attempted", None)
+    elif new_provider and new_provider != OPENROUTER_PROVIDER:
+        merged.pop("openrouter_balance_usd", None)
+        merged.pop("openrouter_balance_retrieved_at", None)
+        merged.pop("openrouter_balance_attempted", None)
+    if not new_provider and old_provider:
+        merged["provider"] = old_provider
+    return merged
 
 
 def _normalized_timestamp(value: Any) -> str:
@@ -361,7 +558,7 @@ def _messages_match_for_recovery(existing: Dict[str, Any], incoming: Dict[str, A
         return False
     if existing.get("type") != "user" or incoming.get("type") != "user":
         return False
-    if _message_content_key(existing) != _message_content_key(incoming):
+    if not _recovery_content_matches(existing, incoming):
         return False
     return _normalized_timestamp(existing.get("timestamp")) == _normalized_timestamp(incoming.get("timestamp"))
 
@@ -402,16 +599,15 @@ def merge_messages(
                             old_index
                             for old_index in range(len(merged) - 1)
                             if _messages_match_for_recovery(merged[old_index], user_message)
-                            and _message_content_key(merged[old_index + 1])
-                            == _message_content_key(assistant_message)
+                            and _recovery_content_matches(merged[old_index + 1], assistant_message)
                         ),
                         None,
                     )
                     if pair_index is None:
                         merged.extend((user_message, assistant_message))
                     else:
-                        merged[pair_index] = {**merged[pair_index], **user_message}
-                        merged[pair_index + 1] = {**merged[pair_index + 1], **assistant_message}
+                        merged[pair_index] = _merge_message(merged[pair_index], user_message)
+                        merged[pair_index + 1] = _merge_message(merged[pair_index + 1], assistant_message)
                     indexes = {_message_key(message): item_index for item_index, message in enumerate(merged)}
                     index += 2
                     continue
@@ -432,7 +628,7 @@ def merge_messages(
                 indexes[key] = len(merged)
                 merged.append(message)
             else:
-                merged[matched_index] = {**merged[matched_index], **message}
+                merged[matched_index] = _merge_message(merged[matched_index], message)
             index += 1
         return merged
 
@@ -440,7 +636,6 @@ def merge_messages(
     used = set()
     for message in new_messages:
         key = _message_key(message)
-        content_key = _message_content_key(message)
         index = next(
             (
                 index
@@ -459,7 +654,7 @@ def merge_messages(
                     for index, old_message in enumerate(old_messages)
                     if index not in used
                     and not old_message.get("id")
-                    and _message_content_key(old_message) == content_key
+                    and _recovery_content_matches(old_message, message)
                 ),
                 None,
             )
@@ -467,9 +662,34 @@ def merge_messages(
             merged.append(message)
         else:
             used.add(index)
-            merged.append({**old_messages[index], **message})
+            merged.append(_merge_message(old_messages[index], message))
     merged.extend(message for index, message in enumerate(old_messages) if index not in used)
     return merged
+
+
+def _find_matching_message(messages: Iterable[Dict[str, Any]], incoming: Dict[str, Any]) -> Optional[int]:
+    candidates = [message for message in messages if isinstance(message, dict)]
+    exact_key = _message_key(incoming)
+    for index, message in enumerate(candidates):
+        if _message_key(message) == exact_key:
+            return index
+    if not incoming.get("id"):
+        return next(
+            (
+                index
+                for index, message in enumerate(candidates)
+                if not message.get("id") and _recovery_content_matches(message, incoming)
+            ),
+            None,
+        )
+    return next(
+        (
+            index
+            for index, message in enumerate(candidates)
+            if not message.get("id") and _recovery_content_matches(message, incoming)
+        ),
+        None,
+    )
 
 
 def find_existing_md(session_id: str) -> Optional[Path]:
@@ -542,6 +762,19 @@ def _markdown_timestamp(value: str) -> str:
     return parsed.isoformat(timespec="seconds")
 
 
+_OPENROUTER_BALANCE_LINE = re.compile(
+    r"^> <small>💳 OpenRouter balance: \$(-?(?:\d+(?:\.\d*)?|\.\d+)) USD \(retrieved: ([^)]*)\)</small>$"
+)
+
+
+def _format_usd(value: Any) -> str:
+    number = _finite_number(value)
+    if number is None:
+        return ""
+    rendered = f"{number:.6f}".rstrip("0").rstrip(".")
+    return rendered if rendered not in ("", "-0") else "0"
+
+
 def parse_existing_markdown(path: Path) -> List[Dict[str, Any]]:
     """状態ファイルが失われた場合に、このスクリプトのMarkdownを復元する。"""
     try:
@@ -567,7 +800,7 @@ def parse_existing_markdown(path: Path) -> List[Dict[str, Any]]:
             continue
         if fence_character is not None:
             continue
-        if line.startswith("# User: ") and index + 1 < len(lines) and lines[index + 1] == "> [!QUESTION] User":
+        if line.startswith("# ") and index + 1 < len(lines) and lines[index + 1] == "> [!QUESTION] User":
             markers.append((index, "user"))
         elif line == "> [!NOTE] OpenCode":
             markers.append((index, "assistant"))
@@ -602,46 +835,111 @@ def parse_existing_markdown(path: Path) -> List[Dict[str, Any]]:
 
         index = start + 1
         model = ""
+        balance = None
+        balance_retrieved_at = ""
         if index < end and lines[index].startswith("> <small>🤖 "):
             model = lines[index][len("> <small>🤖 ") : -len("</small>")]
             index += 1
+        if index < end:
+            balance_match = _OPENROUTER_BALANCE_LINE.fullmatch(lines[index])
+            if balance_match:
+                balance = float(balance_match.group(1))
+                balance_retrieved_at = balance_match.group(2)
+                index += 1
         if index < end and lines[index] == "":
             index += 1
         body = "\n".join(lines[index:end]).strip("\n")
         if body.strip():
-            messages.append({"id": "", "type": role, "text": body, "timestamp": "", "model": model})
+            message = {"id": "", "type": role, "text": body, "timestamp": "", "model": model}
+            if balance is not None:
+                message.update(
+                    {
+                        "provider": OPENROUTER_PROVIDER,
+                        "openrouter_balance_usd": balance,
+                        "openrouter_balance_retrieved_at": balance_retrieved_at,
+                        "openrouter_balance_attempted": True,
+                    }
+                )
+            messages.append(message)
     return messages
 
 
-def build_frontmatter(session_id: str, cwd: str, created: datetime, modified: datetime, count: int) -> str:
-    return "\n".join(
-        [
-            "---",
-            "source: opencode",
-            f"session_id: {yaml_quote(session_id)}",
-            f"project: {yaml_quote(cwd)}",
-            f"created: {yaml_quote(format_iso(created))}",
-            f"modified: {yaml_quote(format_iso(modified))}",
-            "tags:",
-            "  - ai-conversation",
-            "  - opencode",
-            f"message_count: {count}",
-            "---",
-        ]
-    ) + "\n\n"
-
-
-def render_markdown(session_id: str, cwd: str, created: datetime, messages: List[Dict[str, str]]) -> str:
-    modified = datetime.now(JST)
-    blocks = [build_frontmatter(session_id, cwd, created, modified, len(messages))]
+def _latest_openrouter_balance(messages: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    latest = None
     for message in messages:
-        timestamp = format_message_time(message.get("timestamp"))
+        balance = _format_usd(message.get("openrouter_balance_usd"))
+        retrieved_at = str(message.get("openrouter_balance_retrieved_at", ""))
+        if balance and retrieved_at and (latest is None or retrieved_at >= latest["retrieved_at"]):
+            latest = {"balance": balance, "retrieved_at": retrieved_at}
+    return latest
+
+
+def build_frontmatter(
+    session_id: str,
+    cwd: str,
+    created: datetime,
+    modified: datetime,
+    count: int,
+    openrouter_balance: Optional[Dict[str, Any]] = None,
+    title: Optional[str] = None,
+) -> str:
+    lines = [
+        "---",
+        "source: opencode",
+        *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
+        f"session_id: {yaml_quote(session_id)}",
+        f"project: {yaml_quote(cwd)}",
+        f"created: {yaml_quote(format_iso(created))}",
+        f"modified: {yaml_quote(format_iso(modified))}",
+        "tags:",
+        "  - ai-conversation",
+        "  - opencode",
+        f"message_count: {count}",
+    ]
+    if openrouter_balance:
+        lines.extend(
+            [
+                f"openrouter_balance_usd: {openrouter_balance['balance']}",
+                f"openrouter_balance_retrieved_at: {yaml_quote(openrouter_balance['retrieved_at'])}",
+            ]
+        )
+    lines.append("---")
+    return "\n".join(lines) + "\n\n"
+
+
+def render_markdown(
+    session_id: str,
+    cwd: str,
+    created: datetime,
+    messages: List[Dict[str, str]],
+    *,
+    modified: Optional[datetime] = None,
+) -> str:
+    modified = modified or datetime.now(JST)
+    first_user = next((message["text"] for message in messages if message["type"] == "user"), None)
+    title = heading_title(first_user) if first_user is not None else None
+    blocks = [
+        build_frontmatter(
+            session_id,
+            cwd,
+            created,
+            modified,
+            len(messages),
+            _latest_openrouter_balance(messages),
+            title,
+        )
+    ]
+    for message in messages:
         if message["type"] == "user":
-            blocks.append(f"{user_heading(message['text'])}> [!QUESTION] User\n{timestamp}{callout_lines(message['text'])}\n\n")
+            blocks.append(render_user_message_block(message["text"], message.get("timestamp")))
         else:
             model = message.get("model", "")
-            meta = f"> <small>🤖 {model}</small>\n" if model else ""
-            blocks.append(f"> [!NOTE] OpenCode\n{meta}\n{message['text']}\n\n")
+            metadata = [f"🤖 {model}"] if model else []
+            balance = _format_usd(message.get("openrouter_balance_usd"))
+            retrieved_at = str(message.get("openrouter_balance_retrieved_at", ""))
+            if balance and retrieved_at:
+                metadata.append(f"💳 OpenRouter balance: ${balance} USD (retrieved: {retrieved_at})")
+            blocks.append(render_assistant_message_block(message["text"], "OpenCode", metadata))
     return "".join(blocks)
 
 
@@ -674,6 +972,7 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
             "text": item["text"],
             "timestamp": item.get("timestamp", ""),
             "model": item.get("model", ""),
+            "provider": _message_provider(item),
         }
         for item in messages
     ]
@@ -684,6 +983,34 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
         logger.debug("同じ payload のため保存をスキップ %s", session_id[:8])
         save_state(session_id, state)
         return output_path
+
+    incoming_messages = extract_messages(payload.get("messages") or [])
+    latest_assistant = next(
+        (message for message in reversed(incoming_messages) if message.get("type") == "assistant"),
+        None,
+    )
+    existing_latest = False
+    if latest_assistant is not None:
+        latest_index = incoming_messages.index(latest_assistant)
+        has_incoming_pair = latest_index > 0 and incoming_messages[latest_index - 1].get("type") == "user"
+        if has_incoming_pair:
+            incoming_user = incoming_messages[latest_index - 1]
+            existing_latest = any(
+                _message_records_match(stored_messages[index], incoming_user)
+                and index + 1 < len(stored_messages)
+                and _message_records_match(stored_messages[index + 1], latest_assistant)
+                for index in range(len(stored_messages) - 1)
+            )
+        if not has_incoming_pair and not existing_latest:
+            existing_latest = _find_matching_message(stored_messages, latest_assistant) is not None
+
+        if _message_provider(latest_assistant) == OPENROUTER_PROVIDER and not existing_latest:
+            target_index = _find_matching_message(messages, latest_assistant)
+            if target_index is not None and not messages[target_index].get("openrouter_balance_attempted"):
+                balance = fetch_openrouter_balance()
+                messages[target_index]["openrouter_balance_attempted"] = True
+                if balance is not None:
+                    messages[target_index].update(balance)
     if output_path is None:
         created = parse_datetime(payload.get("created"))
         project = safe_filename_component(Path(cwd).name) if cwd else ""

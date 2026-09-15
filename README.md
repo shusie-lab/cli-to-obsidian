@@ -13,7 +13,9 @@ Antigravity、Codex、Claude Code、OpenCode の会話履歴を、Markdownファ
 - OpenCode の会話完了プラグイン（`chat.message`、`experimental.text.complete`、`session.idle`）に対応
 - 会話本文だけを抽出し、ツール実行結果などのノイズを除いて保存
 - ObsidianのYAML frontmatter、見出し、Calloutを使った読みやすい出力
+- 最初のユーザー発話を短い見出しとfrontmatterの`title`へ記録
 - CodexとAntigravityでは、会話ごとのquota変化とセッション全体のweekly quota消費量を記録
+- OpenRouter接続のOpenCode回答では、回答時点で取得したUSD残高を回答メタデータへ記録
 - 外部パッケージ不要で、hookから直接呼び出せる単一ファイル構成
 
 ### 対応状況
@@ -23,7 +25,7 @@ Antigravity、Codex、Claude Code、OpenCode の会話履歴を、Markdownファ
 | Codex | 対応 | ChatGPTデスクトップアプリ内のCodexに対応 | 対応 |
 | Antigravity | 対応 | Antigravityアプリに対応 | 対応 |
 | Claude Code | 対応 | — | なし |
-| OpenCode | 対応（プラグイン） | 対応 | なし |
+| OpenCode | 対応（プラグイン） | 対応 | OpenRouter残高 |
 
 ChatGPTの一般的な会話を保存する機能ではありません。対応するのは、ChatGPTデスクトップアプリ内で実行されるCodexセッションです。
 
@@ -38,10 +40,10 @@ Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_lim
 
 ## インストール元の取得
 
-リリース版の利用を推奨します。次の例では`v1.3.0`を取得します。
+リリース版の利用を推奨します。次の例では`v1.4.0`を取得します。
 
 ```bash
-git clone --branch v1.3.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
+git clone --branch v1.4.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
 cd cli-to-obsidian
 ```
 
@@ -168,6 +170,13 @@ cp opencode_obsidian.js ~/.config/opencode/plugins/opencode_obsidian.js
 
 OpenCode を再起動するとプラグインが読み込まれます。`OBSIDIAN_VAULT` と `OBSIDIAN_OUTPUT_DIR` は OpenCode 起動時の環境変数を引き継ぎます。保存先は `生成AI/ChatLog/opencode/` です。
 
+OpenRouterを接続先にしている場合は、既存の`OPENROUTER_API_KEY`環境変数を使って
+`https://openrouter.ai/api/v1/credits`から残高（`total_credits - total_usage`）を取得し、
+その回答のメタデータへ取得日時とともに記録します。別の接続先、同じ回答の重複保存では
+取得しません。frontmatterには履歴中で最後に取得できた残高を
+`openrouter_balance_usd`と`openrouter_balance_retrieved_at`として表示します。
+キーがない、またはAPIに接続できない場合も会話保存は継続します。
+
 保存スクリプトを別の場所へ置く場合は、プラグイン起動前に `OPENCODE_OBSIDIAN_SAVE_SCRIPT` へ絶対パスを指定してください。既定値は `~/.config/opencode/scripts/opencode_save.py` です。
 
 ## 出力例
@@ -176,6 +185,7 @@ OpenCode を再起動するとプラグインが読み込まれます。`OBSIDIA
 ---
 source: codex-cli
 session_id: "019f6d84-c321-7750-9532-c4b40fad70df"
+title: "このコードのバグを直してください。"
 project: "/Users/yourname/projects/myapp"
 created: "2026-07-17T09:40:55+09:00"
 modified: "2026-07-17T09:40:55+09:00"
@@ -191,7 +201,7 @@ quota: 3.00
 
 <!-- last_line: 11 -->
 
-# User: このコードのバグを直してください。
+# このコードのバグを直してください。
 > [!QUESTION] User
 > <small>⏱ 2026-07-17 09:40:45</small>
 >
@@ -209,7 +219,8 @@ ChatGPTからWorkへ移行した際に生成される構造化されたユーザ
 依頼本文は通常のUser QUESTION calloutへ表示し、前置きの参照情報は内容を解釈せず、
 折りたたみ式の「参照情報（原文）」INFO calloutへ保存します。条件が曖昧な入力は従来どおり全文を保存します。
 
-Claude Codeの新規出力にはquota情報は含まれません。Antigravityでは公式の`/quota`出力が
+Claude Codeの新規出力にはquota情報は含まれません。OpenCodeのOpenRouter残高は各回答に紐づく
+履歴として保存され、後続回答の現在残高で過去回答を更新しません。Antigravityでは公式の`/quota`出力が
 提供する範囲（アカウントによってweekly、5hなど）を記録します。5h quotaが契約上提供
 されないアカウントでは、その項目は表示されません。過去に保存したMarkdownのquota記録は、
 履歴情報として削除されません。
@@ -230,11 +241,19 @@ Claude Codeの新規出力にはquota情報は含まれません。Antigravity�
 外部パッケージは不要です。リポジトリのルートで次を実行します。
 
 ```bash
+/usr/bin/python3 sync_shared.py --check
 /usr/bin/python3 -m unittest discover -s tests -v
 /usr/bin/python3 -X pycache_prefix=/tmp/cli_obsidian_save_pycache -m py_compile agy_save.py codex_save.py claude_save.py opencode_save.py
 ```
 
-テストでは、通常の追記、CodexとAntigravityのquota解析・更新、連続発言の集約に加えて、cursor復旧、state消失時の既存Markdown再利用、書き込み途中のJSONL最終行の再試行、YAML文字列とstateファイル名の安全化、保存先相対パスの検証を確認しています。
+共通のMarkdown整形・日時・見出し・描画、増分Callout判定・抽出、3つの増分saverで共通する
+frontmatter更新・state・ロック・atomic書き込み・既存Markdown探索は`shared/`を開発用の正本とし、変更後に
+`/usr/bin/python3 sync_shared.py`で各`*_save.py`へ埋め込みます。生成後の各スクリプトは
+共通モジュールをimportせず、従来どおり単一ファイルで動作します。生成領域を変更する場合は
+各スクリプトを直接編集せず、`shared/`を変更してから同期してください。同期時は全スクリプトの
+Python構文を先に検証し、1本でも不正なら書き込みません。
+
+テストでは、通常の追記、CodexとAntigravityのquota解析・更新、OpenRouter残高の取得・検証、連続発言の集約に加えて、cursor復旧、state消失時の既存Markdown再利用、書き込み途中のJSONL最終行の再試行、YAML文字列とstateファイル名の安全化、保存先相対パスの検証を確認しています。
 
 ## 実装上の特徴
 
