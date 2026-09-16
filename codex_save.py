@@ -8,7 +8,7 @@ Codex CLI の会話履歴を Obsidian に自動保存するフックスクリプ
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import json
 import re
@@ -66,6 +66,8 @@ STRUCTURED_USER_HEADERS = (
 )
 STRUCTURED_REQUEST_MARKER = "## My request:"
 REFERENCE_CALLOUT_HEADER = "> [!INFO]- 参照情報（原文）"
+QUESTION_REPLY_START = "<send_user_message_question_reply>"
+QUESTION_REPLY_END = "</send_user_message_question_reply>"
 
 # ============================================================
 # ロギング
@@ -424,6 +426,45 @@ def split_structured_user_message(text: str) -> tuple[str, str | None]:
     return request, text[:marker_start]
 
 
+def parse_question_reply(text: str) -> str | None:
+    """質問UIの選択結果をCodex回答へ連結する表示本文へ変換する。
+
+    Codex DesktopはUIからの回答をUserMessageとして記録するが、これは
+    ユーザーの自由発話ではなく、直前のCodex質問に対する選択結果である。
+    形式を確実に確認できない場合はNoneを返し、従来のUserMessage処理へ戻す。
+    """
+    normalized = text.strip()
+    if not (
+        normalized.startswith(QUESTION_REPLY_START)
+        and normalized.endswith(QUESTION_REPLY_END)
+    ):
+        return None
+
+    payload_text = normalized[
+        len(QUESTION_REPLY_START) : -len(QUESTION_REPLY_END)
+    ].strip()
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, list) or not payload:
+        return None
+
+    selections = []
+    for item in payload:
+        if not isinstance(item, dict):
+            return None
+        question = item.get("question")
+        answer = item.get("answer")
+        if not isinstance(question, str) or not isinstance(answer, str):
+            return None
+        if not question.strip() or not answer.strip():
+            return None
+        selections.append(f"- {question.strip()} → {answer.strip()}")
+
+    return "**ユーザーの選択**\n\n" + "\n".join(selections)
+
+
 def reference_callout(text: str) -> str:
     """前置き原文を、内容を解釈せず折りたたみINFO calloutへ入れる。"""
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -750,6 +791,11 @@ def load_jsonl_messages(jsonl_path: Path, start_line: int) -> tuple[list[dict], 
                                         and str(part.get("type", "")).lower() == "text"
                                     )
                                 )
+
+                        question_reply = parse_question_reply(message)
+                        if question_reply is not None:
+                            message_type = "agent_message"
+                            message = question_reply
 
                         if message_type in ("user_message", "agent_message"):
                             messages.append({

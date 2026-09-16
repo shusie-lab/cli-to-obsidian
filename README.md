@@ -40,10 +40,10 @@ Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_lim
 
 ## インストール元の取得
 
-リリース版の利用を推奨します。次の例では`v1.4.0`を取得します。
+リリース版の利用を推奨します。次の例では`v1.4.1`を取得します。
 
 ```bash
-git clone --branch v1.4.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
+git clone --branch v1.4.1 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
 cd cli-to-obsidian
 ```
 

@@ -108,6 +108,78 @@ Response text
         ):
             self.assertEqual(codex_save.split_structured_user_message(message), (message, None))
 
+    def test_codex_question_reply_is_rendered_as_assistant_continuation(self):
+        reply = (
+            codex_save.QUESTION_REPLY_START
+            + '\n[{"question":"配布方法は？","answer":"Pages（推奨）"}]\n'
+            + codex_save.QUESTION_REPLY_END
+        )
+        self.assertEqual(
+            codex_save.parse_question_reply(reply),
+            "**ユーザーの選択**\n\n- 配布方法は？ → Pages（推奨）",
+        )
+
+        for malformed in (
+            "質問だけ",
+            codex_save.QUESTION_REPLY_START + "\nnot-json\n" + codex_save.QUESTION_REPLY_END,
+            codex_save.QUESTION_REPLY_START + "\n[]\n" + codex_save.QUESTION_REPLY_END,
+            codex_save.QUESTION_REPLY_START
+            + '\n[{"question":"質問","answer":""}]\n'
+            + codex_save.QUESTION_REPLY_END,
+        ):
+            self.assertIsNone(codex_save.parse_question_reply(malformed))
+
+    def test_codex_question_reply_item_completed_is_not_user_callout(self):
+        transcript = self.test_dir / "codex-question-reply.jsonl"
+        reply = (
+            codex_save.QUESTION_REPLY_START
+            + '\n[{"question":"配布方法は？","answer":"Pages（推奨）"}]\n'
+            + codex_save.QUESTION_REPLY_END
+        )
+        transcript.write_text(
+            "".join(
+                json.dumps(row, ensure_ascii=False) + "\n"
+                for row in (
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-09-16T01:00:00Z",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "AgentMessage",
+                                "content": [{"type": "Text", "text": "配布方法を選んでください。"}],
+                            },
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-09-16T01:00:01Z",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "UserMessage",
+                                "content": [{"type": "text", "text": reply}],
+                            },
+                        },
+                    },
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        messages, last_line = codex_save.load_jsonl_messages(transcript, 0)
+
+        self.assertEqual(last_line, 2)
+        self.assertEqual([message["type"] for message in messages], ["agent_message", "agent_message"])
+        self.assertIn("ユーザーの選択", messages[1]["message"])
+
+        output_path = codex_save.create_md_file("codex-question-reply", "myproj", datetime.now(JST))
+        codex_save.append_messages(output_path, messages, datetime.now(JST), "gpt-5", last_line)
+        content = output_path.read_text(encoding="utf-8")
+        self.assertNotIn("> [!QUESTION] User", content)
+        self.assertEqual(content.count("> [!NOTE] Codex"), 1)
+        self.assertIn("**ユーザーの選択**", content)
+
     def test_codex_structured_user_message_uses_question_and_raw_reference_callouts(self):
         now = datetime.now(JST)
         md_path = codex_save.create_md_file("test-structured", "myproj", now)

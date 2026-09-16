@@ -8,3 +8,4 @@ ENV/
 *.log
 *.tmp
 .antigravitycli/
+/public/

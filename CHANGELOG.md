@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-16
+
+### Fixed
+
+- Codex Desktop の質問 UI に対する選択結果が、ユーザーの独立した発話ではなく、質問を含む Codex 回答へ連結されるよう修正
+
 ## [1.4.0] - 2026-09-15
 
 ### Added
@@ -56,7 +62,8 @@
 - `OBSIDIAN_OUTPUT_DIR`による保管庫内の保存先カスタマイズに対応
 - macOS 標準 Python 3.9 で実行できる標準ライブラリのみの構成
 
-[Unreleased]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/shusie1969/cli-to-obsidian/compare/v1.1.0...v1.2.0
