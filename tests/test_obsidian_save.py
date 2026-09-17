@@ -584,6 +584,79 @@ Response text
         self.assertIn("Quota: W 75.0(-5.00)% / 5h 60.0(-5.00)%", content)
         self.assertIn("quota: 5.00", content)
 
+    def test_codex_usage_is_summed_per_record_and_model(self):
+        transcript = self.test_dir / "usage.jsonl"
+        records = [
+            {"type": "turn_context", "payload": {"model": "gpt-5.6-luna"}},
+            {
+                "type": "token_usage_record",
+                "payload": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 10,
+                        "cache_write_input_tokens": 2,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": 120,
+                    },
+                    "thread_token_usage": {"total_tokens": 999999},
+                },
+            },
+            {"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}},
+            {
+                "type": "token_usage_record",
+                "payload": {
+                    "usage": {
+                        "input_tokens": 200,
+                        "cached_input_tokens": 20,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 30,
+                        "reasoning_output_tokens": 7,
+                        "total_tokens": 230,
+                    },
+                    "thread_token_usage": {"total_tokens": 1000000},
+                },
+            },
+        ]
+        transcript.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+        usage = codex_save.retrieve_usage(transcript)
+
+        self.assertEqual(usage["total_tokens"], 350)
+        self.assertEqual(usage["input_tokens"], 300)
+        self.assertEqual(usage["by_model"]["gpt-5.6-luna"]["total_tokens"], 120)
+        self.assertEqual(usage["by_model"]["gpt-5.6-sol"]["total_tokens"], 230)
+        self.assertAlmostEqual(usage["total_cost_usd"], 0.0001775, places=8)
+
+        path = codex_save.create_md_file("usage-session", "myproj", datetime.now(JST), usage=usage)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("usage:", content)
+        self.assertIn("total_cost_usd: 0.00017750", content)
+        self.assertIn('"gpt-5.6-luna":', content)
+        self.assertIn("💰 **Usage (USD換算)**: Total: $0.000 (gpt-5.6-luna $0.000、gpt-5.6-sol $0.000)", content)
+
+        refreshed = codex_save.update_markdown_metadata(
+            content,
+            datetime.now(JST),
+            0,
+            0,
+            None,
+            None,
+            usage,
+        )
+        self.assertEqual(refreshed.count("💰 **Usage (USD換算)**:"), 1)
+
+        unknown = dict(usage)
+        unknown["by_model"] = dict(usage["by_model"])
+        unknown["by_model"]["codex-auto-review"] = {
+            "total_tokens": 10,
+            "cost_unavailable": True,
+        }
+        # 未知モデルが混在しても既知分の総計は保存し、完全な請求額と誤認しない。
+        unknown["cost_incomplete"] = True
+        self.assertIn("codex-auto-review 換算不可", codex_save.build_usage_section(unknown))
+        self.assertIn("cost_incomplete: true", "\n".join(codex_save.build_usage_frontmatter_fields(unknown)))
+
     # ------------------------------------------------------------
     # 3. claude_save テスト
     # ------------------------------------------------------------

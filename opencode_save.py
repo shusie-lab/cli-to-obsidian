@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """OpenCode プラグインから渡された会話を Obsidian に保存する。"""
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 import argparse
 import fcntl

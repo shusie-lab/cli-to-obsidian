@@ -8,7 +8,7 @@ Codex CLI の会話履歴を Obsidian に自動保存するフックスクリプ
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 import json
 import re
@@ -36,6 +36,16 @@ OBSIDIAN_VAULT = Path(
     )
 )
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
+
+# Usage の換算係数（USD / 1,000,000 total tokens）。
+# quota のモデル間の影響を比較するための固定係数であり、実際の請求額・契約上の
+# quota 消費額ではない。新しいモデルはここへ追加し、未知モデルは換算不可として扱う。
+USAGE_COST_USD_PER_1M_TOKENS = {
+    "gpt-5.6-luna": 1.00,
+    "gpt-5.6-sol": 0.25,
+    "gpt-5.6-terra": 0.50,
+    "gpt-6-astra": 2.00,
+}
 
 
 # BEGIN GENERATED: output-directory
@@ -641,6 +651,123 @@ def retrieve_quota(jsonl_path: Path, start_line: int = 0) -> dict | None:
 
 
 # ============================================================
+# Usage 集計ユーティリティ
+# ============================================================
+USAGE_TOKEN_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _empty_usage_totals() -> dict[str, int]:
+    return {field: 0 for field in USAGE_TOKEN_FIELDS}
+
+
+def _add_usage_totals(target: dict[str, int], raw_usage: object) -> bool:
+    """usage オブジェクトの数値フィールドを target へ加算する。"""
+    if not isinstance(raw_usage, dict):
+        return False
+    values = {}
+    for field in USAGE_TOKEN_FIELDS:
+        value = raw_usage.get(field, 0)
+        if isinstance(value, bool):
+            return False
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            return False
+        if numeric < 0:
+            return False
+        values[field] = numeric
+    for field, value in values.items():
+        target[field] += value
+    return True
+
+
+def _usage_cost(model: str, total_tokens: int) -> float | None:
+    rate = USAGE_COST_USD_PER_1M_TOKENS.get(model)
+    if rate is None:
+        return None
+    return total_tokens * rate / 1_000_000
+
+
+def retrieve_usage(jsonl_path: Path) -> dict | None:
+    """transcript 全体の token_usage_record をモデル別に集計する。
+
+    ``thread_token_usage`` は再開前の使用量も含む累計値になり得るため使わず、各
+    record の ``payload.usage`` を一度ずつ加算する。途中書き込みや壊れた行は
+    hook の会話保存を止めないよう無視する。
+    """
+    total = _empty_usage_totals()
+    by_model: dict[str, dict[str, int]] = {}
+    current_model = ""
+    found = False
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get("type") == "turn_context":
+                    payload = data.get("payload", {})
+                    if isinstance(payload, dict) and payload.get("model"):
+                        current_model = str(payload["model"])
+                    continue
+
+                if data.get("type") != "token_usage_record":
+                    continue
+                payload = data.get("payload", {})
+                if not isinstance(payload, dict):
+                    continue
+                raw_usage = payload.get("usage")
+                record_totals = _empty_usage_totals()
+                if not _add_usage_totals(record_totals, raw_usage):
+                    continue
+                model = str(payload.get("model") or data.get("model") or current_model or "unknown")
+                model_totals = by_model.setdefault(model, _empty_usage_totals())
+                for field, value in record_totals.items():
+                    total[field] += value
+                    model_totals[field] += value
+                found = True
+    except (OSError, UnicodeError) as error:
+        logger.warning("Usage情報の読み込みに失敗: %s: %s", jsonl_path, error)
+        return None
+
+    if not found:
+        return None
+
+    usage = dict(total)
+    usage["by_model"] = {}
+    total_cost = 0.0
+    has_cost = False
+    has_unpriced = False
+    for model, model_totals in by_model.items():
+        entry = dict(model_totals)
+        cost = _usage_cost(model, model_totals["total_tokens"])
+        if cost is not None:
+            entry["cost_usd"] = round(cost, 8)
+            total_cost += cost
+            has_cost = True
+        else:
+            entry["cost_unavailable"] = True
+            has_unpriced = True
+        usage["by_model"][model] = entry
+    if has_cost:
+        usage["total_cost_usd"] = round(total_cost, 8)
+        if has_unpriced:
+            usage["cost_incomplete"] = True
+    else:
+        usage["cost_unavailable"] = True
+    return usage
+
+
+# ============================================================
 # transcript（JSONL）のパース
 # ============================================================
 def transcript_source_label(raw_source: str, originator: str = "") -> str:
@@ -910,6 +1037,76 @@ def build_quota_section(initial_quota: dict | None, final_quota: dict | None) ->
     return f"📊 **Quota**:\n{line}\n"
 
 
+def _format_usd(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        return f"${float(value):.3f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def build_usage_section(usage: dict | None) -> str:
+    """Usage の換算額だけを本文先頭の一行に表示する。"""
+    if not usage:
+        return "💰 **Usage (USD換算)**: N/A\n"
+
+    total_cost = _format_usd(usage.get("total_cost_usd"))
+    total_label = total_cost or "換算不可"
+    model_parts = []
+    for model, model_usage in usage.get("by_model", {}).items():
+        model_cost = _format_usd(model_usage.get("cost_usd"))
+        model_label = model_cost or "換算不可"
+        model_parts.append(f"{model} {model_label}")
+    model_summary = f" ({'、'.join(model_parts)})" if model_parts else ""
+    return f"💰 **Usage (USD換算)**: Total: {total_label}{model_summary}\n"
+
+
+def build_usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    """usage オブジェクトを Obsidian/Dataview 用の YAML 行へ変換する。"""
+    if not usage:
+        return []
+    fields = ["usage:"]
+    for field in USAGE_TOKEN_FIELDS:
+        fields.append(f"  {field}: {int(usage.get(field, 0))}")
+    if "total_cost_usd" in usage:
+        fields.append(f"  total_cost_usd: {usage['total_cost_usd']:.8f}")
+        if usage.get("cost_incomplete"):
+            fields.append("  cost_incomplete: true")
+    elif usage.get("cost_unavailable"):
+        fields.append("  cost_unavailable: true")
+    fields.append("  by_model:")
+    for model, model_usage in usage.get("by_model", {}).items():
+        fields.append(f"    {yaml_quote(model)}:")
+        for field in USAGE_TOKEN_FIELDS:
+            fields.append(f"      {field}: {int(model_usage.get(field, 0))}")
+        if "cost_usd" in model_usage:
+            fields.append(f"      cost_usd: {model_usage['cost_usd']:.8f}")
+        elif model_usage.get("cost_unavailable"):
+            fields.append("      cost_unavailable: true")
+    return fields
+
+
+def remove_frontmatter_key_block(content: str, key: str) -> str:
+    """frontmatter 内の key とそのインデントされた子要素を取り除く。"""
+    fm_match = re.match(r"^(---\s*\n)(.*?)(\n---\s*\n)", content, re.DOTALL)
+    if not fm_match:
+        return content
+    lines = fm_match.group(2).splitlines()
+    kept = []
+    skip = False
+    prefix = f"{key}:"
+    for line in lines:
+        if line.startswith(prefix) and not line.startswith(" "):
+            skip = True
+            continue
+        if skip and (line.startswith((" ", "\t")) or not line.strip()):
+            continue
+        skip = False
+        kept.append(line)
+    return fm_match.group(1) + "\n".join(kept) + fm_match.group(3) + content[fm_match.end():]
+
+
 def build_frontmatter(
     session_id: str,
     cwd: str,
@@ -918,6 +1115,7 @@ def build_frontmatter(
     source: str = "codex-cli",
     initial_quota: dict | None = None,
     final_quota: dict | None = None,
+    usage: dict | None = None,
     title: str | None = None,
 ) -> str:
     ts = format_iso(start_dt)
@@ -937,6 +1135,7 @@ def build_frontmatter(
     consumption = quota_consumption(initial_quota, final_quota)
     if consumption is not None:
         fm_lines.append(f"quota: {consumption:.2f}")
+    fm_lines.extend(build_usage_frontmatter_fields(usage))
     fm_lines.append("---")
     return "\n".join(fm_lines) + "\n\n"
 
@@ -946,6 +1145,7 @@ def create_md_file(
     cwd: str,
     start_dt: datetime,
     initial_quota: dict | None = None,
+    usage: dict | None = None,
     source: str = "codex-cli",
     title: str | None = None,
 ) -> Path:
@@ -972,10 +1172,12 @@ def create_md_file(
         source=source,
         initial_quota=initial_quota,
         final_quota=initial_quota,
+        usage=usage,
         title=title,
     )
     quota_sec = build_quota_section(initial_quota, initial_quota)
-    content = fm + quota_sec + "\n<!-- last_line: 0 -->\n\n"
+    usage_sec = build_usage_section(usage)
+    content = fm + quota_sec + "\n" + usage_sec + "\n<!-- last_line: 0 -->\n\n"
     atomic_write_md(path, content)
     return path
 
@@ -1190,15 +1392,18 @@ def update_markdown_metadata(
     last_line: int,
     initial_quota: dict | None,
     current_quota: dict | None,
+    usage: dict | None = None,
 ) -> str:
-    """本文のfrontmatter・cursor・quotaを更新し、書き込み前の全文を返す。"""
+    """本文のfrontmatter・cursor・quota・usageを更新し、書き込み前の全文を返す。"""
     consumption = quota_consumption(initial_quota, current_quota)
+    content_without_usage = remove_frontmatter_key_block(content, "usage") if usage is not None else content
+    usage_fields = tuple(build_usage_frontmatter_fields(usage)) if usage is not None else ()
     updated = update_frontmatter_fields(
-        content,
+        content_without_usage,
         modified_dt,
         appended,
         extra_removed_keys=("quota",) if consumption is not None else (),
-        extra_fields=(f"quota: {consumption:.2f}",) if consumption is not None else (),
+        extra_fields=((f"quota: {consumption:.2f}",) if consumption is not None else ()) + usage_fields,
     )
     if updated is None:
         return content
@@ -1215,6 +1420,13 @@ def update_markdown_metadata(
         )
     else:
         body_text = new_quota_sec + "\n" + body_text.lstrip()
+    if usage is not None:
+        usage_sec = build_usage_section(usage)
+        usage_pattern = r"(?m)^💰 \*\*Usage \((?:API|USD)換算\)\*\*:.*(?:\n(?:^- .*(?:\n|$))*)?"
+        if re.search(usage_pattern, body_text):
+            body_text = re.sub(usage_pattern, usage_sec.rstrip("\n") + "\n", body_text, count=1)
+        else:
+            body_text = usage_sec + "\n" + body_text.lstrip()
     body_text = re.sub(
         r"<!--\s*last_line:.*?-->",
         f"<!-- last_line: {last_line} -->",
@@ -1233,6 +1445,7 @@ def append_messages(
     current_quota: dict | None = None,
     last_quota: dict | None = None,
     initial_quota: dict | None = None,
+    usage: dict | None = None,
     effort: str = "",
 ) -> tuple[int, bool]:
     content = path.read_text(encoding="utf-8")
@@ -1314,6 +1527,7 @@ def append_messages(
         last_line,
         initial_quota,
         current_quota,
+        usage,
     )
     # 本文とメタデータを1回のatomic writeで確定する。
     atomic_write_md(path, final_content)
@@ -1374,6 +1588,7 @@ def handle_stop_event(hook_input: dict) -> None:
             logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
     saved_last_line = state.get("last_line", 0)
     current_quota = retrieve_quota(jsonl_path, saved_last_line)
+    current_usage = retrieve_usage(jsonl_path)
     if current_quota:
         if "initial_quota" not in state:
             state["initial_quota"] = current_quota
@@ -1387,6 +1602,7 @@ def handle_stop_event(hook_input: dict) -> None:
             cwd,
             start_dt,
             initial_quota=state.get("initial_quota"),
+            usage=current_usage,
             source=source,
         )
         state["output_path"] = str(path)
@@ -1413,6 +1629,7 @@ def handle_stop_event(hook_input: dict) -> None:
             state.get("cwd", cwd),
             start_dt,
             initial_quota=state.get("initial_quota"),
+            usage=current_usage,
             source=source,
         )
         state["output_path"] = str(path)
@@ -1446,6 +1663,7 @@ def handle_stop_event(hook_input: dict) -> None:
             current_quota=current_quota or state.get("final_quota"),
             last_quota=state.get("last_quota"),
             initial_quota=state.get("initial_quota"),
+            usage=current_usage,
             effort=effort,
         )
         if updated:
@@ -1463,6 +1681,24 @@ def handle_stop_event(hook_input: dict) -> None:
             save_state(session_id, state)
     elif new_last_line != last_line:
         advance_last_line(path, new_last_line)
+        state["last_line"] = new_last_line
+        save_state(session_id, state)
+
+    # Usage は transcript 全体の最新値を使うため、メッセージが増えていない
+    # hook 再実行でも frontmatter と本文を更新する（最後の usage record を拾う）。
+    if current_usage is not None:
+        content = path.read_text(encoding="utf-8")
+        refreshed = update_markdown_metadata(
+            content,
+            now_jst(),
+            0,
+            new_last_line,
+            state.get("initial_quota"),
+            current_quota or state.get("final_quota"),
+            current_usage,
+        )
+        if refreshed != content:
+            atomic_write_md(path, refreshed)
         state["last_line"] = new_last_line
         save_state(session_id, state)
 

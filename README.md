@@ -14,7 +14,8 @@ Antigravity、Codex、Claude Code、OpenCode の会話履歴を、Markdownファ
 - 会話本文だけを抽出し、ツール実行結果などのノイズを除いて保存
 - ObsidianのYAML frontmatter、見出し、Calloutを使った読みやすい出力
 - 最初のユーザー発話を短い見出しとfrontmatterの`title`へ記録
-- CodexとAntigravityでは、会話ごとのquota変化とセッション全体のweekly quota消費量を記録
+- CodexとAntigravityでは、会話ごとのquota変化とセッション全体のquota消費量を記録
+- Codexではtranscriptのtoken使用量をモデル別に集計し、Dataview共通名の`usage`と固定係数によるUSD換算額を記録
 - OpenRouter接続のOpenCode回答では、回答時点で取得したUSD残高を回答メタデータへ記録
 - 外部パッケージ不要で、hookから直接呼び出せる単一ファイル構成
 
@@ -31,6 +32,8 @@ ChatGPTの一般的な会話を保存する機能ではありません。対応�
 
 Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_limits`から取得します。各回答のメタデータに直前の記録からの変化を表示し、frontmatterにはセッション開始時と終了時のweekly quota残量の差を消費量として記録します。quota情報を取得できない場合も、会話保存は継続します。
 
+CodexのUsageは、transcript全体の`token_usage_record.payload.usage`を各レコード一度ずつ加算して集計します。`thread_token_usage`の累計値は二重計上を避けるため使用しません。frontmatterの`usage`にはtoken総計・モデル別内訳・`total_cost_usd`・モデル別`cost_usd`を保存します。USDはモデルごとの固定係数（`codex_save.py`冒頭の`USAGE_COST_USD_PER_1M_TOKENS`、total tokens 100万あたり）による比較用の換算値であり、実際の請求額や契約上のquota消費額ではありません。係数が未登録のモデルはtokenだけを保存し、金額を換算しません。既知モデルが一部でもある場合はその分の`total_cost_usd`を保存し、`cost_incomplete: true`で総計が部分換算であることを示します。
+
 ## 必要環境
 
 - macOS
@@ -40,10 +43,10 @@ Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_lim
 
 ## インストール元の取得
 
-リリース版の利用を推奨します。次の例では`v1.4.1`を取得します。
+リリース版の利用を推奨します。次の例では`v1.5.0`を取得します。
 
 ```bash
-git clone --branch v1.4.1 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
+git clone --branch v1.5.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
 cd cli-to-obsidian
 ```
 
@@ -194,10 +197,24 @@ tags:
   - codex-cli
 message_count: 2
 quota: 3.00
+usage:
+  input_tokens: 120000
+  cached_input_tokens: 100000
+  cache_write_input_tokens: 0
+  output_tokens: 8000
+  reasoning_output_tokens: 3000
+  total_tokens: 128000
+  total_cost_usd: 0.03200000
+  by_model:
+    "gpt-5.6-sol":
+      total_tokens: 128000
+      cost_usd: 0.03200000
 ---
 
 📊 **Quota**:
 - **Codex**: W: 94.0% ➔ 91.0%
+
+💰 **Usage (USD換算)**: Total: $0.032 (gpt-5.6-sol $0.032)
 
 <!-- last_line: 11 -->
 
