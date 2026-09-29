@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,36 @@ class TestSaveScripts(unittest.TestCase):
         for save_module in (codex_save, claude_save, agy_save, opencode_save):
             self.assertEqual(save_module.__version__, version)
 
+    def test_codex_first_hook_preserves_first_and_last_quota_in_batch(self):
+        transcript = self.test_dir / "quota-batch.jsonl"
+        rows = [{"type": "event_msg", "payload": {"type": "user_message", "message": "質問"}}]
+        for stamp, used in (("2026-09-26T01:00:00Z", 10), ("2026-09-26T01:05:00Z", 20)):
+            rows.append({"type": "event_msg", "timestamp": stamp, "payload": {
+                "type": "token_count", "rate_limits": {"primary": {
+                    "window_minutes": 300, "used_percent": used}}}})
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        codex_save.handle_stop_event({"session_id": "quota-batch", "transcript_path": str(transcript),
+                                      "cwd": str(self.test_dir)})
+        state = codex_save.load_state("quota-batch")
+        content = Path(state["output_path"]).read_text(encoding="utf-8")
+        first, last = codex_save.recover_quota_frontmatter(content)
+        self.assertEqual(first["codex"]["5h"]["remaining"], 90)
+        self.assertEqual(last["codex"]["5h"]["remaining"], 80)
+        self.assertEqual(first["codex"]["5h"]["observed_at"], "2026-09-26T01:00:00Z")
+
+    def test_claude_unchanged_quota_refreshes_last_observation_time(self):
+        data = {"session_id": "quota-time", "rate_limits": {
+            "five_hour": {"used_percentage": 20}}}
+        early = datetime(2026, 9, 26, 10, tzinfo=JST)
+        late = early + timedelta(minutes=5)
+        with mock.patch.object(claude_save, "now_jst", return_value=early):
+            claude_save.capture_statusline_quota(data)
+        with mock.patch.object(claude_save, "now_jst", return_value=late):
+            claude_save.capture_statusline_quota(data)
+        state = claude_save.load_state("quota-time")
+        self.assertEqual(state["initial_quota"]["claude"]["5h"]["observed_at"], early.isoformat())
+        self.assertEqual(state["final_quota"]["claude"]["5h"]["observed_at"], late.isoformat())
+
     def test_output_dir_defaults_to_vault_relative_path(self):
         for save_module in (codex_save, claude_save, agy_save, opencode_save):
             with mock.patch.dict(os.environ, {}, clear=False):
@@ -48,6 +79,53 @@ class TestSaveScripts(unittest.TestCase):
             self.assertEqual(save_module.resolve_output_dir("/tmp/out"), Path("生成AI/ChatLog"))
             self.assertEqual(save_module.resolve_output_dir("../outside"), Path("生成AI/ChatLog"))
             self.assertEqual(save_module.resolve_output_dir("AI/../outside"), Path("生成AI/ChatLog"))
+
+    def test_source_name_default_override_and_invalid_values(self):
+        for module, default in (
+            (codex_save, "codex-cli"),
+            (claude_save, "claude-code"),
+            (agy_save, "antigravity-cli"),
+            (opencode_save, "opencode"),
+        ):
+            with self.subTest(module=module.__name__):
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("OBSIDIAN_SOURCE", None)
+                    self.assertEqual(module.resolve_source_name(default), default)
+                with mock.patch.dict(os.environ, {"OBSIDIAN_SOURCE": "device-pi4"}):
+                    self.assertEqual(module.resolve_source_name(default), "device-pi4")
+                for value in ("", ".", "..", "../outside", "codex/pi4", "codex pi4", "x" * 65):
+                    self.assertEqual(module.resolve_source_name(default, value), default)
+
+    def test_source_override_controls_output_directory_and_frontmatter(self):
+        script = """
+import agy_save, claude_save, codex_save, opencode_save
+from datetime import datetime, timezone
+from pathlib import Path
+now = datetime.now(timezone.utc)
+for module in (agy_save, claude_save, codex_save, opencode_save):
+    assert module.OUTPUT_BASE == Path(__import__('os').environ['OBSIDIAN_VAULT']) / 'ChatLog' / 'device-pi4'
+    if module is opencode_save:
+        frontmatter = module.build_frontmatter('session', '/project', now, now, 0)
+    else:
+        frontmatter = module.build_frontmatter('session', '/project', now)
+    assert 'source: device-pi4\\n' in frontmatter
+    assert '  - device-pi4\\n' in frontmatter
+"""
+        env = os.environ.copy()
+        env.update({
+            "OBSIDIAN_VAULT": str(self.test_dir),
+            "OBSIDIAN_OUTPUT_DIR": "ChatLog",
+            "OBSIDIAN_SOURCE": "device-pi4",
+            "HOME": str(self.test_dir),
+        })
+        result = subprocess.run(
+            ["/usr/bin/python3", "-c", script],
+            cwd=Path(__file__).parent.parent,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     # ------------------------------------------------------------
     # 1. ヘッダー抽出テスト
@@ -359,6 +437,37 @@ Response text
             )
             self.assertEqual(save_module.user_heading("\n"), "# User\n")
 
+    def test_callout_preserves_code_regions_while_escaping_normal_markdown(self):
+        text = (
+            "<normal>\n"
+            "`<inline>` and `> quoted`\n"
+            "```text\n"
+            "<fenced>\n"
+            "> raw\n"
+            "```\n"
+            "> > ```text\n"
+            "> > [nested](/tmp/nested.md)\n"
+            "> > <nested>\n"
+            "> > ```\n"
+            "  > normal\n"
+        )
+        expected = (
+            "> &lt;normal>\n"
+            "> `<inline>` and `> quoted`\n"
+            "> ```text\n"
+            "> <fenced>\n"
+            "> > raw\n"
+            "> ```\n"
+            "> > > ```text\n"
+            "> > > [nested](/tmp/nested.md)\n"
+            "> > > <nested>\n"
+            "> > > ```\n"
+            ">   &gt; normal\n"
+            ">"
+        )
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
+            self.assertEqual(save_module.callout_lines(text), expected)
+
     def test_common_message_blocks_have_the_same_contract(self):
         expected_user = (
             "# \*確認\*\n"
@@ -390,6 +499,34 @@ Response text
                 ),
                 expected_assistant.replace("</small>\n\n", "</small>\n\n\n"),
             )
+
+    def test_assistant_local_file_links_are_normalized_for_all_savers(self):
+        text = (
+            "[README](/tmp/My Project/README.md)\n"
+            "[既存URI](file:///tmp/existing.md)\n"
+            "`[コード](/tmp/code.py)`\n"
+            "```text\n"
+            "[例](/tmp/example.txt)\n"
+            "```\n"
+            "> ```text\n"
+            "> [入れ子](/tmp/nested.txt)\n"
+            "> ```\n"
+            "[行](</tmp/space.md>)"
+        )
+        expected = (
+            "[README](file:///tmp/My%20Project/README.md)\n"
+            "[既存URI](file:///tmp/existing.md)\n"
+            "`[コード](/tmp/code.py)`\n"
+            "```text\n"
+            "[例](/tmp/example.txt)\n"
+            "```\n"
+            "> ```text\n"
+            "> [入れ子](/tmp/nested.txt)\n"
+            "> ```\n"
+            "[行](<file:///tmp/space.md>)"
+        )
+        for save_module in (codex_save, claude_save, agy_save, opencode_save):
+            self.assertEqual(save_module.normalize_local_file_links(text), expected)
 
     def test_title_comes_from_first_user_heading(self):
         now = datetime(2026, 8, 7, 10, 0, tzinfo=JST)
@@ -500,6 +637,58 @@ Response text
         self.assertIn("First agent response\nSecond agent response", content2)
         self.assertNotIn("---\n\nSecond agent response", content2)
 
+    def test_codex_streaming_usage_stays_in_one_callout(self):
+        now = datetime.now(JST)
+        md_path = codex_save.create_md_file("streaming-usage", "myproj", now)
+        messages = [
+            {"line_number": 1, "type": "agent_message", "message": "part 1", "model": "gpt-5.6-luna",
+             "usage": {"input_tokens": 10, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+                       "output_tokens": 2, "reasoning_output_tokens": 0, "total_tokens": 12,
+                       "by_model": {"gpt-5.6-luna": {"input_tokens": 10, "cached_input_tokens": 0,
+                       "cache_write_input_tokens": 0, "output_tokens": 2, "reasoning_output_tokens": 0,
+                       "total_tokens": 12, "cost_usd": codex_save.Decimal("0.0000044")}},
+                       "total_cost_usd": codex_save.Decimal("0.0000044")}},
+            {"line_number": 2, "type": "agent_message", "message": "part 2", "model": "gpt-5.6-luna",
+             "usage": {"input_tokens": 20, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+                       "output_tokens": 3, "reasoning_output_tokens": 0, "total_tokens": 23,
+                       "by_model": {"gpt-5.6-luna": {"input_tokens": 20, "cached_input_tokens": 0,
+                       "cache_write_input_tokens": 0, "output_tokens": 3, "reasoning_output_tokens": 0,
+                       "total_tokens": 23, "cost_usd": codex_save.Decimal("0.0000076")}},
+                       "total_cost_usd": codex_save.Decimal("0.0000076")}},
+        ]
+        appended, updated = codex_save.append_messages(md_path, messages, now, "gpt-5.6-luna", 2)
+        self.assertTrue(updated)
+        self.assertEqual(appended, 1)
+        content = md_path.read_text(encoding="utf-8")
+        self.assertEqual(content.count("> [!NOTE] Codex"), 1)
+        self.assertIn("part 1\npart 2", content)
+        self.assertIn("Usage: 35 tok · $0.000012", content)
+
+    def test_codex_tool_use_inserts_one_blank_line_before_next_answer(self):
+        transcript = self.test_dir / "codex_tool_use.jsonl"
+        rows = [
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "ツール前の回答"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "CommandExecution"},
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "ツール後の回答"}},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        messages, last_line = codex_save.load_jsonl_messages(transcript, 0)
+
+        self.assertEqual(last_line, 3)
+        self.assertEqual([message["after_tool_use"] for message in messages], [False, True])
+        path = codex_save.create_md_file("tool-use", "myproj", datetime.now(JST))
+        codex_save.append_messages(path, messages, datetime.now(JST), "gpt-5.6-luna", last_line)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("ツール前の回答\n\nツール後の回答", content)
+        self.assertNotIn("ツール前の回答\n\n\nツール後の回答", content)
+
     def test_codex_quota_parsing_and_markdown(self):
         rate_limits = {
             "primary": {
@@ -541,8 +730,10 @@ Response text
             json.dumps(older) + "\n" + json.dumps(latest) + "\n",
             encoding="utf-8",
         )
-        self.assertEqual(codex_save.retrieve_quota(jsonl_path), quota)
-        self.assertEqual(codex_save.retrieve_quota(jsonl_path, start_line=1), quota)
+        for start_line in (0, 1):
+            observed = codex_save.retrieve_quota(jsonl_path, start_line=start_line)
+            self.assertEqual(observed["codex"]["weekly"]["remaining"], 75.0)
+            self.assertEqual(observed["codex"]["5h"]["remaining"], 60.0)
 
         initial_quota = {
             "codex": {
@@ -572,7 +763,6 @@ Response text
             "gpt-5",
             1,
             current_quota=quota,
-            last_quota=initial_quota,
             initial_quota=initial_quota,
         )
         self.assertTrue(updated)
@@ -581,8 +771,10 @@ Response text
         content = md_path.read_text(encoding="utf-8")
         self.assertIn("- **Codex**: W: 80.0% ➔ 75.0%", content)
         self.assertIn("5h: 65.0% ➔ 60.0%", content)
-        self.assertIn("Quota: W 75.0(-5.00)% / 5h 60.0(-5.00)%", content)
-        self.assertIn("quota: 5.00", content)
+        self.assertIn("first_observed:\n        remaining_percent: 80.0", content)
+        self.assertIn("last_observed:\n        remaining_percent: 75.0", content)
+        self.assertNotIn("(Quota:", content)
+        self.assertNotIn("quota: 5.00", content)
 
     def test_codex_usage_is_summed_per_record_and_model(self):
         transcript = self.test_dir / "usage.jsonl"
@@ -626,14 +818,36 @@ Response text
         self.assertEqual(usage["input_tokens"], 300)
         self.assertEqual(usage["by_model"]["gpt-5.6-luna"]["total_tokens"], 120)
         self.assertEqual(usage["by_model"]["gpt-5.6-sol"]["total_tokens"], 230)
-        self.assertAlmostEqual(usage["total_cost_usd"], 0.0001775, places=8)
+        # 通常入力（input - cached - cache write）、キャッシュ入力、cache write、
+        # 出力を別単価で加算する。reasoning_output_tokens は output_tokens の内数。
+        self.assertEqual(str(usage["total_cost_usd"]), "0.0013703")
+        self.assertEqual(str(usage["by_model"]["gpt-5.6-luna"]["cost_usd"]), "0.0000423")
+        self.assertEqual(str(usage["by_model"]["gpt-5.6-sol"]["cost_usd"]), "0.001328")
+
+        # 長文料金はセッション全体ではなく、272K input tokens超の各recordにだけ適用する。
+        long_context = {
+            "input_tokens": 272001,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 10,
+        }
+        self.assertEqual(str(codex_save._usage_cost("gpt-5.6-sol", long_context)), "2.176308")
+
+        gpt6_usage = {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 200000,
+            "cache_write_input_tokens": 100000,
+            "output_tokens": 100000,
+        }
+        self.assertEqual(str(codex_save._usage_cost("gpt-6-sol", gpt6_usage)), "4.880")
+        self.assertEqual(str(codex_save._usage_cost("gpt-6-luna", gpt6_usage)), "0.244")
 
         path = codex_save.create_md_file("usage-session", "myproj", datetime.now(JST), usage=usage)
         content = path.read_text(encoding="utf-8")
         self.assertIn("usage:", content)
-        self.assertIn("total_cost_usd: 0.00017750", content)
+        self.assertIn("total_cost_usd: 0.0013703", content)
         self.assertIn('"gpt-5.6-luna":', content)
-        self.assertIn("💰 **Usage (USD換算)**: Total: $0.000 (gpt-5.6-luna $0.000、gpt-5.6-sol $0.000)", content)
+        self.assertIn("💰 **Usage (USD換算)**: Total: $0.0013703 (gpt-5.6-luna $0.0000423、gpt-5.6-sol $0.001328)", content)
 
         refreshed = codex_save.update_markdown_metadata(
             content,
@@ -656,6 +870,124 @@ Response text
         unknown["cost_incomplete"] = True
         self.assertIn("codex-auto-review 換算不可", codex_save.build_usage_section(unknown))
         self.assertIn("cost_incomplete: true", "\n".join(codex_save.build_usage_frontmatter_fields(unknown)))
+
+    def test_claude_usage_deduplicates_message_id_and_marks_unpriced_models(self):
+        transcript = self.test_dir / "claude-usage.jsonl"
+        priced = {
+            "type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "回答"}],
+                "usage": {"input_tokens": 100, "cache_creation_input_tokens": 20,
+                          "cache_read_input_tokens": 50, "output_tokens": 10,
+                          "cache_creation": {"ephemeral_5m_input_tokens": 20,
+                                             "ephemeral_1h_input_tokens": 0}}},
+        }
+        unknown = {
+            "type": "assistant", "message": {"id": "msg-2", "model": "other/model",
+                "content": [{"type": "text", "text": "別回答"}],
+                "usage": {"input_tokens": 5, "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 0, "output_tokens": 2}},
+        }
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in [priced, priced, unknown]), encoding="utf-8")
+        usage = claude_save.retrieve_usage(transcript)
+        self.assertEqual(usage["total_tokens"], 187)
+        self.assertEqual(usage["input_tokens"], 175)
+        self.assertEqual(usage["by_model"]["claude-sonnet-4-6"]["cost_usd"], claude_save.Decimal("0.00054"))
+        self.assertTrue(usage["cost_incomplete"])
+        self.assertIn("cost_unavailable: true", "\n".join(claude_save.build_usage_frontmatter_fields(usage)))
+
+    def test_claude_hook_saves_usage_with_existing_conversation(self):
+        transcript = self.test_dir / "claude-hook-usage.jsonl"
+        rows = [
+            {"type": "user", "message": {"content": "質問"}},
+            {"type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "回答"}],
+                "usage": {"input_tokens": 100, "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 0, "output_tokens": 10}}},
+            {"type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-4-6",
+                "content": [], "usage": {"input_tokens": 100, "cache_creation_input_tokens": 0,
+                                       "cache_read_input_tokens": 0, "output_tokens": 10}}},
+        ]
+        transcript.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+        hook = {"session_id": "claude-usage-hook", "transcript_path": str(transcript), "cwd": str(self.test_dir)}
+        claude_save.handle_stop_event(hook)
+        state = claude_save.load_state(hook["session_id"])
+        content = Path(state["output_path"]).read_text(encoding="utf-8")
+        self.assertIn("total_tokens: 110", content)
+        self.assertIn("total_cost_usd:", content)
+        cost_line = next(line for line in content.splitlines() if line.startswith("  total_cost_usd:"))
+        self.assertEqual(claude_save.Decimal(cost_line.split(":", 1)[1].strip()), claude_save.Decimal("0.00045"))
+        self.assertEqual(content.count("回答"), 1)
+        claude_save.handle_stop_event(hook)
+        self.assertEqual(content, Path(state["output_path"]).read_text(encoding="utf-8"))
+
+    def test_claude_statusline_quota_updates_note_and_recovers_first_observation(self):
+        transcript = self.test_dir / "claude-quota.jsonl"
+        transcript.write_text(json.dumps({"type": "user", "message": {"content": "質問"}}) + "\n", encoding="utf-8")
+        session_id = "claude-statusline-quota"
+        first = {"session_id": session_id, "rate_limits": {
+            "five_hour": {"used_percentage": 20, "resets_at": 1800000000},
+            "seven_day": {"used_percentage": 10, "resets_at": 1800100000},
+        }}
+        self.assertIn("W: 90.0%", claude_save.capture_statusline_quota(first))
+        hook = {"session_id": session_id, "transcript_path": str(transcript), "cwd": str(self.test_dir)}
+        claude_save.handle_stop_event(hook)
+        path = Path(claude_save.load_state(session_id)["output_path"])
+        self.assertIn("remaining_percent: 90.0", path.read_text(encoding="utf-8"))
+        second = {"session_id": session_id, "rate_limits": {
+            "five_hour": {"used_percentage": 30, "resets_at": 1800000000},
+            "seven_day": {"used_percentage": 15, "resets_at": 1800100000},
+        }}
+        claude_save.capture_statusline_quota(second)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("first_observed:\n        remaining_percent: 90.0", content)
+        self.assertIn("last_observed:\n        remaining_percent: 85.0", content)
+        self.assertIn("W: 90.0% ➔ 85.0%", content)
+        self.assertNotIn("quota: 5", content)
+        claude_save.state_path(session_id).unlink()
+        claude_save.capture_statusline_quota(second)
+        claude_save.handle_stop_event(hook)
+        recovered = claude_save.load_state(session_id)
+        self.assertEqual(Path(recovered["output_path"]), path)
+        self.assertEqual(recovered["initial_quota"]["claude"]["weekly"]["remaining"], 90.0)
+        self.assertEqual(recovered["final_quota"]["claude"]["weekly"]["remaining"], 85.0)
+
+    def test_codex_answer_usage_is_assigned_once_and_marks_long_context(self):
+        transcript = self.test_dir / "answer-usage.jsonl"
+        rows = [
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "turn_id": "turn-1", "message": "Q1"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "turn_id": "turn-1", "message": "A1"}},
+            {"type": "token_usage_record", "payload": {"turn_id": "turn-1", "usage": {
+                "input_tokens": 100, "cached_input_tokens": 10, "cache_write_input_tokens": 0,
+                "output_tokens": 20, "reasoning_output_tokens": 4, "total_tokens": 120,
+            }}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-2", "model": "gpt-5.6-sol"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "turn_id": "turn-2", "message": "Q2"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "turn_id": "turn-2", "message": "A2"}},
+            {"type": "token_usage_record", "payload": {"turn_id": "turn-2", "usage": {
+                "input_tokens": 272001, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+                "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": 272011,
+            }}},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        messages, last_line = codex_save.load_jsonl_messages(transcript, 0)
+        answer_messages = [message for message in messages if message["type"] == "agent_message"]
+        self.assertEqual(last_line, len(rows))
+        self.assertEqual(len(answer_messages), 2)
+        session_usage = codex_save.retrieve_usage(transcript)
+        self.assertEqual(
+            sum(message["usage"]["total_tokens"] for message in answer_messages),
+            session_usage["total_tokens"],
+        )
+        self.assertEqual(str(answer_messages[0]["usage"]["total_cost_usd"]), "0.0000422")
+        self.assertTrue(answer_messages[1]["usage"]["long_context"])
+
+        path = codex_save.create_md_file("answer-usage", "myproj", datetime.now(JST))
+        codex_save.append_messages(path, messages, datetime.now(JST), "gpt-5.6-luna", last_line)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("Usage: 120 tok · $0.0000422", content)
+        self.assertIn("Usage: 272,011 tok · $2.176308 ⚠︎ 272K+", content)
 
     # ------------------------------------------------------------
     # 3. claude_save テスト
@@ -858,7 +1190,7 @@ Response text
             self.assertEqual(path.parent, module.STATE_DIR)
             self.assertNotIn("..", path.name)
 
-    def test_agy_keeps_quota_history_in_existing_markdown(self):
+    def test_agy_replaces_legacy_quota_when_existing_markdown_is_updated(self):
         now = datetime.now(JST)
         md_path = agy_save.create_md_file("test-agy-history", "myproj", now)
         content = md_path.read_text(encoding="utf-8")
@@ -880,8 +1212,8 @@ Response text
             now,
         )
         updated = md_path.read_text(encoding="utf-8")
-        self.assertIn("quota: 5.00", updated)
-        self.assertIn("- **Gemini**: W: 80.0% ➔ 75.0%", updated)
+        self.assertNotIn("quota: 5.00", updated)
+        self.assertIn("📊 **Quota**: N/A", updated)
 
     def test_agy_parses_official_quota_response(self):
         response = {
@@ -1042,15 +1374,14 @@ Response text
         state = agy_save.load_state(hook["conversationId"])
         content = Path(state["output_path"]).read_text(encoding="utf-8")
         self.assertEqual(state["initial_quota"]["gemini"]["weekly"]["remaining"], 90.0)
-        self.assertEqual(state["last_quota"]["gemini"]["weekly"]["remaining"], 80.0)
+        self.assertEqual(state["final_quota"]["gemini"]["weekly"]["remaining"], 80.0)
         self.assertEqual(state["initial_quota"]["gemini"]["5h"]["remaining"], 60.0)
-        self.assertEqual(state["last_quota"]["gemini"]["5h"]["remaining"], 50.0)
-        self.assertIn("quota: 10.00", content)
+        self.assertEqual(state["final_quota"]["gemini"]["5h"]["remaining"], 50.0)
+        self.assertIn("quota:\n  \"gemini\":", content)
+        self.assertIn("first_observed:\n        remaining_percent: 90.0", content)
+        self.assertIn("last_observed:\n        remaining_percent: 80.0", content)
         self.assertIn("W: 90.0% ➔ 80.0% / 5h: 60.0% ➔ 50.0%", content)
-        self.assertEqual(
-            agy_save.quota_suffix("gemini", state["last_quota"], state["initial_quota"]),
-            " (Quota: W 80.0(-10.00)% / 5h 50.0(-10.00)%)",
-        )
+        self.assertNotIn("(Quota:", content)
 
     def test_agy_without_new_messages_does_not_refresh_quota(self):
         now = datetime.now(JST)
@@ -1081,33 +1412,33 @@ Response text
             agy_save.handle_stop_event(hook)
 
         state_after = agy_save.load_state(hook["conversationId"])
-        self.assertEqual(state_after.get("last_quota"), state.get("last_quota"))
+        self.assertEqual(state_after.get("final_quota"), state.get("final_quota"))
         self.assertEqual(Path(state_after["output_path"]).read_text(encoding="utf-8"), content_before)
 
-    def test_agy_recovers_current_and_legacy_claude_quota_history(self):
-        content = """---
-source: antigravity-cli
-session_id: \"recover-quota\"
-quota: 10.00
-quota_claude: 5.00
----
+    def test_quota_frontmatter_roundtrip(self):
+        first = {"gemini": {"weekly": {"remaining": 90.0, "reset": "2026-08-14 09:00",
+                                      "observed_at": "2026-08-07T10:00:00+09:00"}}}
+        last = {"gemini": {"weekly": {"remaining": 80.0, "reset": "2026-08-14 09:00",
+                                     "observed_at": "2026-08-07T11:00:00+09:00"}}}
+        content = "---\n" + "\n".join(agy_save.build_quota_frontmatter_fields(first, last)) + "\n---\n"
+        recovered_first, recovered_last = agy_save.recover_quota_frontmatter(content)
+        self.assertEqual(recovered_first, first)
+        self.assertEqual(recovered_last, last)
 
-📊 **Quota**:
-- **Gemini**: W: 90.0% ➔ 80.0% / 5h: 60.0% ➔ 50.0%
-- <small>Claude: W: 70.0% / 5h: 40.0%</small>
-
-<!-- last_id: 4 -->
-"""
-        initial, final = agy_save.recover_quota_from_markdown(content)
-        self.assertEqual(initial["gemini"]["weekly"]["remaining"], 90.0)
-        self.assertEqual(final["gemini"]["5h"]["remaining"], 50.0)
-        self.assertEqual(initial["claude"]["weekly"]["remaining"], 75.0)
-        self.assertEqual(final["claude"]["weekly"]["remaining"], 70.0)
-        self.assertEqual(initial["claude"]["5h"]["remaining"], 40.0)
-        self.assertEqual(
-            agy_save.recover_quota_from_markdown(content.replace("quota: 10.00", "quota: 10.04")),
-            (None, None),
-        )
+    def test_quota_windows_keep_first_observation_through_reset(self):
+        initial = {"codex": {"weekly": {"remaining": 10.0, "reset": "2026-08-14 09:00",
+                                         "observed_at": "2026-08-13T10:00:00+09:00"}}}
+        later = {"codex": {"weekly": {"remaining": 100.0, "reset": "2026-08-21 09:00",
+                                       "observed_at": "2026-08-14T10:00:00+09:00"},
+                           "5h": {"remaining": 65.0, "observed_at": "2026-08-14T10:00:00+09:00"}}}
+        first = codex_save.merge_first_quota(initial, later)
+        fields = "\n".join(codex_save.build_quota_frontmatter_fields(first, later))
+        self.assertIn("remaining_percent: 10.0", fields)
+        self.assertIn("remaining_percent: 100.0", fields)
+        self.assertIn('reset_at_jst: "2026-08-14 09:00"', fields)
+        self.assertIn('reset_at_jst: "2026-08-21 09:00"', fields)
+        self.assertIn('"5h":\n      first_observed:\n        remaining_percent: 65.0', fields)
+        self.assertNotIn("quota: -90", fields)
 
     def test_agy_state_recovery_preserves_quota_initial_and_consumption(self):
         session_id = "agy-quota-recovery"
@@ -1154,7 +1485,9 @@ quota_claude: 5.00
         content = output_path.read_text(encoding="utf-8")
         self.assertEqual(state["initial_quota"]["gemini"]["weekly"]["remaining"], 90.0)
         self.assertEqual(state["final_quota"]["gemini"]["weekly"]["remaining"], 80.0)
-        self.assertIn("quota: 10.00", content)
+        self.assertIn("quota:\n  \"gemini\":", content)
+        self.assertIn("first_observed:\n        remaining_percent: 90.0", content)
+        self.assertIn("last_observed:\n        remaining_percent: 80.0", content)
         self.assertIn("W: 90.0% ➔ 80.0%", content)
         self.assertEqual(content.count("W: 90.0% ➔ 80.0%"), 1)
 
@@ -1178,39 +1511,14 @@ quota: 5.00
         self.assertEqual(updated.count("- **Gemini**: W:"), 1)
         self.assertIn("80.0% ➔ 70.0%", updated)
 
-    def test_agy_unreadable_quota_history_is_preserved(self):
-        fake_content = """---
-source: antigravity-cli
-quota: not-a-number
----
-
-本文中の例:
-📊 **Quota**:
-- **Gemini**: W: 1.0%
-
-本文
-"""
-        self.assertEqual(agy_save.recover_quota_from_markdown(fake_content), (None, None))
-        body_only_fake = fake_content.replace("quota: not-a-number\n", "")
-        self.assertFalse(agy_save.has_quota_history(body_only_fake))
-
-        content = """---
-source: antigravity-cli
-quota: not-a-number
----
-
-📊 **Quota**:
-- **Gemini**: W: unknown / 5h: unknown
-
-本文
-"""
-        self.assertEqual(agy_save.recover_quota_from_markdown(content), (None, None))
+    def test_agy_legacy_quota_is_removed_on_update(self):
+        content = "---\nsource: antigravity-cli\nquota: not-a-number\n---\n\n📊 **Quota**:\n- **Gemini**: W: unknown\n\n本文\n"
         updated = agy_save.add_quota_metadata(
-            content,
-            None,
-            {"gemini": {"weekly": {"remaining": 70.0, "reset": ""}}},
+            content, None, {"gemini": {"weekly": {"remaining": 70.0, "reset": ""}}},
         )
-        self.assertEqual(updated, content)
+        self.assertNotIn("not-a-number", updated)
+        self.assertIn("quota:\n  \"gemini\":", updated)
+        self.assertIn("last_observed:\n        remaining_percent: 70.0", updated)
 
     def test_agy_partial_quota_history_is_preserved_after_state_loss(self):
         session_id = "agy-partial-quota-recovery"
@@ -1240,9 +1548,9 @@ quota: not-a-number
 
         state = agy_save.load_state(session_id)
         updated = existing.read_text(encoding="utf-8")
-        self.assertTrue(state["preserve_quota_history"])
+        self.assertNotIn("preserve_quota_history", state)
         self.assertNotIn("quota: 0.00", updated)
-        self.assertIn("W: 80.0% ➔ 70.0% / 5h: unavailable", updated)
+        self.assertIn("W: 60.0%", updated)
         self.assertIn("新回答", updated)
 
     def test_incremental_savers_append_with_single_atomic_markdown_write(self):

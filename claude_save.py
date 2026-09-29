@@ -8,9 +8,11 @@ Claude Code CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.5.0"
+__version__ = "3.1.0"
 
 import json
+import math
+from decimal import Decimal
 import re
 import sys
 import os
@@ -36,6 +38,7 @@ OBSIDIAN_VAULT = Path(
     )
 )
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
+DEFAULT_SOURCE = "claude-code"
 
 
 # BEGIN GENERATED: output-directory
@@ -46,11 +49,23 @@ def resolve_output_dir(value: str | None = None) -> Path:
     if candidate.is_absolute() or ".." in candidate.parts:
         return Path(DEFAULT_OUTPUT_DIR)
     return candidate
+
+
+SOURCE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def resolve_source_name(default: str, value: str | None = None) -> str:
+    """保存先とfrontmatterに使う名前を検証し、不正なら既定値を返す。"""
+    candidate = os.environ.get("OBSIDIAN_SOURCE", default) if value is None else value
+    if candidate not in {".", ".."} and SOURCE_NAME_PATTERN.fullmatch(candidate):
+        return candidate
+    return default
 # END GENERATED: output-directory
 
 
 OBSIDIAN_OUTPUT_DIR = resolve_output_dir()
-OUTPUT_BASE = OBSIDIAN_VAULT / OBSIDIAN_OUTPUT_DIR / "claude-code"
+SOURCE_NAME = resolve_source_name(DEFAULT_SOURCE)
+OUTPUT_BASE = OBSIDIAN_VAULT / OBSIDIAN_OUTPUT_DIR / SOURCE_NAME
 
 STATE_DIR = Path.home() / ".claude" / "claude-obsidian" / "state"
 LOG_FILE = Path.home() / ".claude" / "claude-obsidian" / "log" / "claude_obsidian_save.log"
@@ -288,6 +303,91 @@ def yaml_quote(value: object) -> str:
 def safe_filename_component(value: str) -> str:
     """値を単一の安全なファイル名要素へ変換する。"""
     return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
+
+
+def merge_first_quota(first: dict | None, observed: dict) -> dict:
+    """各枠について、最初に取得できた観測値を保持する。"""
+    merged = {group: dict(windows) for group, windows in (first or {}).items()}
+    for group, windows in observed.items():
+        target = merged.setdefault(group, {})
+        for window, value in windows.items():
+            target.setdefault(window, value)
+    return merged
+
+
+def build_quota_frontmatter_fields(first: dict | None, last: dict | None) -> list[str]:
+    """quotaは消費量に換算せず、枠ごとの最初と最後の観測値を保存する。"""
+    if not first and not last:
+        return []
+    lines = ["quota:"]
+    for group in sorted(set(first or {}) | set(last or {})):
+        lines.append(f"  {yaml_quote(group)}:")
+        first_windows = (first or {}).get(group, {})
+        last_windows = (last or {}).get(group, {})
+        for window in sorted(set(first_windows) | set(last_windows)):
+            lines.append(f"    {yaml_quote(window)}:")
+            for label, value in (("first_observed", first_windows.get(window)),
+                                 ("last_observed", last_windows.get(window))):
+                if not isinstance(value, dict) or value.get("remaining") is None:
+                    continue
+                lines.append(f"      {label}:")
+                lines.append(f"        remaining_percent: {value['remaining']}")
+                if value.get("observed_at"):
+                    lines.append(f"        observed_at: {yaml_quote(value['observed_at'])}")
+                if value.get("reset"):
+                    lines.append(f"        reset_at_jst: {yaml_quote(value['reset'])}")
+    return lines
+
+
+def recover_quota_frontmatter(content: str) -> tuple[dict, dict]:
+    """このスクリプトが出力した階層化quotaだけをstateへ復旧する。"""
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        return {}, {}
+    first, last = {}, {}
+    in_quota = False
+    group = window = observation = ""
+    for line in match.group(1).splitlines():
+        if line == "quota:":
+            in_quota = True
+            continue
+        if not in_quota:
+            continue
+        if line and not line.startswith(" "):
+            break
+        indent = len(line) - len(line.lstrip(" "))
+        key = line.strip()
+        if indent == 2 and key.endswith(":"):
+            try:
+                group = json.loads(key[:-1])
+            except (TypeError, ValueError):
+                return {}, {}
+        elif indent == 4 and key.endswith(":"):
+            try:
+                window = json.loads(key[:-1])
+            except (TypeError, ValueError):
+                return {}, {}
+        elif indent == 6 and key in ("first_observed:", "last_observed:"):
+            observation = key[:-1]
+        elif indent == 8 and group and window and observation and ": " in key:
+            field, raw = key.split(": ", 1)
+            target = first if observation == "first_observed" else last
+            item = target.setdefault(group, {}).setdefault(window, {})
+            if field == "remaining_percent":
+                try:
+                    value = float(raw)
+                except ValueError:
+                    return {}, {}
+                if not 0 <= value <= 100:
+                    return {}, {}
+                item["remaining"] = value
+            elif field in ("observed_at", "reset_at_jst"):
+                try:
+                    value = json.loads(raw)
+                except ValueError:
+                    return {}, {}
+                item["observed_at" if field == "observed_at" else "reset"] = value
+    return first, last
 # END GENERATED: incremental-utilities
 
 
@@ -295,6 +395,208 @@ def safe_filename_component(value: str) -> str:
 def sanitize_markdown(text: str) -> str:
     """会話本文のMarkdown記述を維持し、空値を空文字列へそろえる。"""
     return text if text else ""
+
+
+def _file_uri_path(path: str) -> str:
+    """Markdownリンクのローカル絶対パスをfile URIのパスへ変換する。"""
+    from urllib.parse import quote
+
+    path_part, separator, fragment = path.partition("#")
+    encoded = quote(path_part, safe="/%:@!$&'()*+,;=-._~")
+    if separator:
+        encoded += "#" + quote(fragment, safe="/%:@!$&'()*+,;=-._~")
+    return "file://" + encoded
+
+
+def _normalize_link_destination(destination: str) -> str:
+    """ローカル絶対パスだけを外部ファイルURIへ変換する。"""
+    if not destination.startswith("/") or destination.startswith("//"):
+        return destination
+    return _file_uri_path(destination)
+
+
+def _find_link_end(text: str, start: int) -> int | None:
+    """リンク先の閉じ括弧位置を返す（エスケープと入れ子の括弧に対応）。"""
+    depth = 0
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+    return None
+
+
+def _strip_markdown_blockquote_prefix(line: str) -> str:
+    """Markdown行からblockquoteの入れ子接頭辞を取り除く。"""
+    candidate = line.rstrip("\r\n")
+    while True:
+        match = re.match(r"^ {0,3}>[ \t]?", candidate)
+        if not match:
+            return candidate
+        candidate = candidate[match.end():]
+
+
+def _fenced_code_ranges(text: str) -> list[tuple[int, int]]:
+    """Markdown本文中のコードフェンス範囲を、元の文字列位置で返す。"""
+    ranges = []
+    active = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        content = _strip_markdown_blockquote_prefix(line)
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", content)
+        if active is None:
+            if fence:
+                active = (offset, fence.group(1)[0], len(fence.group(1)))
+        elif (
+            fence
+            and fence.group(1)[0] == active[1]
+            and len(fence.group(1)) >= active[2]
+            and not fence.group(2).strip()
+        ):
+            ranges.append((active[0], offset + len(line)))
+            active = None
+        offset += len(line)
+    if active is not None:
+        ranges.append((active[0], len(text)))
+    return ranges
+
+
+def _iter_inline_markdown_segments(text: str):
+    """通常Markdown部分をtext/code_spanの順で走査する。"""
+    index = 0
+    text_start = 0
+    while index < len(text):
+        if text[index] != "`":
+            index += 1
+            continue
+        run_end = index
+        while run_end < len(text) and text[run_end] == "`":
+            run_end += 1
+        marker = text[index:run_end]
+        closing = text.find(marker, run_end)
+        if closing == -1:
+            index = run_end
+            continue
+        if text_start < index:
+            yield "text", text[text_start:index]
+        yield "code_span", text[index:closing + len(marker)]
+        index = closing + len(marker)
+        text_start = index
+    if text_start < len(text):
+        yield "text", text[text_start:]
+
+
+def iter_markdown_segments(text: str):
+    """回答本文をtext、code_span、fenced_codeの領域へ分類して返す。
+
+    各領域の値は元の文字列をそのまま保持する。コード領域を除外する
+    変換と、callout用に行頭へ接頭辞だけを追加する変換が同じ分類を
+    利用できるようにする。
+    """
+    text = str(text)
+    cursor = 0
+    for start, end in _fenced_code_ranges(text):
+        if cursor < start:
+            yield from _iter_inline_markdown_segments(text[cursor:start])
+        yield "fenced_code", text[start:end]
+        cursor = end
+    if cursor < len(text):
+        yield from _iter_inline_markdown_segments(text[cursor:])
+
+
+def _normalize_markdown_links_in_line(line: str) -> str:
+    """コードスパンを保ったまま、Markdownリンクを正規化する。"""
+    result = []
+    index = 0
+    while index < len(line):
+        if line[index] != "[":
+            result.append(line[index])
+            index += 1
+            continue
+
+        label_end = index + 1
+        depth = 1
+        escaped = False
+        while label_end < len(line):
+            character = line[label_end]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "[":
+                depth += 1
+            elif character == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            label_end += 1
+        if label_end >= len(line):
+            result.append(line[index])
+            index += 1
+            continue
+
+        open_paren = label_end + 1
+        while open_paren < len(line) and line[open_paren] in " \t":
+            open_paren += 1
+        if open_paren >= len(line) or line[open_paren] != "(":
+            result.append(line[index:label_end + 1])
+            index = label_end + 1
+            continue
+
+        close_paren = _find_link_end(line, open_paren + 1)
+        if close_paren is None:
+            result.append(line[index])
+            index += 1
+            continue
+
+        raw_destination = line[open_paren + 1:close_paren]
+        destination = raw_destination
+        prefix = ""
+        suffix = ""
+        if raw_destination.startswith("<"):
+            destination_end = raw_destination.find(">", 1)
+            if destination_end != -1:
+                destination = raw_destination[1:destination_end]
+                prefix = "<"
+                suffix = ">" + raw_destination[destination_end + 1:]
+        elif "\n" not in raw_destination:
+            # タイトル付きリンクはタイトルを残し、パス部分だけを変換する。
+            title_match = re.match(r"^(\S+)(\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))$", raw_destination)
+            if title_match:
+                destination, suffix = title_match.groups()
+
+        normalized = _normalize_link_destination(destination)
+        if normalized == destination:
+            result.append(line[index:close_paren + 1])
+        else:
+            result.append(
+                line[index:open_paren + 1]
+                + prefix
+                + normalized
+                + suffix
+                + ")"
+            )
+        index = close_paren + 1
+    return "".join(result)
+
+
+def normalize_local_file_links(text: str) -> str:
+    """回答本文のローカル絶対パスリンクをfile URIへ変換する。"""
+    result = []
+    for kind, segment in iter_markdown_segments(text):
+        if kind == "text":
+            result.append(_normalize_markdown_links_in_line(segment))
+        else:
+            result.append(segment)
+    return "".join(result)
 
 
 def escape_markdown_heading(text: str) -> str:
@@ -319,14 +621,36 @@ def unescape_markdown_heading(text: str) -> str:
 
 def callout_lines(text: str) -> str:
     """本文をObsidian callout内の行へ変換する。"""
-    lines = []
-    for raw_line in str(text).split("\n"):
-        line = raw_line.replace("<", "&lt;")
-        stripped = line.lstrip()
-        if stripped.startswith(">"):
-            line = line[: len(line) - len(stripped)] + "&gt;" + stripped[1:]
-        lines.append(f"> {line}" if line else ">")
-    return "\n".join(lines)
+    segments = list(iter_markdown_segments(text))
+    lines = [[]]
+    for kind, segment in segments:
+        for part in segment.split("\n")[:-1]:
+            lines[-1].append((kind, part))
+            lines.append([])
+        if segment:
+            lines[-1].append((kind, segment.split("\n")[-1]))
+
+    output = []
+    for line_parts in lines:
+        transformed = []
+        first_non_space = True
+        for kind, part in line_parts:
+            if kind == "text":
+                value = part.replace("<", "&lt;")
+                if first_non_space:
+                    leading = len(value) - len(value.lstrip())
+                    if value[leading:leading + 1] == ">":
+                        value = value[:leading] + "&gt;" + value[leading + 1:]
+                if value.strip():
+                    first_non_space = False
+                transformed.append(value)
+            else:
+                if first_non_space and part.lstrip():
+                    first_non_space = False
+                transformed.append(part)
+        line = "".join(transformed)
+        output.append(f"> {line}" if line else ">")
+    return "\n".join(output)
 # END GENERATED: markdown-formatting
 
 
@@ -448,7 +772,7 @@ def render_assistant_message_block(
     extra_blank_line: bool = False,
 ) -> str:
     """Assistant発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
-    body = text
+    body = normalize_local_file_links(text)
     if continued:
         return body
     separator = "\n\n\n" if extra_blank_line else "\n\n"
@@ -490,6 +814,201 @@ def extract_assistant_text_and_model(data: dict) -> tuple[str, str]:
                 if t:
                     texts.append(t)
     return "\n".join(texts), model_name
+
+
+def parse_statusline_quota(data: dict) -> dict:
+    """Claude Code statusLine入力のrate_limitsをquota観測値へ正規化する。"""
+    limits = data.get("rate_limits")
+    if not isinstance(limits, dict):
+        return {}
+    windows = {}
+    for raw_key, window in (("five_hour", "5h"), ("seven_day", "weekly")):
+        source = limits.get(raw_key)
+        if not isinstance(source, dict):
+            continue
+        used = source.get("used_percentage")
+        if isinstance(used, bool) or not isinstance(used, (int, float)):
+            continue
+        used = float(used)
+        if not math.isfinite(used) or not 0 <= used <= 100:
+            continue
+        reset = ""
+        try:
+            reset = datetime.fromtimestamp(int(source["resets_at"]), tz=timezone.utc).astimezone(JST).strftime("%Y-%m-%d %H:%M")
+        except (KeyError, TypeError, ValueError, OSError, OverflowError):
+            pass
+        windows[window] = {"remaining": round(100 - used, 10), "reset": reset,
+                           "observed_at": format_iso(now_jst())}
+    return {"claude": windows} if windows else {}
+
+
+def build_quota_section(first: dict | None, last: dict | None) -> str:
+    first_windows = (first or {}).get("claude", {})
+    last_windows = (last or {}).get("claude", {})
+    parts = []
+    for window, label in (("weekly", "W"), ("5h", "5h")):
+        initial = first_windows.get(window, {}).get("remaining")
+        final = last_windows.get(window, {}).get("remaining")
+        if initial is None and final is None:
+            continue
+        if initial is not None and final is not None and initial != final:
+            parts.append(f"{label}: {initial:.1f}% ➔ {final:.1f}%")
+        else:
+            parts.append(f"{label}: {(final if final is not None else initial):.1f}%")
+    return "📊 **Quota**:\n- **Claude**: " + " / ".join(parts) + "\n" if parts else ""
+
+
+@session_locked("session_id")
+def capture_statusline_quota(data: dict) -> str:
+    """statusLine経由の観測値を保存し、statusLineに表示する短い文字列を返す。"""
+    session_id = str(data.get("session_id") or "")
+    quota = parse_statusline_quota(data)
+    if not session_id or not quota:
+        return ""
+    state = load_state(session_id)
+    state["initial_quota"] = merge_first_quota(state.get("initial_quota"), quota)
+    quota = merge_first_quota(quota, state.get("final_quota") or {})
+    state["final_quota"] = quota
+    save_state(session_id, state)
+    output_path = state.get("output_path")
+    if output_path and Path(output_path).exists():
+        path = Path(output_path)
+        content = path.read_text(encoding="utf-8")
+        refreshed = update_markdown_metadata(
+            content, now_jst(), 0, read_last_line_from_md(path) or 0,
+            initial_quota=state["initial_quota"], final_quota=quota,
+        )
+        if refreshed != content:
+            atomic_write_md(path, refreshed)
+    return build_quota_section(quota, quota).splitlines()[-1].removeprefix("- **Claude**: ")
+
+
+USAGE_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                      "output_tokens", "reasoning_output_tokens", "total_tokens")
+# 標準API単価の比較値。契約上の請求額やサブスクリプション消費量ではない。
+# https://platform.claude.com/docs/en/about-claude/pricing
+CLAUDE_PRICE_PER_1M = {
+    "claude-opus-5-5": ("4", "20"),
+    "claude-opus-5": ("5", "25"),
+    "claude-opus-4-8": ("5", "25"),
+    "claude-opus-4-7": ("5", "25"),
+    "claude-opus-4-6": ("5", "25"),
+    "claude-opus-4-5": ("5", "25"),
+    "claude-sonnet-5": ("2", "10"),
+    "claude-sonnet-4-6": ("3", "15"),
+    "claude-sonnet-4-5": ("3", "15"),
+    "claude-haiku-4-5": ("1", "5"),
+}
+
+
+def _claude_usage_record(message: dict) -> dict | None:
+    raw = message.get("usage")
+    if not isinstance(raw, dict):
+        return None
+    values = [raw.get("input_tokens"), raw.get("cache_creation_input_tokens", 0),
+              raw.get("cache_read_input_tokens", 0), raw.get("output_tokens")]
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        return None
+    fresh, written, cached, output = values
+    usage = {
+        "input_tokens": fresh + written + cached,
+        "cached_input_tokens": cached,
+        "cache_write_input_tokens": written,
+        "output_tokens": output,
+        "reasoning_output_tokens": 0,
+        "total_tokens": fresh + written + cached + output,
+    }
+    model = str(message.get("model") or "unknown")
+    for prefix, (input_rate, output_rate) in CLAUDE_PRICE_PER_1M.items():
+        if model == prefix or model.startswith(prefix + "-"):
+            break
+    else:
+        return usage
+    cache_creation = raw.get("cache_creation") or {}
+    five_min = cache_creation.get("ephemeral_5m_input_tokens", 0) if isinstance(cache_creation, dict) else None
+    one_hour = cache_creation.get("ephemeral_1h_input_tokens", 0) if isinstance(cache_creation, dict) else None
+    if (not isinstance(five_min, int) or not isinstance(one_hour, int)
+            or isinstance(five_min, bool) or isinstance(one_hour, bool)
+            or five_min < 0 or one_hour < 0 or five_min + one_hour != written
+            or usage["input_tokens"] > 200_000
+            or raw.get("speed", "standard") not in (None, "standard")
+            or raw.get("service_tier", "standard") not in (None, "standard")
+            or raw.get("inference_geo") not in (None, "", "global")):
+        return usage
+    rate = Decimal(input_rate)
+    cost = (Decimal(fresh) * rate + Decimal(cached) * rate * Decimal("0.1")
+            + Decimal(five_min) * rate * Decimal("1.25")
+            + Decimal(one_hour) * rate * 2 + Decimal(output) * Decimal(output_rate)) / Decimal(1_000_000)
+    usage["cost_usd"] = cost
+    return usage
+
+
+def retrieve_usage(jsonl_path: Path) -> dict | None:
+    """同じmessage IDの更新行は最後のusageだけを数える。"""
+    records = {}
+    try:
+        with jsonl_path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream):
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if data.get("type") != "assistant" or data.get("isSidechain"):
+                    continue
+                message = data.get("message")
+                if not isinstance(message, dict):
+                    continue
+                usage = _claude_usage_record(message)
+                if usage is None:
+                    continue
+                message_id = str(message.get("id") or data.get("uuid") or line_number)
+                records[message_id] = (str(message.get("model") or "unknown"), usage)
+    except (OSError, UnicodeError) as error:
+        logger.warning("Usage情報の読み込みに失敗: %s", error)
+        return None
+    if not records:
+        return None
+    total = {field: 0 for field in USAGE_TOKEN_FIELDS}
+    by_model = {}
+    priced = 0
+    for model, usage in records.values():
+        entry = by_model.setdefault(model, {field: 0 for field in USAGE_TOKEN_FIELDS})
+        for field in USAGE_TOKEN_FIELDS:
+            total[field] += usage[field]
+            entry[field] += usage[field]
+        if "cost_usd" in usage:
+            priced += 1
+            entry["cost_usd"] = entry.get("cost_usd", Decimal(0)) + usage["cost_usd"]
+    total["by_model"] = by_model
+    if priced:
+        total["total_cost_usd"] = sum((entry.get("cost_usd", Decimal(0)) for entry in by_model.values()), Decimal(0))
+        if priced < len(records):
+            total["cost_incomplete"] = True
+    else:
+        total["cost_unavailable"] = True
+    return total
+
+
+def build_usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    if not usage:
+        return []
+    lines = ["usage:"]
+    lines.extend(f"  {field}: {usage[field]}" for field in USAGE_TOKEN_FIELDS)
+    if "total_cost_usd" in usage:
+        lines.append(f"  total_cost_usd: {usage['total_cost_usd']}")
+        if usage.get("cost_incomplete"):
+            lines.append("  cost_incomplete: true")
+    else:
+        lines.append("  cost_unavailable: true")
+    lines.append("  by_model:")
+    for model, entry in usage["by_model"].items():
+        lines.append(f"    {yaml_quote(model)}:")
+        lines.extend(f"      {field}: {entry[field]}" for field in USAGE_TOKEN_FIELDS)
+        if "cost_usd" in entry:
+            lines.append(f"      cost_usd: {entry['cost_usd']}")
+        else:
+            lines.append("      cost_unavailable: true")
+    return lines
 
 
 def load_jsonl_messages(jsonl_path: Path, start_line: int) -> tuple[list[dict], int]:
@@ -569,11 +1088,14 @@ def build_frontmatter(
     start_dt: datetime,
     message_count: int = 0,
     title: str | None = None,
+    usage: dict | None = None,
+    initial_quota: dict | None = None,
+    final_quota: dict | None = None,
 ) -> str:
     ts = format_iso(start_dt)
     fm_lines = [
         "---",
-        "source: claude-code",
+        f"source: {SOURCE_NAME}",
         *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
         f"session_id: {yaml_quote(session_id)}",
         f"project: {yaml_quote(cwd)}",
@@ -581,10 +1103,12 @@ def build_frontmatter(
         f"modified: {yaml_quote(ts)}",
         "tags:",
         "  - ai-conversation",
-        "  - claude-code",
+        f"  - {SOURCE_NAME}",
         f"message_count: {message_count}",
-        "---",
     ]
+    fm_lines.extend(build_quota_frontmatter_fields(initial_quota, final_quota))
+    fm_lines.extend(build_usage_frontmatter_fields(usage))
+    fm_lines.append("---")
     return "\n".join(fm_lines) + "\n\n"
 
 
@@ -593,6 +1117,9 @@ def create_md_file(
     cwd: str,
     start_dt: datetime,
     title: str | None = None,
+    usage: dict | None = None,
+    initial_quota: dict | None = None,
+    final_quota: dict | None = None,
 ) -> Path:
     date_dir = start_dt.strftime("%Y%m%d")
     time_prefix = start_dt.strftime("%H%M%S")
@@ -609,8 +1136,11 @@ def create_md_file(
         filename = f"{date_dir}_{time_prefix}_{session_key}.md"
 
     path = output_dir / filename
-    fm = build_frontmatter(session_id, cwd, start_dt, message_count=0, title=title)
-    content = fm + "<!-- last_line: 0 -->\n\n"
+    fm = build_frontmatter(session_id, cwd, start_dt, message_count=0, title=title,
+                           usage=usage, initial_quota=initial_quota, final_quota=final_quota)
+    quota_section = build_quota_section(initial_quota, final_quota)
+    usage_section = build_usage_section(usage)
+    content = fm + (quota_section + "\n" if quota_section else "") + (usage_section + "\n" if usage_section else "") + "<!-- last_line: 0 -->\n\n"
     atomic_write_md(path, content)
     return path
 
@@ -784,17 +1314,61 @@ def compose_markdown(new_fm_lines: list[str], body_text: str) -> str:
 # END GENERATED: frontmatter-update
 
 
+def build_usage_section(usage: dict | None) -> str:
+    if not usage:
+        return ""
+    cost = usage.get("total_cost_usd")
+    amount = f" · ${cost}" if cost is not None else " · USD換算不可"
+    return f"📈 **Usage**: {usage['total_tokens']:,} tokens{amount}\n"
+
+
+def _without_frontmatter_keys(content: str, keys: set[str]) -> str:
+    match = re.match(r"^(---\s*\n)(.*?)(\n---\s*\n)", content, re.DOTALL)
+    if not match:
+        return content
+    lines = []
+    skipping = False
+    for line in match.group(2).splitlines():
+        if any(line.startswith(key + ":") for key in keys):
+            skipping = True
+            continue
+        if skipping and (line.startswith((" ", "\t")) or not line.strip()):
+            continue
+        skipping = False
+        lines.append(line)
+    return match.group(1) + "\n".join(lines) + match.group(3) + content[match.end():]
+
+
 def update_markdown_metadata(
     content: str,
     modified_dt: datetime,
     appended: int,
     last_line: int,
+    usage: dict | None = None,
+    initial_quota: dict | None = None,
+    final_quota: dict | None = None,
 ) -> str:
     """本文のfrontmatterとcursorを更新し、書き込み前の全文を返す。"""
-    updated = update_frontmatter_fields(content, modified_dt, appended)
+    removed = {"usage"} if usage is not None else set()
+    if initial_quota or final_quota:
+        removed.add("quota")
+    source = _without_frontmatter_keys(content, removed) if removed else content
+    updated = update_frontmatter_fields(
+        source, modified_dt, appended,
+        extra_fields=tuple(build_quota_frontmatter_fields(initial_quota, final_quota)
+                           + build_usage_frontmatter_fields(usage)),
+    )
     if updated is None:
         return content
     new_fm_lines, body_text = updated
+    if initial_quota or final_quota:
+        section = build_quota_section(initial_quota, final_quota)
+        body_text = re.sub(r"(?m)^📊 \*\*Quota\*\*:\n- \*\*Claude\*\*:.*\n(?:\n)?", "", body_text, count=1)
+        body_text = section + "\n" + body_text.lstrip("\n")
+    if usage is not None:
+        section = build_usage_section(usage)
+        body_text = re.sub(r"(?m)^📈 \*\*Usage\*\*:.*\n(?:\n)?", "", body_text, count=1)
+        body_text = section + "\n" + body_text.lstrip("\n")
     body_text = re.sub(
         r"<!--\s*last_line:.*?-->",
         f"<!-- last_line: {last_line} -->",
@@ -811,6 +1385,9 @@ def append_messages(
     messages: list[dict],
     modified_dt: datetime,
     last_line: int,
+    usage: dict | None = None,
+    initial_quota: dict | None = None,
+    final_quota: dict | None = None,
 ) -> tuple[int, bool]:
     content = path.read_text(encoding="utf-8")
 
@@ -875,7 +1452,8 @@ def append_messages(
         return 0, False
 
     new_content = content + "\n".join(blocks)
-    final_content = update_markdown_metadata(new_content, modified_dt, appended, last_line)
+    final_content = update_markdown_metadata(new_content, modified_dt, appended, last_line, usage,
+                                             initial_quota, final_quota)
     # 本文とメタデータを1回のatomic writeで確定する。
     atomic_write_md(path, final_content)
     return appended, True
@@ -900,9 +1478,10 @@ def handle_stop_event(hook_input: dict) -> None:
     if not jsonl_path.exists():
         logger.warning(f"JSONLファイルが存在しません: {jsonl_path}")
         return
+    current_usage = retrieve_usage(jsonl_path)
 
     state = load_state(session_id)
-    if not state:
+    if not state or "output_path" not in state:
         cleanup_old_states()
         try:
             recovered_path = find_existing_md(session_id)
@@ -912,11 +1491,15 @@ def handle_stop_event(hook_input: dict) -> None:
         if recovered_path is not None:
             recovered_last_line = read_last_line_from_md(recovered_path) or 0
             start_dt = datetime.fromtimestamp(recovered_path.stat().st_mtime, tz=JST)
+            recovered_content = recovered_path.read_text(encoding="utf-8")
+            first_quota, last_quota = recover_quota_frontmatter(recovered_content)
             state = {
                 "output_path": str(recovered_path),
                 "start_time": start_dt.isoformat(),
                 "cwd": cwd,
                 "last_line": recovered_last_line,
+                "initial_quota": merge_first_quota(first_quota, state.get("initial_quota") or {}),
+                "final_quota": merge_first_quota(state.get("final_quota"), last_quota),
             }
             save_state(session_id, state)
             logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
@@ -928,6 +1511,9 @@ def handle_stop_event(hook_input: dict) -> None:
             session_id,
             cwd,
             start_dt,
+            usage=current_usage,
+            initial_quota=state.get("initial_quota"),
+            final_quota=state.get("final_quota"),
         )
         state["output_path"] = str(path)
         state["start_time"] = start_dt.isoformat()
@@ -952,6 +1538,9 @@ def handle_stop_event(hook_input: dict) -> None:
             session_id,
             state.get("cwd", cwd),
             start_dt,
+            usage=current_usage,
+            initial_quota=state.get("initial_quota"),
+            final_quota=state.get("final_quota"),
         )
         state["output_path"] = str(path)
         state["last_line"] = 0
@@ -980,6 +1569,9 @@ def handle_stop_event(hook_input: dict) -> None:
             new_messages,
             now_jst(),
             new_last_line,
+            usage=current_usage,
+            initial_quota=state.get("initial_quota"),
+            final_quota=state.get("final_quota"),
         )
         if updated:
             state["last_line"] = new_last_line
@@ -989,6 +1581,15 @@ def handle_stop_event(hook_input: dict) -> None:
         advance_last_line(path, new_last_line)
         state["last_line"] = new_last_line
         save_state(session_id, state)
+
+    if (current_usage is not None or state.get("final_quota")) and not new_messages:
+        content = path.read_text(encoding="utf-8")
+        refreshed = update_markdown_metadata(
+            content, now_jst(), 0, new_last_line, current_usage,
+            state.get("initial_quota"), state.get("final_quota"),
+        )
+        if refreshed != content:
+            atomic_write_md(path, refreshed)
 
 # ============================================================
 # メイン
@@ -1003,7 +1604,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        if "--capture-quota" in sys.argv[1:]:
+            print(capture_statusline_quota(read_stdin()))
+        else:
+            main()
     except Exception as e:
         logger.exception(f"予期しないエラー: {e}")
         print("{}")

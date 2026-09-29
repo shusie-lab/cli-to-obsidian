@@ -2,7 +2,6 @@ import os
 import sys
 import tempfile
 import unittest
-from io import BytesIO
 from pathlib import Path
 from unittest import mock
 
@@ -115,245 +114,126 @@ class TestOpenCodeSave(unittest.TestCase):
         )
         self.assertEqual(actual, expected)
 
-    def test_openrouter_balance_is_recorded_once_per_answer(self):
-        payload = {
-            "session_id": "ses_openrouter_balance",
-            "cwd": "/tmp/example",
-            "messages": [
-                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
-                {
-                    "info": {
-                        "id": "a1",
-                        "role": "assistant",
-                        "providerID": "openrouter",
-                        "modelID": "test-model",
-                    },
-                    "parts": [{"type": "text", "text": "回答"}],
-                },
-            ],
-        }
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request,
-            "urlopen",
-            return_value=BytesIO(b'{"data":{"total_credits":10,"total_usage":1.25}}'),
-        ) as urlopen:
-            path = opencode_save.handle_payload(payload)
-            opencode_save.handle_payload(payload)
+    def test_consecutive_assistant_records_share_callout_and_usage(self):
+        created = opencode_save.datetime(2026, 9, 27, 6, 0, tzinfo=opencode_save.JST)
+        messages = [
+            {"type": "user", "text": "質問1", "timestamp": "", "model": ""},
+            {"type": "assistant", "text": "進捗1", "model": "model-a", "usage": {"total_tokens": 10, "cost_usd": 0.1}},
+            {"type": "assistant", "text": "進捗2", "model": "model-a", "usage": {"total_tokens": 20, "cost_usd": 0.2}},
+            {"type": "assistant", "text": "最終回答", "model": "model-a", "usage": {"total_tokens": 30, "cost_usd": 0.3}},
+            {"type": "user", "text": "質問2", "timestamp": "", "model": ""},
+            {"type": "assistant", "text": "別の回答", "model": "model-b"},
+        ]
+        content = opencode_save.render_markdown("session", "/tmp/example", created, messages, modified=created)
+        self.assertIn("message_count: 4", content)
+        self.assertEqual(content.count("> [!NOTE] OpenCode"), 2)
+        self.assertIn("Usage: 60 tok", content)
+        self.assertLess(content.index("進捗1"), content.index("進捗2"))
+        self.assertLess(content.index("進捗2"), content.index("最終回答"))
+        self.assertLess(content.index("最終回答"), content.index("質問2"))
 
-        self.assertEqual(urlopen.call_count, 1)
-        state = opencode_save.load_state("ses_openrouter_balance")
-        answer = state["messages"][1]
-        self.assertEqual(answer["provider"], "openrouter")
-        self.assertEqual(answer["openrouter_balance_usd"], 8.75)
-        self.assertTrue(answer["openrouter_balance_retrieved_at"])
+    def test_full_sync_after_state_loss_does_not_duplicate_grouped_reply(self):
+        session_id = "ses_grouped_state_loss"
+        messages = [
+            {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+            {"info": {"id": "a1", "role": "assistant", "modelID": "model-a"}, "parts": [{"type": "text", "text": "進捗"}]},
+            {"info": {"id": "a2", "role": "assistant", "modelID": "model-a"}, "parts": [{"type": "text", "text": "回答"}]},
+        ]
+        payload = {"session_id": session_id, "cwd": "/tmp/example", "full_sync": True, "messages": messages}
+        path = opencode_save.handle_payload(payload)
+        opencode_save.state_path(session_id).unlink()
+        opencode_save.handle_payload(payload)
         content = path.read_text(encoding="utf-8")
-        self.assertIn("OpenRouter balance: $8.75 USD", content)
-        self.assertIn("openrouter_balance_usd: 8.75", content)
-        self.assertIn("openrouter_balance_retrieved_at:", content)
-        recovered = opencode_save.parse_existing_markdown(path)
-        self.assertEqual(recovered[1]["text"], "回答")
-        self.assertEqual(recovered[1]["openrouter_balance_usd"], 8.75)
+        self.assertEqual(content.count("> [!QUESTION] User"), 1)
+        self.assertEqual(content.count("> [!NOTE] OpenCode"), 1)
+        self.assertEqual(content.count("進捗"), 1)
+        self.assertEqual(content.count("回答"), 1)
 
-    def test_other_provider_and_latest_non_openrouter_do_not_fetch_balance(self):
-        payload = {
-            "session_id": "ses_other_provider",
-            "cwd": "/tmp/example",
-            "messages": [
-                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
-                {
-                    "info": {"id": "a1", "role": "assistant", "providerID": "openrouter"},
-                    "parts": [{"type": "text", "text": "過去の回答"}],
-                },
-                {"info": {"id": "u2", "role": "user"}, "parts": [{"type": "text", "text": "質問2"}]},
-                {
-                    "info": {"id": "a2", "role": "assistant", "providerID": "anthropic"},
-                    "parts": [{"type": "text", "text": "最新の回答"}],
-                },
-            ],
-            "full_sync": True,
-        }
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request, "urlopen"
-        ) as urlopen:
-            opencode_save.handle_payload(payload)
-        urlopen.assert_not_called()
-        state = opencode_save.load_state("ses_other_provider")
-        self.assertNotIn("openrouter_balance_usd", state["messages"][1])
-        self.assertEqual(state["messages"][3]["provider"], "anthropic")
-
-    def test_full_sync_fetches_only_newest_openrouter_answer(self):
-        first = {
-            "session_id": "ses_full_openrouter_balance",
-            "cwd": "/tmp/example",
-            "full_sync": True,
-            "messages": [
-                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問1"}]},
-                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答1"}]},
-                {"info": {"id": "u_old", "role": "user"}, "parts": [{"type": "text", "text": "質問別provider"}]},
-                {"info": {"id": "a_old", "role": "assistant", "providerID": "anthropic"}, "parts": [{"type": "text", "text": "回答別provider"}]},
-            ],
-        }
-        second = {
-            **first,
-            "messages": first["messages"] + [
-                {"info": {"id": "u2", "role": "user"}, "parts": [{"type": "text", "text": "質問2"}]},
-                {"info": {"id": "a2", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答2"}]},
-            ],
-        }
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request,
-            "urlopen",
-            return_value=BytesIO(b'{"data":{"total_credits":10,"total_usage":2}}'),
-        ) as urlopen:
-            opencode_save.handle_payload(first)
-            opencode_save.handle_payload(second)
-        self.assertEqual(urlopen.call_count, 1)
-        messages = opencode_save.load_state("ses_full_openrouter_balance")["messages"]
-        self.assertNotIn("openrouter_balance_usd", messages[1])
-        self.assertEqual(messages[5]["openrouter_balance_usd"], 8.0)
-
-    def test_state_loss_does_not_attach_new_balance_to_old_answer(self):
-        payload = {
-            "session_id": "ses_openrouter_state_loss",
-            "cwd": "/tmp/example",
-            "messages": [
-                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
-                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答"}]},
-            ],
-        }
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request,
-            "urlopen",
-            side_effect=[
-                BytesIO(b'{"data":{"total_credits":10,"total_usage":1}}'),
-                BytesIO(b'{"data":{"total_credits":10,"total_usage":2}}'),
-            ],
-        ) as urlopen:
-            path = opencode_save.handle_payload(payload)
-            opencode_save.state_path("ses_openrouter_state_loss").unlink()
-            opencode_save.handle_payload(payload)
-        self.assertEqual(urlopen.call_count, 1)
-        self.assertIn("OpenRouter balance: $9 USD", path.read_text(encoding="utf-8"))
-        self.assertNotIn("$8 USD", path.read_text(encoding="utf-8"))
-
-    def test_state_loss_same_text_new_timestamp_gets_balance_only_on_new_answer(self):
-        def payload(user_id, assistant_id, timestamp):
-            return {
-                "session_id": "ses_openrouter_same_text_new_turn",
-                "cwd": "/tmp/example",
-                "messages": [
-                    {
-                        "info": {"id": user_id, "role": "user", "time": {"created": timestamp}},
-                        "parts": [{"type": "text", "text": "同じ質問"}],
-                    },
-                    {
-                        "info": {
-                            "id": assistant_id,
-                            "role": "assistant",
-                            "providerID": "openrouter",
-                            "time": {"created": timestamp + 5000},
-                        },
-                        "parts": [{"type": "text", "text": "同じ回答"}],
-                    },
-                ],
-            }
-
-        with mock.patch.dict(os.environ, {}, clear=True):
-            path = opencode_save.handle_payload(payload("u1", "a1", 1722988800000))
-        opencode_save.state_path("ses_openrouter_same_text_new_turn").unlink()
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request,
-            "urlopen",
-            return_value=BytesIO(b'{"data":{"total_credits":10,"total_usage":2}}'),
-        ) as urlopen:
-            opencode_save.handle_payload(payload("u2", "a2", 1722988860000))
-
-        self.assertEqual(urlopen.call_count, 1)
-        state_messages = opencode_save.load_state("ses_openrouter_same_text_new_turn")["messages"]
-        self.assertEqual(len(state_messages), 4)
-        self.assertNotIn("openrouter_balance_usd", state_messages[1])
-        self.assertEqual(state_messages[3]["openrouter_balance_usd"], 8.0)
-        self.assertIn("message_count: 4", path.read_text(encoding="utf-8"))
-
-    def test_old_markdown_without_balance_is_not_refreshed_on_duplicate_recovery(self):
-        payload = {
-            "session_id": "ses_openrouter_old_markdown",
-            "cwd": "/tmp/example",
-            "messages": [
-                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "過去の質問"}]},
-                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "過去の回答"}]},
-            ],
-        }
-        with mock.patch.dict(os.environ, {}, clear=True):
-            path = opencode_save.handle_payload(payload)
-        opencode_save.state_path("ses_openrouter_old_markdown").unlink()
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request, "urlopen"
-        ) as urlopen:
-            opencode_save.handle_payload(payload)
-        urlopen.assert_not_called()
-        self.assertNotIn("OpenRouter balance", path.read_text(encoding="utf-8"))
-
-    def test_invalid_openrouter_credits_do_not_break_save(self):
-        invalid_responses = (
-            b'{"data":{"total_credits":true,"total_usage":0}}',
-            b'{"data":{"total_credits":"10","total_usage":0}}',
-            b'{"data":{"total_credits":NaN,"total_usage":0}}',
-            b'{"data":{"total_credits":Infinity,"total_usage":0}}',
-            b'{"data":{"total_credits":10,"total_usage":Infinity}}',
-            b'{"data":{"total_credits":10,"total_usage":0}',
-            b"not-json",
-        )
-        for response in invalid_responses:
-            with self.subTest(response=response), mock.patch.dict(
-                os.environ, {"OPENROUTER_API_KEY": "test-secret"}
-            ), mock.patch.object(opencode_save.urllib_request, "urlopen", return_value=BytesIO(response)):
-                self.assertIsNone(opencode_save.fetch_openrouter_balance())
-
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request, "urlopen", side_effect=TimeoutError("timed out")
-        ):
-            self.assertIsNone(opencode_save.fetch_openrouter_balance())
-
-        huge_int = b'{"data":{"total_credits":' + (b"9" * 5000) + b',"total_usage":0}}'
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request, "urlopen", return_value=BytesIO(huge_int)
-        ):
-            self.assertIsNone(opencode_save.fetch_openrouter_balance())
-
-    def test_missing_key_and_http_403_do_not_call_or_record_balance(self):
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            opencode_save.urllib_request, "urlopen"
-        ) as urlopen:
-            self.assertIsNone(opencode_save.fetch_openrouter_balance())
-        urlopen.assert_not_called()
-
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request,
-            "urlopen",
-            side_effect=opencode_save.urllib_error.HTTPError(
-                opencode_save.OPENROUTER_CREDITS_URL, 403, "forbidden", {}, None
-            ),
-        ):
-            self.assertIsNone(opencode_save.fetch_openrouter_balance())
-
-    def test_api_failure_still_saves_answer_without_secret(self):
-        payload = {
-            "session_id": "ses_openrouter_failure",
-            "cwd": "/tmp/example",
-            "messages": [
-                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
-                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter"}, "parts": [{"type": "text", "text": "回答"}]},
-            ],
-        }
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch.object(
-            opencode_save.urllib_request, "urlopen", side_effect=TimeoutError("timed out")
-        ):
-            path = opencode_save.handle_payload(payload)
+    def test_full_sync_after_state_loss_preserves_reply_missing_from_payload(self):
+        session_id = "ses_grouped_partial_recovery"
+        first = [
+            {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "過去の質問"}]},
+            {"info": {"id": "a1", "role": "assistant", "modelID": "model-a"}, "parts": [{"type": "text", "text": "過去の進捗"}]},
+            {"info": {"id": "a2", "role": "assistant", "modelID": "model-a"}, "parts": [{"type": "text", "text": "過去の回答"}]},
+        ]
+        path = opencode_save.handle_payload({"session_id": session_id, "cwd": "/tmp/example", "full_sync": True, "messages": first})
+        opencode_save.state_path(session_id).unlink()
+        second = [
+            {"info": {"id": "u2", "role": "user"}, "parts": [{"type": "text", "text": "新しい質問"}]},
+            {"info": {"id": "a3", "role": "assistant", "modelID": "model-a"}, "parts": [{"type": "text", "text": "新しい回答"}]},
+        ]
+        opencode_save.handle_payload({"session_id": session_id, "cwd": "/tmp/example", "full_sync": True, "messages": second})
         content = path.read_text(encoding="utf-8")
-        self.assertIn("回答", content)
-        self.assertNotIn("test-secret", content)
-        self.assertNotIn("openrouter_balance_usd", content)
+        for text in ("過去の進捗", "過去の回答", "新しい回答"):
+            self.assertEqual(content.count(text), 1)
+        self.assertEqual(content.count("> [!QUESTION] User"), 2)
+
+    def test_openrouter_balance_is_not_fetched_and_native_tokens_are_saved(self):
+        payload = {
+            "session_id": "ses_native_usage",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                {"info": {"id": "a1", "role": "assistant", "providerID": "openrouter",
+                          "modelID": "test-model", "cost": 0,
+                          "tokens": {"input": 10, "output": 5, "reasoning": 2,
+                                     "cache": {"read": 20, "write": 3}}},
+                 "parts": [{"type": "text", "text": "回答"}]},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}), mock.patch(
+            "urllib.request.urlopen", side_effect=AssertionError("no network call expected")
+        ) as urlopen:
+            path = opencode_save.handle_payload(payload)
+            opencode_save.handle_payload(payload)
+        urlopen.assert_not_called()
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("input_tokens: 33", content)
+        self.assertIn("cached_input_tokens: 20", content)
+        self.assertIn("output_tokens: 7", content)
+        self.assertIn("total_tokens: 40", content)
+        self.assertIn("cost_unavailable: true", content)
+        self.assertIn("Usage: 40 tok", content)
+        self.assertNotIn("OpenRouter balance", content)
+        self.assertNotIn("openrouter_balance", content)
+
+    def test_native_usage_updates_when_same_answer_gets_late_tokens(self):
+        answer = {"info": {"id": "a1", "role": "assistant", "modelID": "test-model"},
+                  "parts": [{"type": "text", "text": "回答"}]}
+        payload = {"session_id": "ses_late_usage", "cwd": "/tmp/example", "full_sync": True,
+                   "messages": [
+                       {"info": {"id": "u1", "role": "user"},
+                        "parts": [{"type": "text", "text": "質問"}]}, answer]}
+        path = opencode_save.handle_payload(payload)
+        self.assertNotIn("usage:", path.read_text(encoding="utf-8"))
+        answer["info"]["tokens"] = {"input": 10, "output": 2, "reasoning": 0,
+                                    "cache": {"read": 0, "write": 0}}
+        opencode_save.handle_payload(payload)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("total_tokens: 12", content)
+        self.assertEqual(content.count("Usage: 12 tok"), 1)
+        self.assertEqual(content.count("回答"), 1)
+
+    def test_usage_includes_assistant_without_visible_text(self):
+        payload = {"session_id": "ses_hidden_usage", "cwd": "/tmp/example", "full_sync": True,
+                   "messages": [
+                       {"info": {"id": "u1", "role": "user"},
+                        "parts": [{"type": "text", "text": "質問"}]},
+                       {"info": {"id": "a_tool", "role": "assistant", "modelID": "test-model",
+                                 "tokens": {"input": 10, "output": 2, "reasoning": 3,
+                                            "cache": {"read": 4, "write": 1}}},
+                        "parts": [{"type": "tool", "tool": "bash"}]},
+                       {"info": {"id": "a_text", "role": "assistant", "modelID": "test-model",
+                                 "tokens": {"input": 20, "output": 5, "reasoning": 0,
+                                            "cache": {"read": 0, "write": 0}}},
+                        "parts": [{"type": "text", "text": "回答"}]},
+                   ]}
+        path = opencode_save.handle_payload(payload)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("total_tokens: 45", content)
+        self.assertIn("reasoning_output_tokens: 3", content)
+        self.assertEqual(content.count("> [!NOTE] OpenCode"), 1)
+        self.assertIn("message_count: 2", content)
 
     def test_provider_change_is_in_payload_hash(self):
         def payload(provider):

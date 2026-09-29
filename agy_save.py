@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "1.5.0"
+__version__ = "3.1.0"
 
 import json
 import math
@@ -38,6 +38,7 @@ OBSIDIAN_VAULT = Path(
     )
 )
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
+DEFAULT_SOURCE = "antigravity-cli"
 
 
 # BEGIN GENERATED: output-directory
@@ -48,11 +49,23 @@ def resolve_output_dir(value: str | None = None) -> Path:
     if candidate.is_absolute() or ".." in candidate.parts:
         return Path(DEFAULT_OUTPUT_DIR)
     return candidate
+
+
+SOURCE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def resolve_source_name(default: str, value: str | None = None) -> str:
+    """保存先とfrontmatterに使う名前を検証し、不正なら既定値を返す。"""
+    candidate = os.environ.get("OBSIDIAN_SOURCE", default) if value is None else value
+    if candidate not in {".", ".."} and SOURCE_NAME_PATTERN.fullmatch(candidate):
+        return candidate
+    return default
 # END GENERATED: output-directory
 
 
 OBSIDIAN_OUTPUT_DIR = resolve_output_dir()
-OUTPUT_BASE = OBSIDIAN_VAULT / OBSIDIAN_OUTPUT_DIR / "antigravity-cli"
+SOURCE_NAME = resolve_source_name(DEFAULT_SOURCE)
+OUTPUT_BASE = OBSIDIAN_VAULT / OBSIDIAN_OUTPUT_DIR / SOURCE_NAME
 
 STATE_DIR = Path.home() / ".gemini" / "agy-obsidian" / "state"
 LOG_FILE = Path.home() / ".gemini" / "agy-obsidian" / "log" / "obsidian_save.log"
@@ -294,6 +307,91 @@ def yaml_quote(value: object) -> str:
 def safe_filename_component(value: str) -> str:
     """値を単一の安全なファイル名要素へ変換する。"""
     return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
+
+
+def merge_first_quota(first: dict | None, observed: dict) -> dict:
+    """各枠について、最初に取得できた観測値を保持する。"""
+    merged = {group: dict(windows) for group, windows in (first or {}).items()}
+    for group, windows in observed.items():
+        target = merged.setdefault(group, {})
+        for window, value in windows.items():
+            target.setdefault(window, value)
+    return merged
+
+
+def build_quota_frontmatter_fields(first: dict | None, last: dict | None) -> list[str]:
+    """quotaは消費量に換算せず、枠ごとの最初と最後の観測値を保存する。"""
+    if not first and not last:
+        return []
+    lines = ["quota:"]
+    for group in sorted(set(first or {}) | set(last or {})):
+        lines.append(f"  {yaml_quote(group)}:")
+        first_windows = (first or {}).get(group, {})
+        last_windows = (last or {}).get(group, {})
+        for window in sorted(set(first_windows) | set(last_windows)):
+            lines.append(f"    {yaml_quote(window)}:")
+            for label, value in (("first_observed", first_windows.get(window)),
+                                 ("last_observed", last_windows.get(window))):
+                if not isinstance(value, dict) or value.get("remaining") is None:
+                    continue
+                lines.append(f"      {label}:")
+                lines.append(f"        remaining_percent: {value['remaining']}")
+                if value.get("observed_at"):
+                    lines.append(f"        observed_at: {yaml_quote(value['observed_at'])}")
+                if value.get("reset"):
+                    lines.append(f"        reset_at_jst: {yaml_quote(value['reset'])}")
+    return lines
+
+
+def recover_quota_frontmatter(content: str) -> tuple[dict, dict]:
+    """このスクリプトが出力した階層化quotaだけをstateへ復旧する。"""
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        return {}, {}
+    first, last = {}, {}
+    in_quota = False
+    group = window = observation = ""
+    for line in match.group(1).splitlines():
+        if line == "quota:":
+            in_quota = True
+            continue
+        if not in_quota:
+            continue
+        if line and not line.startswith(" "):
+            break
+        indent = len(line) - len(line.lstrip(" "))
+        key = line.strip()
+        if indent == 2 and key.endswith(":"):
+            try:
+                group = json.loads(key[:-1])
+            except (TypeError, ValueError):
+                return {}, {}
+        elif indent == 4 and key.endswith(":"):
+            try:
+                window = json.loads(key[:-1])
+            except (TypeError, ValueError):
+                return {}, {}
+        elif indent == 6 and key in ("first_observed:", "last_observed:"):
+            observation = key[:-1]
+        elif indent == 8 and group and window and observation and ": " in key:
+            field, raw = key.split(": ", 1)
+            target = first if observation == "first_observed" else last
+            item = target.setdefault(group, {}).setdefault(window, {})
+            if field == "remaining_percent":
+                try:
+                    value = float(raw)
+                except ValueError:
+                    return {}, {}
+                if not 0 <= value <= 100:
+                    return {}, {}
+                item["remaining"] = value
+            elif field in ("observed_at", "reset_at_jst"):
+                try:
+                    value = json.loads(raw)
+                except ValueError:
+                    return {}, {}
+                item["observed_at" if field == "observed_at" else "reset"] = value
+    return first, last
 # END GENERATED: incremental-utilities
 
 
@@ -301,6 +399,208 @@ def safe_filename_component(value: str) -> str:
 def sanitize_markdown(text: str) -> str:
     """会話本文のMarkdown記述を維持し、空値を空文字列へそろえる。"""
     return text if text else ""
+
+
+def _file_uri_path(path: str) -> str:
+    """Markdownリンクのローカル絶対パスをfile URIのパスへ変換する。"""
+    from urllib.parse import quote
+
+    path_part, separator, fragment = path.partition("#")
+    encoded = quote(path_part, safe="/%:@!$&'()*+,;=-._~")
+    if separator:
+        encoded += "#" + quote(fragment, safe="/%:@!$&'()*+,;=-._~")
+    return "file://" + encoded
+
+
+def _normalize_link_destination(destination: str) -> str:
+    """ローカル絶対パスだけを外部ファイルURIへ変換する。"""
+    if not destination.startswith("/") or destination.startswith("//"):
+        return destination
+    return _file_uri_path(destination)
+
+
+def _find_link_end(text: str, start: int) -> int | None:
+    """リンク先の閉じ括弧位置を返す（エスケープと入れ子の括弧に対応）。"""
+    depth = 0
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+    return None
+
+
+def _strip_markdown_blockquote_prefix(line: str) -> str:
+    """Markdown行からblockquoteの入れ子接頭辞を取り除く。"""
+    candidate = line.rstrip("\r\n")
+    while True:
+        match = re.match(r"^ {0,3}>[ \t]?", candidate)
+        if not match:
+            return candidate
+        candidate = candidate[match.end():]
+
+
+def _fenced_code_ranges(text: str) -> list[tuple[int, int]]:
+    """Markdown本文中のコードフェンス範囲を、元の文字列位置で返す。"""
+    ranges = []
+    active = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        content = _strip_markdown_blockquote_prefix(line)
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", content)
+        if active is None:
+            if fence:
+                active = (offset, fence.group(1)[0], len(fence.group(1)))
+        elif (
+            fence
+            and fence.group(1)[0] == active[1]
+            and len(fence.group(1)) >= active[2]
+            and not fence.group(2).strip()
+        ):
+            ranges.append((active[0], offset + len(line)))
+            active = None
+        offset += len(line)
+    if active is not None:
+        ranges.append((active[0], len(text)))
+    return ranges
+
+
+def _iter_inline_markdown_segments(text: str):
+    """通常Markdown部分をtext/code_spanの順で走査する。"""
+    index = 0
+    text_start = 0
+    while index < len(text):
+        if text[index] != "`":
+            index += 1
+            continue
+        run_end = index
+        while run_end < len(text) and text[run_end] == "`":
+            run_end += 1
+        marker = text[index:run_end]
+        closing = text.find(marker, run_end)
+        if closing == -1:
+            index = run_end
+            continue
+        if text_start < index:
+            yield "text", text[text_start:index]
+        yield "code_span", text[index:closing + len(marker)]
+        index = closing + len(marker)
+        text_start = index
+    if text_start < len(text):
+        yield "text", text[text_start:]
+
+
+def iter_markdown_segments(text: str):
+    """回答本文をtext、code_span、fenced_codeの領域へ分類して返す。
+
+    各領域の値は元の文字列をそのまま保持する。コード領域を除外する
+    変換と、callout用に行頭へ接頭辞だけを追加する変換が同じ分類を
+    利用できるようにする。
+    """
+    text = str(text)
+    cursor = 0
+    for start, end in _fenced_code_ranges(text):
+        if cursor < start:
+            yield from _iter_inline_markdown_segments(text[cursor:start])
+        yield "fenced_code", text[start:end]
+        cursor = end
+    if cursor < len(text):
+        yield from _iter_inline_markdown_segments(text[cursor:])
+
+
+def _normalize_markdown_links_in_line(line: str) -> str:
+    """コードスパンを保ったまま、Markdownリンクを正規化する。"""
+    result = []
+    index = 0
+    while index < len(line):
+        if line[index] != "[":
+            result.append(line[index])
+            index += 1
+            continue
+
+        label_end = index + 1
+        depth = 1
+        escaped = False
+        while label_end < len(line):
+            character = line[label_end]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "[":
+                depth += 1
+            elif character == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            label_end += 1
+        if label_end >= len(line):
+            result.append(line[index])
+            index += 1
+            continue
+
+        open_paren = label_end + 1
+        while open_paren < len(line) and line[open_paren] in " \t":
+            open_paren += 1
+        if open_paren >= len(line) or line[open_paren] != "(":
+            result.append(line[index:label_end + 1])
+            index = label_end + 1
+            continue
+
+        close_paren = _find_link_end(line, open_paren + 1)
+        if close_paren is None:
+            result.append(line[index])
+            index += 1
+            continue
+
+        raw_destination = line[open_paren + 1:close_paren]
+        destination = raw_destination
+        prefix = ""
+        suffix = ""
+        if raw_destination.startswith("<"):
+            destination_end = raw_destination.find(">", 1)
+            if destination_end != -1:
+                destination = raw_destination[1:destination_end]
+                prefix = "<"
+                suffix = ">" + raw_destination[destination_end + 1:]
+        elif "\n" not in raw_destination:
+            # タイトル付きリンクはタイトルを残し、パス部分だけを変換する。
+            title_match = re.match(r"^(\S+)(\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))$", raw_destination)
+            if title_match:
+                destination, suffix = title_match.groups()
+
+        normalized = _normalize_link_destination(destination)
+        if normalized == destination:
+            result.append(line[index:close_paren + 1])
+        else:
+            result.append(
+                line[index:open_paren + 1]
+                + prefix
+                + normalized
+                + suffix
+                + ")"
+            )
+        index = close_paren + 1
+    return "".join(result)
+
+
+def normalize_local_file_links(text: str) -> str:
+    """回答本文のローカル絶対パスリンクをfile URIへ変換する。"""
+    result = []
+    for kind, segment in iter_markdown_segments(text):
+        if kind == "text":
+            result.append(_normalize_markdown_links_in_line(segment))
+        else:
+            result.append(segment)
+    return "".join(result)
 
 
 def escape_markdown_heading(text: str) -> str:
@@ -325,14 +625,36 @@ def unescape_markdown_heading(text: str) -> str:
 
 def callout_lines(text: str) -> str:
     """本文をObsidian callout内の行へ変換する。"""
-    lines = []
-    for raw_line in str(text).split("\n"):
-        line = raw_line.replace("<", "&lt;")
-        stripped = line.lstrip()
-        if stripped.startswith(">"):
-            line = line[: len(line) - len(stripped)] + "&gt;" + stripped[1:]
-        lines.append(f"> {line}" if line else ">")
-    return "\n".join(lines)
+    segments = list(iter_markdown_segments(text))
+    lines = [[]]
+    for kind, segment in segments:
+        for part in segment.split("\n")[:-1]:
+            lines[-1].append((kind, part))
+            lines.append([])
+        if segment:
+            lines[-1].append((kind, segment.split("\n")[-1]))
+
+    output = []
+    for line_parts in lines:
+        transformed = []
+        first_non_space = True
+        for kind, part in line_parts:
+            if kind == "text":
+                value = part.replace("<", "&lt;")
+                if first_non_space:
+                    leading = len(value) - len(value.lstrip())
+                    if value[leading:leading + 1] == ">":
+                        value = value[:leading] + "&gt;" + value[leading + 1:]
+                if value.strip():
+                    first_non_space = False
+                transformed.append(value)
+            else:
+                if first_non_space and part.lstrip():
+                    first_non_space = False
+                transformed.append(part)
+        line = "".join(transformed)
+        output.append(f"> {line}" if line else ">")
+    return "\n".join(output)
 # END GENERATED: markdown-formatting
 
 
@@ -454,7 +776,7 @@ def render_assistant_message_block(
     extra_blank_line: bool = False,
 ) -> str:
     """Assistant発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
-    body = text
+    body = normalize_local_file_links(text)
     if continued:
         return body
     separator = "\n\n\n" if extra_blank_line else "\n\n"
@@ -781,6 +1103,10 @@ def retrieve_quota() -> dict | None:
         quota = parse_quota_data(data)
         if not quota:
             raise RuntimeError("agy /quota 応答に利用可能な quota がありません")
+        observed_at = format_iso(now_jst())
+        for windows in quota.values():
+            for window in windows.values():
+                window["observed_at"] = observed_at
         return quota
     except (
         OSError,
@@ -821,7 +1147,7 @@ def quota_value(quota: dict | None, group: str, window: str, field: str):
     return quota.get(group, {}).get(window, {}).get(field, None if field == "remaining" else "")
 
 
-def build_quota_section(initial_quota: dict | None, final_quota: dict) -> str:
+def build_quota_section(initial_quota: dict | None, final_quota: dict | None) -> str:
     lines = ["📊 **Quota**:"]
     for group, label in (("gemini", "Gemini"), ("claude", "Claude")):
         values = []
@@ -839,154 +1165,31 @@ def build_quota_section(initial_quota: dict | None, final_quota: dict) -> str:
             values.append(f"{short_label}: {value}{reset_text}")
         if values:
             lines.append(f"- **{label}**: " + " / ".join(values))
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n" if len(lines) > 1 else "📊 **Quota**: N/A\n"
 
 
-def quota_consumption(initial_quota: dict | None, final_quota: dict, group: str) -> float | None:
-    initial = quota_value(initial_quota, group, "weekly", "remaining")
-    final = quota_value(final_quota, group, "weekly", "remaining")
-    if initial is None or final is None:
-        return None
-    return round(initial - final, 2)
-
-
-def quota_suffix(model_name: str, current_quota: dict | None, last_quota: dict | None) -> str:
-    group = "gemini" if "gemini" in model_name.lower() else "claude"
-    parts = []
-    for window, label in (("weekly", "W"), ("5h", "5h")):
-        current = quota_value(current_quota, group, window, "remaining")
-        if current is None:
-            continue
-        previous = quota_value(last_quota, group, window, "remaining")
-        diff = "" if previous is None else f"({current - previous:+.2f})"
-        parts.append(f"{label} {current:.1f}{diff}%")
-    return f" (Quota: {' / '.join(parts)})" if parts else ""
-
-
-def has_quota_history(content: str) -> bool:
-    """既存Markdownにquota履歴があるか判定する。"""
-    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-    if fm_match and re.search(r"(?m)^(?:quota|quota_claude):\s*", fm_match.group(1)):
-        return True
-    if not fm_match:
-        return False
-    body = content[fm_match.end():]
-    return bool(re.match(r"^(?:[ \t]*\n)*📊 \*\*Quota\*\*:", body))
-
-
-def recover_quota_from_markdown(content: str) -> tuple[dict | None, dict | None]:
-    """既存Markdownのquota表示から初期値と最終値を復旧する。
-
-    現行の矢印形式に加え、旧個人版の ``<small>Claude: ...</small>`` を受け付ける。
-    数値を安全に読み取れない履歴は呼び出し側が保守的に保持するため、Noneを返す。
-    """
-    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-    if not fm_match:
-        return None, None
-
-    consumption = {}
-    invalid_consumption_groups = set()
-    for line in fm_match.group(1).splitlines():
-        key_match = re.match(r"^(quota|quota_claude):\s*(.*)$", line)
-        if not key_match:
-            continue
-        group = "gemini" if key_match.group(1) == "quota" else "claude"
-        value_text = key_match.group(2).strip()
-        try:
-            value = float(value_text)
-        except (TypeError, ValueError, OverflowError):
-            invalid_consumption_groups.add(group)
-            continue
-        if math.isfinite(value):
-            consumption[group] = value
-        else:
-            invalid_consumption_groups.add(group)
-
-    body = content[fm_match.end():]
-    section_match = re.match(
-        r"^(?:[ \t]*\n)*📊 \*\*Quota\*\*:(?:[ \t]*N/A)?\n",
-        body,
-    )
-    if not section_match or body[section_match.start():].lstrip().startswith("📊 **Quota**: N/A"):
-        return None, None
-    body_lines = body[section_match.end():].splitlines()
-
-    group_pattern = re.compile(
-        r"^\s*-\s+(?:<small>)?(?:\*\*)?(Gemini|Claude)(?:\*\*)?:\s*(.*?)(?:</small>)?\s*$",
-        re.IGNORECASE,
-    )
-    number_pattern = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))%"
-    initial_quota = {}
-    final_quota = {}
-    for line in body_lines:
-        if not line.lstrip().startswith("-"):
-            break
-        group_match = group_pattern.match(line)
-        if not group_match:
-            return None, None
-        group = group_match.group(1).lower()
-        details = group_match.group(2)
-        found_bucket = False
-        for window, label in (("weekly", "W"), ("5h", "5h")):
-            if not re.search(rf"\b{re.escape(label)}\s*:", details, re.IGNORECASE):
-                continue
-            bucket_match = re.search(
-                rf"\b{re.escape(label)}\s*:\s*{number_pattern}"
-                rf"(?:\s*➔\s*{number_pattern})?",
-                details,
-                re.IGNORECASE,
-            )
-            if not bucket_match:
-                return None, None
-            try:
-                first = float(bucket_match.group(1))
-                second = float(bucket_match.group(2)) if bucket_match.group(2) is not None else None
-            except (TypeError, ValueError, OverflowError):
-                return None, None
-            if not all(math.isfinite(value) for value in (first, second) if value is not None):
-                return None, None
-            final = round(second if second is not None else first, 2)
-            initial = round(first, 2)
-            if second is None and window == "weekly" and group in consumption:
-                initial = final + consumption[group]
-            elif second is None and window == "weekly" and group in invalid_consumption_groups:
-                return None, None
-            initial_quota.setdefault(group, {})[window] = {"remaining": initial, "reset": ""}
-            final_quota.setdefault(group, {})[window] = {"remaining": final, "reset": ""}
-            found_bucket = True
-        if not found_bucket:
-            return None, None
-
-    if not final_quota:
-        return None, None
-    for group, recorded_consumption in consumption.items():
-        weekly_initial = initial_quota.get(group, {}).get("weekly", {}).get("remaining")
-        weekly_final = final_quota.get(group, {}).get("weekly", {}).get("remaining")
-        if weekly_initial is None or weekly_final is None:
-            return None, None
-        if round(weekly_initial - weekly_final, 2) != round(recorded_consumption, 2):
-            logger.info("既存Markdownのquota消費量と表示値が一致しないため復旧を見送ります")
-            return None, None
-    return initial_quota, final_quota
-
-
-def add_quota_metadata(content: str, initial_quota: dict | None, final_quota: dict) -> str:
+def add_quota_metadata(content: str, initial_quota: dict | None, final_quota: dict | None) -> str:
     match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
     if not match:
         return content
-    if not initial_quota and has_quota_history(content):
-        return content
-    frontmatter, body = match.group(1), content[match.end():]
-    for group, key in (("gemini", "quota"), ("claude", "quota_claude")):
-        consumption = quota_consumption(initial_quota, final_quota, group)
-        if consumption is not None:
-            frontmatter = re.sub(rf"(?m)^{key}:.*\n?", "", frontmatter).rstrip()
-            frontmatter += f"\n{key}: {consumption:.2f}"
+    old_lines = match.group(1).splitlines()
+    kept = []
+    skipping = False
+    for line in old_lines:
+        if re.match(r"^(?:quota|quota_claude):", line):
+            skipping = True
+            continue
+        if skipping and (line.startswith((" ", "\t")) or not line.strip()):
+            continue
+        skipping = False
+        kept.append(line)
+    kept.extend(build_quota_frontmatter_fields(initial_quota, final_quota))
+    frontmatter, body = "\n".join(kept), content[match.end():]
     section = build_quota_section(initial_quota, final_quota)
     pattern = r"\A[ \t]*📊 \*\*Quota\*\*:(?:[ \t]*N/A)?\n(?:[ \t]*-[^\n]*(?:\n|$))*"
     if re.search(pattern, body):
         body = re.sub(pattern, lambda _: section, body, count=1)
-    else:
+    elif initial_quota or final_quota:
         body = section + "\n" + body.lstrip()
     return "---\n" + frontmatter + "\n---\n" + body
 
@@ -999,16 +1202,13 @@ def build_frontmatter(
     cwd: str,
     start_dt: datetime,
     message_count: int = 0,
-    is_app: bool = False,
     title: str | None = None,
 ) -> str:
     ts = format_iso(start_dt)
-    source = "antigravity-app" if is_app else "antigravity-cli"
-    tag_name = "antigravity-app" if is_app else "antigravity-cli"
 
     fm_lines = [
         "---",
-        f"source: {source}",
+        f"source: {SOURCE_NAME}",
         *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
         f"session_id: {yaml_quote(session_id)}",
         f"project: {yaml_quote(cwd)}",
@@ -1016,7 +1216,7 @@ def build_frontmatter(
         f"modified: {yaml_quote(ts)}",
         "tags:",
         "  - ai-conversation",
-        f"  - {tag_name}",
+        f"  - {SOURCE_NAME}",
         f"message_count: {message_count}",
     ]
     fm_lines.append("---")
@@ -1028,7 +1228,6 @@ def create_md_file(
     session_id: str,
     cwd: str,
     start_dt: datetime,
-    is_app: bool = False,
     title: str | None = None,
 ) -> Path:
     date_dir = start_dt.strftime("%Y%m%d")
@@ -1054,7 +1253,6 @@ def create_md_file(
         start_dt,
         title=title,
         message_count=0,
-        is_app=is_app,
     )
     content = fm + "<!-- last_id: -->\n\n"
     atomic_write_md(path, content)
@@ -1199,8 +1397,7 @@ def update_markdown_metadata(
     )
 
     new_content = compose_markdown(new_fm_lines, body_text)
-    if current_quota:
-        new_content = add_quota_metadata(new_content, initial_quota, current_quota)
+    new_content = add_quota_metadata(new_content, initial_quota, current_quota)
     return new_content
 
 
@@ -1253,7 +1450,6 @@ def append_messages(
     messages: list,
     modified_dt: datetime,
     current_quota: dict | None = None,
-    last_quota: dict | None = None,
     initial_quota: dict | None = None,
 ) -> tuple[str, int, bool]:
     content = path.read_text(encoding="utf-8")
@@ -1287,7 +1483,6 @@ def append_messages(
             appended += 1
 
         elif m_type == "agent_message":
-            m_model += quota_suffix(m_model, current_quota, last_quota) if m_model else ""
             metadata = [f"🤖 {m_model}"] if m_model else []
             callout_header = assistant_callout_header(AGENT_NAME, metadata)
 
@@ -1354,13 +1549,6 @@ def handle_stop_event(hook_input: dict) -> None:
     if not transcript_path:
         logger.info("transcriptPath が未提供のため session_id から JSONL を探索します")
 
-    # アプリ版セッションかどうかの判定（transcriptPath のパスで識別）
-    is_app = (
-        bool(transcript_path)
-        and "/.gemini/antigravity/" in transcript_path
-        and "/.gemini/antigravity-cli/" not in transcript_path
-    )
-
     state = load_state(session_id)
     if not state:
         cleanup_old_states()
@@ -1382,18 +1570,13 @@ def handle_stop_event(hook_input: dict) -> None:
             try:
                 recovered_content = recovered_path.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as error:
-                state["preserve_quota_history"] = True
-                logger.warning(f"既存Markdownのquota履歴を読み取れないため保持します: {error}")
+                logger.warning(f"既存Markdownのquota履歴を読み取れませんでした: {error}")
             else:
-                recovered_initial, recovered_final = recover_quota_from_markdown(recovered_content)
-                state["preserve_quota_history"] = (
-                    has_quota_history(recovered_content) and recovered_initial is None
-                )
-                if recovered_initial is not None:
+                recovered_initial, recovered_final = recover_quota_frontmatter(recovered_content)
+                if recovered_initial:
                     state["initial_quota"] = recovered_initial
-                if recovered_final is not None:
+                if recovered_final:
                     state["final_quota"] = recovered_final
-                    state["last_quota"] = recovered_final
             save_state(session_id, state)
             logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
 
@@ -1403,7 +1586,6 @@ def handle_stop_event(hook_input: dict) -> None:
             session_id,
             cwd,
             start_dt,
-            is_app=is_app,
         )
         state["output_path"] = str(path)
         state["start_time"] = start_dt.isoformat()
@@ -1429,7 +1611,6 @@ def handle_stop_event(hook_input: dict) -> None:
             session_id,
             state.get("cwd", cwd),
             start_dt,
-            is_app=is_app,
         )
         state["output_path"] = str(path)
         state["last_id"] = ""  # 再作成時は全メッセージを再取得
@@ -1456,21 +1637,18 @@ def handle_stop_event(hook_input: dict) -> None:
     if new_messages:
         current_quota = retrieve_quota()
         if current_quota:
-            if not state.get("initial_quota") and not state.get("preserve_quota_history"):
-                state["initial_quota"] = current_quota
+            state["initial_quota"] = merge_first_quota(state.get("initial_quota"), current_quota)
+            current_quota = merge_first_quota(current_quota, state.get("final_quota") or {})
             state["final_quota"] = current_quota
         new_last_id, appended, updated = append_messages(
             path,
             new_messages,
             now_jst(),
-            current_quota=current_quota,
-            last_quota=state.get("last_quota"),
+            current_quota=current_quota or state.get("final_quota"),
             initial_quota=state.get("initial_quota"),
         )
         if new_last_id:
             state["last_id"] = new_last_id
-        if updated and current_quota:
-            state["last_quota"] = current_quota
         save_state(session_id, state)
         logger.info(f"{appended}件追記完了 {session_id[:8]}")
     else:

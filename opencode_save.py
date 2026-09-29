@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """OpenCode プラグインから渡された会話を Obsidian に保存する。"""
 
-__version__ = "1.5.0"
+__version__ = "3.1.0"
 
 import argparse
 import fcntl
@@ -19,13 +19,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 
 
 JST = timezone(timedelta(hours=9))
 OBSIDIAN_VAULT = Path(os.environ.get("OBSIDIAN_VAULT", str(Path.home() / "obsidian")))
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
+DEFAULT_SOURCE = "opencode"
 
 
 # BEGIN GENERATED: output-directory
@@ -36,17 +35,26 @@ def resolve_output_dir(value: str | None = None) -> Path:
     if candidate.is_absolute() or ".." in candidate.parts:
         return Path(DEFAULT_OUTPUT_DIR)
     return candidate
+
+
+SOURCE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def resolve_source_name(default: str, value: str | None = None) -> str:
+    """保存先とfrontmatterに使う名前を検証し、不正なら既定値を返す。"""
+    candidate = os.environ.get("OBSIDIAN_SOURCE", default) if value is None else value
+    if candidate not in {".", ".."} and SOURCE_NAME_PATTERN.fullmatch(candidate):
+        return candidate
+    return default
 # END GENERATED: output-directory
 
 
-OUTPUT_BASE = OBSIDIAN_VAULT / resolve_output_dir() / "opencode"
+SOURCE_NAME = resolve_source_name(DEFAULT_SOURCE)
+OUTPUT_BASE = OBSIDIAN_VAULT / resolve_output_dir() / SOURCE_NAME
 STATE_DIR = Path.home() / ".local" / "state" / "opencode-obsidian"
 LOG_FILE = STATE_DIR / "opencode_obsidian_save.log"
 STATE_RETENTION_DAYS = 30
 SAFE_SESSION_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
-OPENROUTER_PROVIDER = "openrouter"
-OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
-OPENROUTER_TIMEOUT_SECONDS = 5
 
 
 def setup_logger() -> logging.Logger:
@@ -255,50 +263,212 @@ def _finite_number(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-def fetch_openrouter_balance() -> Optional[Dict[str, Any]]:
-    """OpenRouterの残高を1回取得する。失敗時は会話保存を止めずNoneを返す。"""
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        return None
-
-    request = urllib_request.Request(
-        OPENROUTER_CREDITS_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-        method="GET",
-    )
-    try:
-        with urllib_request.urlopen(request, timeout=OPENROUTER_TIMEOUT_SECONDS) as response:
-            status = getattr(response, "status", None)
-            if status is not None and not (200 <= int(status) < 300):
-                raise urllib_error.HTTPError(OPENROUTER_CREDITS_URL, int(status), "HTTP error", None, None)
-            data = json.load(response)
-        if not isinstance(data, dict):
-            raise ValueError("response is not an object")
-        data = data.get("data")
-        if not isinstance(data, dict):
-            raise ValueError("response data is invalid")
-        total_credits = _finite_number(data.get("total_credits"))
-        total_usage = _finite_number(data.get("total_usage"))
-        if total_credits is None or total_usage is None:
-            raise ValueError("credits fields are invalid")
-        balance = total_credits - total_usage
-        if not math.isfinite(balance):
-            raise ValueError("balance is invalid")
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        # APIキーやレスポンス本文をログへ出さない。
-        logger.warning("OpenRouter残高を取得できませんでした")
-        return None
-
-    return {
-        "openrouter_balance_usd": balance,
-        "openrouter_balance_retrieved_at": format_iso(datetime.now(JST)),
-    }
-
-
 # BEGIN GENERATED: markdown-formatting
 def sanitize_markdown(text: str) -> str:
     """会話本文のMarkdown記述を維持し、空値を空文字列へそろえる。"""
     return text if text else ""
+
+
+def _file_uri_path(path: str) -> str:
+    """Markdownリンクのローカル絶対パスをfile URIのパスへ変換する。"""
+    from urllib.parse import quote
+
+    path_part, separator, fragment = path.partition("#")
+    encoded = quote(path_part, safe="/%:@!$&'()*+,;=-._~")
+    if separator:
+        encoded += "#" + quote(fragment, safe="/%:@!$&'()*+,;=-._~")
+    return "file://" + encoded
+
+
+def _normalize_link_destination(destination: str) -> str:
+    """ローカル絶対パスだけを外部ファイルURIへ変換する。"""
+    if not destination.startswith("/") or destination.startswith("//"):
+        return destination
+    return _file_uri_path(destination)
+
+
+def _find_link_end(text: str, start: int) -> int | None:
+    """リンク先の閉じ括弧位置を返す（エスケープと入れ子の括弧に対応）。"""
+    depth = 0
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+    return None
+
+
+def _strip_markdown_blockquote_prefix(line: str) -> str:
+    """Markdown行からblockquoteの入れ子接頭辞を取り除く。"""
+    candidate = line.rstrip("\r\n")
+    while True:
+        match = re.match(r"^ {0,3}>[ \t]?", candidate)
+        if not match:
+            return candidate
+        candidate = candidate[match.end():]
+
+
+def _fenced_code_ranges(text: str) -> list[tuple[int, int]]:
+    """Markdown本文中のコードフェンス範囲を、元の文字列位置で返す。"""
+    ranges = []
+    active = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        content = _strip_markdown_blockquote_prefix(line)
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", content)
+        if active is None:
+            if fence:
+                active = (offset, fence.group(1)[0], len(fence.group(1)))
+        elif (
+            fence
+            and fence.group(1)[0] == active[1]
+            and len(fence.group(1)) >= active[2]
+            and not fence.group(2).strip()
+        ):
+            ranges.append((active[0], offset + len(line)))
+            active = None
+        offset += len(line)
+    if active is not None:
+        ranges.append((active[0], len(text)))
+    return ranges
+
+
+def _iter_inline_markdown_segments(text: str):
+    """通常Markdown部分をtext/code_spanの順で走査する。"""
+    index = 0
+    text_start = 0
+    while index < len(text):
+        if text[index] != "`":
+            index += 1
+            continue
+        run_end = index
+        while run_end < len(text) and text[run_end] == "`":
+            run_end += 1
+        marker = text[index:run_end]
+        closing = text.find(marker, run_end)
+        if closing == -1:
+            index = run_end
+            continue
+        if text_start < index:
+            yield "text", text[text_start:index]
+        yield "code_span", text[index:closing + len(marker)]
+        index = closing + len(marker)
+        text_start = index
+    if text_start < len(text):
+        yield "text", text[text_start:]
+
+
+def iter_markdown_segments(text: str):
+    """回答本文をtext、code_span、fenced_codeの領域へ分類して返す。
+
+    各領域の値は元の文字列をそのまま保持する。コード領域を除外する
+    変換と、callout用に行頭へ接頭辞だけを追加する変換が同じ分類を
+    利用できるようにする。
+    """
+    text = str(text)
+    cursor = 0
+    for start, end in _fenced_code_ranges(text):
+        if cursor < start:
+            yield from _iter_inline_markdown_segments(text[cursor:start])
+        yield "fenced_code", text[start:end]
+        cursor = end
+    if cursor < len(text):
+        yield from _iter_inline_markdown_segments(text[cursor:])
+
+
+def _normalize_markdown_links_in_line(line: str) -> str:
+    """コードスパンを保ったまま、Markdownリンクを正規化する。"""
+    result = []
+    index = 0
+    while index < len(line):
+        if line[index] != "[":
+            result.append(line[index])
+            index += 1
+            continue
+
+        label_end = index + 1
+        depth = 1
+        escaped = False
+        while label_end < len(line):
+            character = line[label_end]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "[":
+                depth += 1
+            elif character == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            label_end += 1
+        if label_end >= len(line):
+            result.append(line[index])
+            index += 1
+            continue
+
+        open_paren = label_end + 1
+        while open_paren < len(line) and line[open_paren] in " \t":
+            open_paren += 1
+        if open_paren >= len(line) or line[open_paren] != "(":
+            result.append(line[index:label_end + 1])
+            index = label_end + 1
+            continue
+
+        close_paren = _find_link_end(line, open_paren + 1)
+        if close_paren is None:
+            result.append(line[index])
+            index += 1
+            continue
+
+        raw_destination = line[open_paren + 1:close_paren]
+        destination = raw_destination
+        prefix = ""
+        suffix = ""
+        if raw_destination.startswith("<"):
+            destination_end = raw_destination.find(">", 1)
+            if destination_end != -1:
+                destination = raw_destination[1:destination_end]
+                prefix = "<"
+                suffix = ">" + raw_destination[destination_end + 1:]
+        elif "\n" not in raw_destination:
+            # タイトル付きリンクはタイトルを残し、パス部分だけを変換する。
+            title_match = re.match(r"^(\S+)(\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))$", raw_destination)
+            if title_match:
+                destination, suffix = title_match.groups()
+
+        normalized = _normalize_link_destination(destination)
+        if normalized == destination:
+            result.append(line[index:close_paren + 1])
+        else:
+            result.append(
+                line[index:open_paren + 1]
+                + prefix
+                + normalized
+                + suffix
+                + ")"
+            )
+        index = close_paren + 1
+    return "".join(result)
+
+
+def normalize_local_file_links(text: str) -> str:
+    """回答本文のローカル絶対パスリンクをfile URIへ変換する。"""
+    result = []
+    for kind, segment in iter_markdown_segments(text):
+        if kind == "text":
+            result.append(_normalize_markdown_links_in_line(segment))
+        else:
+            result.append(segment)
+    return "".join(result)
 
 
 def escape_markdown_heading(text: str) -> str:
@@ -323,14 +493,36 @@ def unescape_markdown_heading(text: str) -> str:
 
 def callout_lines(text: str) -> str:
     """本文をObsidian callout内の行へ変換する。"""
-    lines = []
-    for raw_line in str(text).split("\n"):
-        line = raw_line.replace("<", "&lt;")
-        stripped = line.lstrip()
-        if stripped.startswith(">"):
-            line = line[: len(line) - len(stripped)] + "&gt;" + stripped[1:]
-        lines.append(f"> {line}" if line else ">")
-    return "\n".join(lines)
+    segments = list(iter_markdown_segments(text))
+    lines = [[]]
+    for kind, segment in segments:
+        for part in segment.split("\n")[:-1]:
+            lines[-1].append((kind, part))
+            lines.append([])
+        if segment:
+            lines[-1].append((kind, segment.split("\n")[-1]))
+
+    output = []
+    for line_parts in lines:
+        transformed = []
+        first_non_space = True
+        for kind, part in line_parts:
+            if kind == "text":
+                value = part.replace("<", "&lt;")
+                if first_non_space:
+                    leading = len(value) - len(value.lstrip())
+                    if value[leading:leading + 1] == ">":
+                        value = value[:leading] + "&gt;" + value[leading + 1:]
+                if value.strip():
+                    first_non_space = False
+                transformed.append(value)
+            else:
+                if first_non_space and part.lstrip():
+                    first_non_space = False
+                transformed.append(part)
+        line = "".join(transformed)
+        output.append(f"> {line}" if line else ">")
+    return "\n".join(output)
 # END GENERATED: markdown-formatting
 
 
@@ -408,7 +600,7 @@ def render_assistant_message_block(
     extra_blank_line: bool = False,
 ) -> str:
     """Assistant発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
-    body = text
+    body = normalize_local_file_links(text)
     if continued:
         return body
     separator = "\n\n\n" if extra_blank_line else "\n\n"
@@ -426,6 +618,112 @@ def _message_text(envelope: Dict[str, Any]) -> str:
         if isinstance(text, str) and text.strip():
             texts.append(text)
     return "\n".join(texts)
+
+
+USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                "output_tokens", "reasoning_output_tokens", "total_tokens")
+
+
+def _message_usage(info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """OpenCodeの非キャッシュ入力・出力を共通の内数形式へ変換する。"""
+    raw = info.get("tokens")
+    if not isinstance(raw, dict):
+        return None
+    cache = raw.get("cache") or {}
+    if not isinstance(cache, dict):
+        return None
+    values = [raw.get("input"), cache.get("read", 0), cache.get("write", 0),
+              raw.get("output"), raw.get("reasoning", 0)]
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        return None
+    fresh, read, write, visible_output, reasoning = values
+    usage = {
+        "input_tokens": fresh + read + write,
+        "cached_input_tokens": read,
+        "cache_write_input_tokens": write,
+        "output_tokens": visible_output + reasoning,
+        "reasoning_output_tokens": reasoning,
+        "total_tokens": fresh + read + write + visible_output + reasoning,
+    }
+    cost = _finite_number(info.get("cost"))
+    if cost is not None and cost > 0:
+        usage["cost_usd"] = cost
+    return usage
+
+
+def extract_usage_records(raw_messages: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """本文のないツール専用assistantも含め、message IDごとに最後のusageを保持する。"""
+    records = {}
+    for envelope in raw_messages:
+        if not isinstance(envelope, dict):
+            continue
+        info = envelope.get("info") or envelope.get("message") or envelope
+        if not isinstance(info, dict) or (info.get("role") or info.get("type")) != "assistant":
+            continue
+        usage = _message_usage(info)
+        message_id = str(info.get("id") or info.get("messageID") or envelope.get("id") or "")
+        if not usage or not message_id:
+            continue
+        model = info.get("modelID") or info.get("model") or "unknown"
+        if isinstance(model, dict):
+            model = model.get("modelID") or model.get("id") or "unknown"
+        records[message_id] = {"type": "assistant", "model": str(model), "usage": usage}
+    return records
+
+
+def summarize_usage(messages: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    total = {field: 0 for field in USAGE_FIELDS}
+    by_model: Dict[str, Dict[str, Any]] = {}
+    count = priced = 0
+    total_cost = 0.0
+    for message in messages:
+        usage = message.get("usage") if message.get("type") == "assistant" else None
+        if not isinstance(usage, dict):
+            continue
+        count += 1
+        model = str(message.get("model") or "unknown")
+        entry = by_model.setdefault(model, {field: 0 for field in USAGE_FIELDS})
+        for field in USAGE_FIELDS:
+            value = int(usage.get(field, 0))
+            total[field] += value
+            entry[field] += value
+        if "cost_usd" in usage:
+            priced += 1
+            value = float(usage["cost_usd"])
+            total_cost += value
+            entry["cost_usd"] = entry.get("cost_usd", 0.0) + value
+    if not count:
+        return None
+    total["by_model"] = by_model
+    if priced:
+        total["total_cost_usd"] = total_cost
+        if priced < count:
+            total["cost_incomplete"] = True
+    else:
+        total["cost_unavailable"] = True
+    return total
+
+
+def usage_frontmatter_fields(usage: Optional[Dict[str, Any]]) -> List[str]:
+    if not usage:
+        return []
+    lines = ["usage:"]
+    lines.extend(f"  {field}: {usage[field]}" for field in USAGE_FIELDS)
+    if "total_cost_usd" in usage:
+        lines.append(f"  total_cost_usd: {usage['total_cost_usd']}")
+        if usage.get("cost_incomplete"):
+            lines.append("  cost_incomplete: true")
+    else:
+        lines.append("  cost_unavailable: true")
+    lines.append("  by_model:")
+    for model, entry in usage["by_model"].items():
+        lines.append(f"    {yaml_quote(model)}:")
+        lines.extend(f"      {field}: {entry[field]}" for field in USAGE_FIELDS)
+        if "cost_usd" in entry:
+            lines.append(f"      cost_usd: {entry['cost_usd']}")
+        else:
+            lines.append("      cost_unavailable: true")
+    return lines
 
 
 def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -478,6 +776,7 @@ def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, A
                 "timestamp": timestamp,
                 "model": model,
                 "provider": provider,
+                **({"usage": usage} if role == "assistant" and (usage := _message_usage(info)) else {}),
             }
         )
     return messages
@@ -533,16 +832,10 @@ def _message_provider(message: Dict[str, Any]) -> str:
 
 def _merge_message(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
     merged = {**existing, **incoming}
+    for key in ("openrouter_balance_usd", "openrouter_balance_retrieved_at", "openrouter_balance_attempted"):
+        merged.pop(key, None)
     old_provider = _message_provider(existing)
     new_provider = _message_provider(incoming)
-    if old_provider and new_provider and old_provider != new_provider:
-        merged.pop("openrouter_balance_usd", None)
-        merged.pop("openrouter_balance_retrieved_at", None)
-        merged.pop("openrouter_balance_attempted", None)
-    elif new_provider and new_provider != OPENROUTER_PROVIDER:
-        merged.pop("openrouter_balance_usd", None)
-        merged.pop("openrouter_balance_retrieved_at", None)
-        merged.pop("openrouter_balance_attempted", None)
     if not new_provider and old_provider:
         merged["provider"] = old_provider
     return merged
@@ -633,7 +926,19 @@ def merge_messages(
         return merged
 
     merged: List[Dict[str, Any]] = []
-    used = set()
+    # state消失後のMarkdownには、連続回答が1件の本文として残る。
+    # 全履歴の個別レコードと一致するまとまりは既存分として扱い、
+    # 全履歴に現れない過去の本文だけは従来どおり保持する。
+    grouped_replies = {
+        (str(group[0].get("model", "")), "\n\n".join(item["text"].strip("\n") for item in group))
+        for group in _display_message_groups(new_messages)
+        if len(group) > 1 and group[0].get("type") == "assistant"
+    }
+    used = {
+        index for index, message in enumerate(old_messages)
+        if not message.get("id") and message.get("type") == "assistant"
+        and (str(message.get("model", "")), str(message.get("text", ""))) in grouped_replies
+    }
     for message in new_messages:
         key = _message_key(message)
         index = next(
@@ -767,14 +1072,6 @@ _OPENROUTER_BALANCE_LINE = re.compile(
 )
 
 
-def _format_usd(value: Any) -> str:
-    number = _finite_number(value)
-    if number is None:
-        return ""
-    rendered = f"{number:.6f}".rstrip("0").rstrip(".")
-    return rendered if rendered not in ("", "-0") else "0"
-
-
 def parse_existing_markdown(path: Path) -> List[Dict[str, Any]]:
     """状態ファイルが失われた場合に、このスクリプトのMarkdownを復元する。"""
     try:
@@ -835,43 +1132,22 @@ def parse_existing_markdown(path: Path) -> List[Dict[str, Any]]:
 
         index = start + 1
         model = ""
-        balance = None
-        balance_retrieved_at = ""
         if index < end and lines[index].startswith("> <small>🤖 "):
             model = lines[index][len("> <small>🤖 ") : -len("</small>")]
             index += 1
         if index < end:
             balance_match = _OPENROUTER_BALANCE_LINE.fullmatch(lines[index])
             if balance_match:
-                balance = float(balance_match.group(1))
-                balance_retrieved_at = balance_match.group(2)
                 index += 1
+        if index < end and lines[index].startswith("> <small>Usage: "):
+            index += 1
         if index < end and lines[index] == "":
             index += 1
         body = "\n".join(lines[index:end]).strip("\n")
         if body.strip():
             message = {"id": "", "type": role, "text": body, "timestamp": "", "model": model}
-            if balance is not None:
-                message.update(
-                    {
-                        "provider": OPENROUTER_PROVIDER,
-                        "openrouter_balance_usd": balance,
-                        "openrouter_balance_retrieved_at": balance_retrieved_at,
-                        "openrouter_balance_attempted": True,
-                    }
-                )
             messages.append(message)
     return messages
-
-
-def _latest_openrouter_balance(messages: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    latest = None
-    for message in messages:
-        balance = _format_usd(message.get("openrouter_balance_usd"))
-        retrieved_at = str(message.get("openrouter_balance_retrieved_at", ""))
-        if balance and retrieved_at and (latest is None or retrieved_at >= latest["retrieved_at"]):
-            latest = {"balance": balance, "retrieved_at": retrieved_at}
-    return latest
 
 
 def build_frontmatter(
@@ -880,12 +1156,12 @@ def build_frontmatter(
     created: datetime,
     modified: datetime,
     count: int,
-    openrouter_balance: Optional[Dict[str, Any]] = None,
+    usage: Optional[Dict[str, Any]] = None,
     title: Optional[str] = None,
 ) -> str:
     lines = [
         "---",
-        "source: opencode",
+        f"source: {SOURCE_NAME}",
         *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
         f"session_id: {yaml_quote(session_id)}",
         f"project: {yaml_quote(cwd)}",
@@ -893,18 +1169,27 @@ def build_frontmatter(
         f"modified: {yaml_quote(format_iso(modified))}",
         "tags:",
         "  - ai-conversation",
-        "  - opencode",
+        f"  - {SOURCE_NAME}",
         f"message_count: {count}",
     ]
-    if openrouter_balance:
-        lines.extend(
-            [
-                f"openrouter_balance_usd: {openrouter_balance['balance']}",
-                f"openrouter_balance_retrieved_at: {yaml_quote(openrouter_balance['retrieved_at'])}",
-            ]
-        )
+    lines.extend(usage_frontmatter_fields(usage))
     lines.append("---")
     return "\n".join(lines) + "\n\n"
+
+
+def _display_message_groups(messages: Iterable[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    groups: List[List[Dict[str, Any]]] = []
+    for message in messages:
+        if (
+            message["type"] == "assistant"
+            and groups
+            and groups[-1][0]["type"] == "assistant"
+            and groups[-1][0].get("model", "") == message.get("model", "")
+        ):
+            groups[-1].append(message)
+        else:
+            groups.append([message])
+    return groups
 
 
 def render_markdown(
@@ -914,32 +1199,36 @@ def render_markdown(
     messages: List[Dict[str, str]],
     *,
     modified: Optional[datetime] = None,
+    usage_records: Optional[Iterable[Dict[str, Any]]] = None,
 ) -> str:
     modified = modified or datetime.now(JST)
     first_user = next((message["text"] for message in messages if message["type"] == "user"), None)
     title = heading_title(first_user) if first_user is not None else None
+    display_messages = _display_message_groups(messages)
     blocks = [
         build_frontmatter(
             session_id,
             cwd,
             created,
             modified,
-            len(messages),
-            _latest_openrouter_balance(messages),
+            len(display_messages),
+            summarize_usage(messages if usage_records is None else usage_records),
             title,
         )
     ]
-    for message in messages:
+    for group in display_messages:
+        message = group[0]
         if message["type"] == "user":
             blocks.append(render_user_message_block(message["text"], message.get("timestamp")))
         else:
             model = message.get("model", "")
             metadata = [f"🤖 {model}"] if model else []
-            balance = _format_usd(message.get("openrouter_balance_usd"))
-            retrieved_at = str(message.get("openrouter_balance_retrieved_at", ""))
-            if balance and retrieved_at:
-                metadata.append(f"💳 OpenRouter balance: ${balance} USD (retrieved: {retrieved_at})")
-            blocks.append(render_assistant_message_block(message["text"], "OpenCode", metadata))
+            usage = summarize_usage(group)
+            if usage:
+                cost = f" · ${usage['total_cost_usd']}" if "total_cost_usd" in usage and not usage.get("cost_incomplete") else ""
+                metadata.append(f"Usage: {usage['total_tokens']:,} tok{cost}")
+            body = "\n\n".join(item["text"].strip("\n") for item in group)
+            blocks.append(render_assistant_message_block(body, "OpenCode", metadata))
     return "".join(blocks)
 
 
@@ -950,6 +1239,7 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
         return None
     cwd = str(payload.get("cwd", "") or os.getcwd())
     messages = extract_messages(payload.get("messages") or [])
+    incoming_usage_records = extract_usage_records(payload.get("messages") or [])
     state = load_state(session_id)
     if not state:
         cleanup_old_states()
@@ -962,6 +1252,8 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
     if not stored_messages and output_path is not None:
         stored_messages = parse_existing_markdown(output_path)
     messages = merge_messages(stored_messages, messages, full_sync=bool(payload.get("full_sync")))
+    usage_records = {} if payload.get("full_sync") else dict(state.get("usage_records") or {})
+    usage_records.update(incoming_usage_records)
     if not messages:
         logger.debug("本文がないため保存をスキップ %s", session_id[:8])
         return output_path
@@ -973,44 +1265,19 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
             "timestamp": item.get("timestamp", ""),
             "model": item.get("model", ""),
             "provider": _message_provider(item),
+            "usage": item.get("usage"),
         }
         for item in messages
     ]
     payload_hash = hashlib.sha256(
-        json.dumps({"cwd": cwd, "messages": hash_messages}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        json.dumps({"render_version": 2, "cwd": cwd, "messages": hash_messages, "usage_records": usage_records},
+                   ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     if state.get("payload_hash") == payload_hash and output_path is not None and output_path.exists():
         logger.debug("同じ payload のため保存をスキップ %s", session_id[:8])
         save_state(session_id, state)
         return output_path
 
-    incoming_messages = extract_messages(payload.get("messages") or [])
-    latest_assistant = next(
-        (message for message in reversed(incoming_messages) if message.get("type") == "assistant"),
-        None,
-    )
-    existing_latest = False
-    if latest_assistant is not None:
-        latest_index = incoming_messages.index(latest_assistant)
-        has_incoming_pair = latest_index > 0 and incoming_messages[latest_index - 1].get("type") == "user"
-        if has_incoming_pair:
-            incoming_user = incoming_messages[latest_index - 1]
-            existing_latest = any(
-                _message_records_match(stored_messages[index], incoming_user)
-                and index + 1 < len(stored_messages)
-                and _message_records_match(stored_messages[index + 1], latest_assistant)
-                for index in range(len(stored_messages) - 1)
-            )
-        if not has_incoming_pair and not existing_latest:
-            existing_latest = _find_matching_message(stored_messages, latest_assistant) is not None
-
-        if _message_provider(latest_assistant) == OPENROUTER_PROVIDER and not existing_latest:
-            target_index = _find_matching_message(messages, latest_assistant)
-            if target_index is not None and not messages[target_index].get("openrouter_balance_attempted"):
-                balance = fetch_openrouter_balance()
-                messages[target_index]["openrouter_balance_attempted"] = True
-                if balance is not None:
-                    messages[target_index].update(balance)
     if output_path is None:
         created = parse_datetime(payload.get("created"))
         project = safe_filename_component(Path(cwd).name) if cwd else ""
@@ -1028,13 +1295,16 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
         except OSError:
             pass
         created = parse_datetime(state.get("created"), fallback_created)
-    atomic_write(output_path, render_markdown(session_id, cwd, created, messages))
+    atomic_write(output_path, render_markdown(
+        session_id, cwd, created, messages, usage_records=usage_records.values()
+    ))
     state.update({
         "output_path": str(output_path),
         "created": format_iso(created),
         "cwd": cwd,
         "message_count": len(messages),
         "messages": messages,
+        "usage_records": usage_records,
         "payload_hash": payload_hash,
     })
     save_state(session_id, state)

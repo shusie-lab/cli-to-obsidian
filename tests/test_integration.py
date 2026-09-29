@@ -135,7 +135,119 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("message_count: 2", content)
         self.assertIn("<!-- last_line: 3 -->", content)
 
-    def test_codex_uses_transcript_source_and_effort(self):
+    def test_codex_late_usage_updates_existing_answer_callout(self):
+        session_id = "test_codex_late_usage"
+        jsonl_path = self.test_dir / "transcript_codex_late_usage.jsonl"
+        rows = [
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "turn_id": "turn-1", "message": "Question"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "turn_id": "turn-1", "message": "Answer"}},
+        ]
+        jsonl_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        hook_input = {
+            "session_id": session_id,
+            "transcript_path": str(jsonl_path),
+            "cwd": str(self.test_dir),
+        }
+
+        codex_save.handle_stop_event(hook_input)
+        output_path = Path(codex_save.load_state(session_id)["output_path"])
+        before = output_path.read_text(encoding="utf-8")
+        self.assertNotIn("Usage:", before)
+
+        with open(jsonl_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "type": "token_usage_record",
+                "payload": {
+                    "turn_id": "turn-1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 10,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": 120,
+                    },
+                },
+            }) + "\n")
+
+        codex_save.handle_stop_event(hook_input)
+        after = output_path.read_text(encoding="utf-8")
+        self.assertIn("Usage: 120 tok · $0.0000422", after)
+        self.assertEqual(after.count("Usage: 120 tok · $0.0000422"), 1)
+        self.assertIn("total_tokens: 120", after)
+
+    def test_codex_subagent_usage_updates_session_without_double_counting(self):
+        session_id = "parent-session"
+        parent = self.test_dir / "rollout-parent.jsonl"
+        child = self.test_dir / "rollout-child.jsonl"
+        grandchild = self.test_dir / "rollout-grandchild.jsonl"
+        unrelated = self.test_dir / "rollout-unrelated.jsonl"
+        guardian = self.test_dir / "rollout-guardian.jsonl"
+
+        def write_rows(path, rows):
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        def usage(tokens, model_session=session_id):
+            return {"type": "token_usage_record", "payload": {
+                "session_id": model_session,
+                "usage": {"input_tokens": tokens, "cached_input_tokens": 0,
+                          "cache_write_input_tokens": 0, "output_tokens": 0,
+                          "reasoning_output_tokens": 0, "total_tokens": tokens},
+                "thread_token_usage": {"total_tokens": 999999},
+            }}
+
+        write_rows(parent, [
+            {"type": "session_meta", "payload": {"id": session_id}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-sol"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Question"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "Answer"}},
+            usage(100),
+        ])
+        write_rows(child, [
+            {"type": "session_meta", "payload": {"id": "child", "parent_thread_id": session_id,
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": session_id}}}}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-luna", "effort": "xhigh"}},
+            usage(120), usage(999, "another-session"),
+        ])
+        write_rows(grandchild, [
+            {"type": "session_meta", "payload": {"id": "grandchild", "parent_thread_id": "child",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "child"}}}}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-luna"}},
+            usage(30),
+        ])
+        write_rows(unrelated, [
+            {"type": "session_meta", "payload": {"id": "unrelated", "parent_thread_id": "other",
+                "source": {"subagent": {}}}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-luna"}},
+            usage(800),
+        ])
+        write_rows(guardian, [
+            {"type": "session_meta", "payload": {"id": "guardian", "parent_thread_id": session_id,
+                "source": {"subagent": {"other": "guardian"}}}},
+            {"type": "turn_context", "payload": {"model": "codex-auto-review"}},
+            usage(700),
+        ])
+
+        hook_input = {"session_id": session_id, "transcript_path": str(parent), "cwd": str(self.test_dir)}
+        codex_save.handle_stop_event(hook_input)
+        output = Path(codex_save.load_state(session_id)["output_path"])
+        first = output.read_text(encoding="utf-8")
+        self.assertIn("total_tokens: 250", first)
+        self.assertIn('"gpt-6-luna":', first)
+        self.assertIn("Usage: 100 tok", first)
+        self.assertNotIn("total_tokens: 999999", first)
+
+        with child.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(usage(50)) + "\n")
+        codex_save.handle_stop_event(hook_input)
+        second = output.read_text(encoding="utf-8")
+        self.assertIn("total_tokens: 300", second)
+        self.assertEqual(second.count("Usage: 100 tok"), 1)
+        codex_save.handle_stop_event(hook_input)
+        self.assertEqual(output.read_text(encoding="utf-8"), second)
+
+    def test_codex_app_transcript_uses_common_source_and_effort(self):
         session_id = "test_codex_app_metadata"
         jsonl_path = self.test_dir / "transcript_codex_app.jsonl"
         events = [
@@ -179,8 +291,8 @@ class TestIntegration(unittest.TestCase):
 
         output_path = Path(codex_save.load_state(session_id)["output_path"])
         content = output_path.read_text(encoding="utf-8")
-        self.assertIn("source: codex-app", content)
-        self.assertIn("  - codex-app", content)
+        self.assertIn("source: codex-cli", content)
+        self.assertIn("  - codex-cli", content)
         self.assertIn("🤖 gpt-5.6-sol-medium", content)
 
     def test_codex_projectless_app_uses_stable_project_name(self):
@@ -228,7 +340,7 @@ class TestIntegration(unittest.TestCase):
         content = output_path.read_text(encoding="utf-8")
         self.assertIn('project: "projectless"', content)
 
-    def test_codex_cli_source_is_preserved(self):
+    def test_codex_cli_transcript_uses_common_source(self):
         session_id = "test_codex_cli_metadata"
         jsonl_path = self.test_dir / "transcript_codex_cli.jsonl"
         events = [
@@ -311,7 +423,7 @@ class TestIntegration(unittest.TestCase):
 
         state = codex_save.load_state(session_id)
         self.assertEqual(state["initial_quota"]["codex"]["weekly"]["remaining"], 80.0)
-        self.assertEqual(state["last_quota"]["codex"]["weekly"]["remaining"], 80.0)
+        self.assertEqual(state["final_quota"]["codex"]["weekly"]["remaining"], 80.0)
 
         second_turn = [
             {
@@ -335,7 +447,10 @@ class TestIntegration(unittest.TestCase):
         content = Path(final_state["output_path"]).read_text(encoding="utf-8")
         self.assertEqual(final_state["final_quota"]["codex"]["weekly"]["remaining"], 75.0)
         self.assertIn("- **Codex**: W: 80.0% ➔ 75.0%", content)
-        self.assertIn("Quota: W 75.0(-5.00)%", content)
+        self.assertIn("quota:\n  \"codex\":\n    \"weekly\":", content)
+        self.assertIn("first_observed:\n        remaining_percent: 80.0", content)
+        self.assertIn("last_observed:\n        remaining_percent: 75.0", content)
+        self.assertNotIn("(Quota:", content)
 
     def test_codex_recovers_stale_and_missing_state_without_duplicates(self):
         session_id = "test_codex_recovery"
@@ -459,6 +574,31 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(Path(agy_save.load_state(session_id)["output_path"]), output_path)
         self.assertEqual(output_path.read_text(encoding="utf-8").count("AGY recovery answer"), 1)
         self.assertEqual(len(list(agy_save.OUTPUT_BASE.glob("*.md"))), 1)
+
+    def test_agy_app_transcript_uses_common_source(self):
+        transcript = self.test_dir / ".gemini" / "antigravity" / "app.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            json.dumps({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "created_at": "2026-08-07T10:00:00Z",
+                "content": "<USER_REQUEST>App question</USER_REQUEST>",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        session_id = "test_agy_app_source"
+        with mock.patch.object(agy_save, "retrieve_quota", return_value=None):
+            agy_save.handle_stop_event({
+                "conversationId": session_id,
+                "transcriptPath": str(transcript),
+                "workspacePaths": [str(self.test_dir)],
+            })
+        output_path = Path(agy_save.load_state(session_id)["output_path"])
+        content = output_path.read_text(encoding="utf-8")
+        self.assertIn("source: antigravity-cli\n", content)
+        self.assertIn("  - antigravity-cli\n", content)
+        self.assertNotIn("antigravity-app", content)
 
 if __name__ == "__main__":
     unittest.main()

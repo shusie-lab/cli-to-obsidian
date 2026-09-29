@@ -27,7 +27,7 @@ def render_assistant_message_block(
     extra_blank_line: bool = False,
 ) -> str:
     """Assistant発言を、ファイルI/Oを行わずMarkdownブロックへ変換する。"""
-    body = text
+    body = normalize_local_file_links(text)
     if continued:
         return body
     separator = "\n\n\n" if extra_blank_line else "\n\n"
