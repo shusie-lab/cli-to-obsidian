@@ -664,6 +664,56 @@ Response text
         self.assertIn("part 1\npart 2", content)
         self.assertIn("Usage: 35 tok · $0.000012", content)
 
+    def test_codex_late_usage_preserves_one_callout_and_repairs_split_headers(self):
+        now = datetime.now(JST)
+        path = codex_save.create_md_file("late-split", "myproj", now)
+
+        def summary(tokens, cost):
+            return {"total_tokens": tokens, "total_cost_usd": codex_save.Decimal(cost), "by_model": {}}
+
+        user = {"line_number": 1, "type": "user_message", "message": "Question"}
+        first = {"line_number": 2, "type": "agent_message", "message": "part 1",
+                 "model": "gpt-6-sol", "usage": summary(10, "0.00002")}
+        second = {"line_number": 3, "type": "agent_message", "message": "part 2",
+                  "model": "gpt-6-sol", "usage": summary(20, "0.00004")}
+        codex_save.append_messages(path, [user, first], now, "gpt-6-sol", 2)
+        codex_save.append_messages(path, [second], now, "gpt-6-sol", 3)
+        content = path.read_text(encoding="utf-8")
+        self.assertEqual(content.count("> [!NOTE] Codex"), 1)
+
+        legacy_split = content.replace(
+            "part 2\n\n",
+            "> [!NOTE] Codex\n> <small>🤖 gpt-6-sol</small>\n"
+            "> <small>Usage: 20 tok · $0.00004</small>\n\npart 2\n\n",
+        )
+        self.assertEqual(legacy_split.count("> [!NOTE] Codex"), 2)
+        second["usage"] = summary(35, "0.000055")
+        second["subagent_usage"] = {
+            **summary(15, "0.000015"),
+            "by_model": {"gpt-6-luna": {
+                "total_tokens": 15, "cost_usd": codex_save.Decimal("0.000015"),
+            }},
+        }
+        refreshed = codex_save.refresh_answer_usage_metadata(legacy_split, [user, first, second])
+        self.assertEqual(refreshed.count("Usage:"), 1)
+        self.assertIn(
+            "Usage: 45 tok · $0.000075 (gpt-6-luna 15 tok・$0.000015)", refreshed,
+        )
+        self.assertLess(refreshed.index("part 1"), refreshed.index("Usage: 45 tok"))
+        self.assertLess(refreshed.index("Usage: 45 tok"), refreshed.index("part 2"))
+
+        mixed = codex_save.format_message_usage(
+            {"total_tokens": 50, "total_cost_usd": codex_save.Decimal("0.000015")},
+            {"by_model": {
+                "gpt-6-luna": {"total_tokens": 30, "cost_usd": codex_save.Decimal("0.000015")},
+                "unknown-model": {"total_tokens": 20, "cost_unavailable": True},
+            }},
+        )
+        self.assertEqual(
+            mixed,
+            "Usage: 50 tok · $0.000015 (gpt-6-luna 30 tok・$0.000015、unknown-model 20 tok・換算不可)",
+        )
+
     def test_codex_tool_use_inserts_one_blank_line_before_next_answer(self):
         transcript = self.test_dir / "codex_tool_use.jsonl"
         rows = [
@@ -870,6 +920,12 @@ Response text
         unknown["cost_incomplete"] = True
         self.assertIn("codex-auto-review 換算不可", codex_save.build_usage_section(unknown))
         self.assertIn("cost_incomplete: true", "\n".join(codex_save.build_usage_frontmatter_fields(unknown)))
+        merged = codex_save._merge_usage_summaries(
+            usage, {"total_tokens": 10, "by_model": {"codex-auto-review": {
+                "total_tokens": 10, "cost_unavailable": True,
+            }}, "cost_unavailable": True},
+        )
+        self.assertTrue(merged["cost_incomplete"])
 
     def test_claude_usage_deduplicates_message_id_and_marks_unpriced_models(self):
         transcript = self.test_dir / "claude-usage.jsonl"

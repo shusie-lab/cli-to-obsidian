@@ -35,7 +35,7 @@ Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_lim
 
 CodexのUsageは、親セッションと`parent_thread_id`で紐付くサブエージェントのtranscriptにある`token_usage_record.payload.usage`を各レコード一度ずつ加算して集計します。子のusageは同じ`session_id`を持つレコードだけを対象にします。`thread_token_usage`の累計値は二重計上を避けるため使用しません。frontmatterの`usage`にはtoken総計・モデル別内訳・`total_cost_usd`・モデル別`cost_usd`を保存します。USD概算は、`codex_save.py`冒頭のモデル別標準API単価を用い、通常入力（`input_tokens`からキャッシュ入力・cache writeを除いた値）、キャッシュ入力、cache write、出力を別々に計算します。推論トークンは出力の内数のため二重計上しません。272K input tokensを超えるリクエストは、標準API価格どおり入力・キャッシュ系を2倍、出力を1.5倍にします。これはCodexの契約上の請求額やquota消費額ではなく、ツール料金・割引モードなどを含まない標準API単価による概算です。係数が未登録のモデルはtokenだけを保存し、金額を換算しません。既知モデルが一部でもある場合はその分の`total_cost_usd`を保存し、`cost_incomplete: true`で総計が部分換算であることを示します。USD表示・frontmatterの金額は小数桁を丸めません。
 
-本文中のCodex回答calloutには、親transcriptの回答に対応付けたUsage（`total_tokens`とUSD概算）を表示します。本文冒頭のUsageセクションとfrontmatterの`usage`はサブエージェントも含むセッション累計です。サブエージェントを使った会話では、回答calloutのUsage合計よりセッション累計が大きくなります。272K input tokensを超えるusage recordが回答に含まれる場合は、回答のUSD表示に`⚠︎ 272K+`を付けます。
+本文中のCodex回答calloutには、親transcriptの回答と、同じ親ターンに紐付くサブエージェントのUsage（`total_tokens`とUSD概算）を表示します。子の`root_turn_id`で親ターンを特定し、そのターンの最後に表示される回答calloutへ加えます。サブエージェント分がある回答では、合計のtoken数とUSD概算に加え、括弧内にサブエージェントのモデル別token数・USD概算を表示します。換算できないモデルは`換算不可`と表示します。親ターンを特定できない子のusageや、表示できる親回答がないターンのusageはセッション累計だけに含めます。本文冒頭のUsageセクションとfrontmatterの`usage`はセッション累計です。272K input tokensを超えるusage recordが回答に含まれる場合は、回答のUSD表示に`⚠︎ 272K+`を付けます。
 
 Claude CodeのUsageはtranscriptの`message.usage`をmessage IDごとに最後の値だけ集計します。通常入力、キャッシュ読み込み、キャッシュ書き込み、出力を合わせてtoken総数を出します。対応モデルではAnthropicの標準API単価からUSD概算を計算します。価格に影響する条件を確定できない場合や未登録モデルはtokenのみを保存します。これはClaude Codeのサブスクリプション請求額ではありません。quotaは任意のstatusLine設定から5h・weeklyの残量を観測し、Codexと同じ`first_observed`・`last_observed`形式で保存します。statusLineがquotaを返さない場合は省略します。
 
@@ -52,10 +52,10 @@ OpenCodeの連続する同一モデルの回答は、途中経過と最終回答
 
 ## インストール元の取得
 
-リリース版の利用を推奨します。次の例では`v3.1.0`を取得します。
+リリース版の利用を推奨します。次の例では`v3.2.0`を取得します。
 
 ```bash
-git clone --branch v3.1.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
+git clone --branch v3.2.0 --depth 1 https://github.com/shusie1969/cli-to-obsidian.git
 cd cli-to-obsidian
 ```
 

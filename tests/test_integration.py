@@ -188,9 +188,10 @@ class TestIntegration(unittest.TestCase):
         def write_rows(path, rows):
             path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
-        def usage(tokens, model_session=session_id):
+        def usage(tokens, model_session=session_id, root_turn_id="turn-1"):
             return {"type": "token_usage_record", "payload": {
                 "session_id": model_session,
+                "root_turn_id": root_turn_id,
                 "usage": {"input_tokens": tokens, "cached_input_tokens": 0,
                           "cache_write_input_tokens": 0, "output_tokens": 0,
                           "reasoning_output_tokens": 0, "total_tokens": tokens},
@@ -199,7 +200,7 @@ class TestIntegration(unittest.TestCase):
 
         write_rows(parent, [
             {"type": "session_meta", "payload": {"id": session_id}},
-            {"type": "turn_context", "payload": {"model": "gpt-6-sol"}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-6-sol"}},
             {"type": "event_msg", "payload": {"type": "user_message", "message": "Question"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "message": "Answer"}},
             usage(100),
@@ -235,7 +236,9 @@ class TestIntegration(unittest.TestCase):
         first = output.read_text(encoding="utf-8")
         self.assertIn("total_tokens: 250", first)
         self.assertIn('"gpt-6-luna":', first)
-        self.assertIn("Usage: 100 tok", first)
+        self.assertIn(
+            "Usage: 250 tok · $0.000215 (gpt-6-luna 150 tok・$0.000015)", first,
+        )
         self.assertNotIn("total_tokens: 999999", first)
 
         with child.open("a", encoding="utf-8") as stream:
@@ -243,9 +246,66 @@ class TestIntegration(unittest.TestCase):
         codex_save.handle_stop_event(hook_input)
         second = output.read_text(encoding="utf-8")
         self.assertIn("total_tokens: 300", second)
-        self.assertEqual(second.count("Usage: 100 tok"), 1)
+        self.assertEqual(
+            second.count("Usage: 300 tok · $0.000220 (gpt-6-luna 200 tok・$0.000020)"), 1,
+        )
         codex_save.handle_stop_event(hook_input)
         self.assertEqual(output.read_text(encoding="utf-8"), second)
+
+        codex_save.state_path(session_id).unlink()
+        codex_save.handle_stop_event(hook_input)
+        recovered = output.read_text(encoding="utf-8")
+        self.assertEqual(recovered.count("gpt-6-luna 200 tok・$0.000020"), 1)
+        self.assertEqual(recovered.count("Answer"), 1)
+
+    def test_codex_subagent_usage_follows_parent_root_turn(self):
+        session_id = "two-turn-parent"
+        parent = self.test_dir / "rollout-two-turn-parent.jsonl"
+        child = self.test_dir / "rollout-two-turn-child.jsonl"
+
+        def token_record(tokens, root_turn_id):
+            return {"type": "token_usage_record", "payload": {
+                "session_id": session_id, "root_turn_id": root_turn_id,
+                "usage": {"input_tokens": tokens, "cached_input_tokens": 0,
+                          "cache_write_input_tokens": 0, "output_tokens": 0,
+                          "reasoning_output_tokens": 0, "total_tokens": tokens},
+            }}
+
+        parent_rows = [
+            {"type": "session_meta", "payload": {"id": session_id}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-6-sol"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Q1"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "A1 interim"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "A1 final",
+                                          "model": "gpt-5.6-sol"}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-2", "model": "gpt-6-sol"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Q2"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "A2"}},
+        ]
+        child_rows = [
+            {"type": "session_meta", "payload": {"id": "two-turn-child",
+                "parent_thread_id": session_id,
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": session_id}}}}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-luna"}},
+            token_record(30, "turn-1"), token_record(40, "turn-2"),
+            token_record(5, ""),
+        ]
+        parent.write_text("".join(json.dumps(row) + "\n" for row in parent_rows), encoding="utf-8")
+        child.write_text("".join(json.dumps(row) + "\n" for row in child_rows), encoding="utf-8")
+        codex_save.handle_stop_event(
+            {"session_id": session_id, "transcript_path": str(parent), "cwd": str(self.test_dir)}
+        )
+        output = Path(codex_save.load_state(session_id)["output_path"])
+        content = output.read_text(encoding="utf-8")
+        self.assertIn("total_tokens: 75", content)
+        self.assertEqual(content.count("gpt-6-luna 30 tok・$0.000003"), 1)
+        self.assertEqual(content.count("gpt-6-luna 40 tok・$0.000004"), 1)
+        self.assertNotIn("gpt-6-luna 5 tok", content)
+        self.assertLess(content.index("A1 interim"), content.index("gpt-6-luna 30 tok"))
+        self.assertLess(content.index("gpt-6-luna 30 tok"), content.index("A1 final"))
+        self.assertIn("A1 interim", content)
+        self.assertIn("A1 final", content)
+        self.assertIn("A2", content)
 
     def test_codex_app_transcript_uses_common_source_and_effort(self):
         session_id = "test_codex_app_metadata"

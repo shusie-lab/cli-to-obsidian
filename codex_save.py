@@ -8,9 +8,10 @@ Codex CLI の会話履歴を Obsidian に自動保存するフックスクリプ
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 from decimal import Decimal
+from bisect import bisect_right
 import json
 import re
 import sys
@@ -1085,7 +1086,9 @@ def _usage_cost(model: str, usage: dict[str, int]) -> Decimal | None:
     ) / Decimal(1_000_000)
 
 
-def retrieve_usage(jsonl_path: Path, session_id: str = "") -> dict | None:
+def retrieve_usage(
+    jsonl_path: Path, session_id: str = "", subagent_records: list[dict] | None = None,
+) -> dict | None:
     """親と子のtranscriptの token_usage_record をモデル別に集計する。
 
     ``thread_token_usage`` は再開前の使用量も含む累計値になり得るため使わず、各
@@ -1094,8 +1097,10 @@ def retrieve_usage(jsonl_path: Path, session_id: str = "") -> dict | None:
     """
     records = _read_usage_records(jsonl_path)
     if session_id:
-        for child_path in _find_subagent_transcripts(jsonl_path, session_id):
-            records.extend(_read_usage_records(child_path, session_id=session_id))
+        records.extend(
+            subagent_records if subagent_records is not None
+            else _read_subagent_usage_records(jsonl_path, session_id)
+        )
     return _summarize_usage_records(records)
 
 
@@ -1151,6 +1156,14 @@ def _find_subagent_transcripts(jsonl_path: Path, session_id: str) -> list[Path]:
     return paths
 
 
+def _read_subagent_usage_records(jsonl_path: Path, session_id: str) -> list[dict]:
+    """子transcriptから、この親セッションに属するusage recordを集める。"""
+    records = []
+    for child_path in _find_subagent_transcripts(jsonl_path, session_id):
+        records.extend(_read_usage_records(child_path, session_id=session_id))
+    return records
+
+
 def _read_usage_records(jsonl_path: Path, session_id: str = "") -> list[dict]:
     """有効なusage recordを読み、行番号・turn・モデルとともに返す。"""
     records = []
@@ -1196,6 +1209,7 @@ def _read_usage_records(jsonl_path: Path, session_id: str = "") -> list[dict]:
                 records.append({
                     "line_number": line_number,
                     "turn_id": turn_id,
+                    "root_turn_id": str(payload.get("root_turn_id") or ""),
                     "model": model,
                     "usage": record_totals,
                 })
@@ -1350,7 +1364,9 @@ def is_tool_use_event(data: dict) -> bool:
     return isinstance(item, dict) and item.get("type") in TOOL_USE_ITEM_TYPES
 
 
-def load_jsonl_messages(jsonl_path: Path, start_line: int) -> tuple[list[dict], int]:
+def load_jsonl_messages(
+    jsonl_path: Path, start_line: int, subagent_records: list[dict] | None = None,
+) -> tuple[list[dict], int]:
     """
     JSONLファイルを読み込み、start_line (1-indexed) より後ろの行を処理する。
     event_msg 内の user_message / agent_message を抽出して返す。
@@ -1493,9 +1509,29 @@ def load_jsonl_messages(jsonl_path: Path, start_line: int) -> tuple[list[dict], 
             continue
         assigned.setdefault(target, []).append(record)
 
-    for index, record_list in assigned.items():
-        messages[index]["usage"] = _summarize_usage_records(record_list)
-        messages[index]["usage_records"] = record_list
+    # 子の行番号は親transcriptと比較できない。root_turn_idで親ターンを特定し、
+    # そのターンの最後の表示可能な回答へ寄せる。
+    child_assigned: dict[int, list[dict]] = {}
+    for record in subagent_records or []:
+        root_turn_id = record.get("root_turn_id")
+        if not root_turn_id:
+            continue
+        candidates = [
+            index for index in agent_indices_by_turn.get(root_turn_id, [])
+            if str(messages[index].get("message", "")).strip()
+        ]
+        if candidates:
+            child_assigned.setdefault(candidates[-1], []).append(record)
+
+    for index in set(assigned) | set(child_assigned):
+        parent_records = assigned.get(index, [])
+        child_records = child_assigned.get(index, [])
+        parent_usage = _summarize_usage_records(parent_records)
+        child_usage = _summarize_usage_records(child_records)
+        messages[index]["usage"] = _merge_usage_summaries(parent_usage, child_usage)
+        if child_usage is not None:
+            messages[index]["subagent_usage"] = child_usage
+        messages[index]["usage_records"] = parent_records + child_records
 
     filtered = [message for message in messages if message["line_number"] > start_line]
     return filtered, incomplete_last_line if incomplete_last_line is not None else current_line
@@ -1601,7 +1637,7 @@ def build_usage_section(usage: dict | None) -> str:
     return f"💰 **Usage (USD換算)**: Total: {total_label}{model_summary}\n"
 
 
-def format_message_usage(usage: dict | None) -> str:
+def format_message_usage(usage: dict | None, subagent_usage: dict | None = None) -> str:
     """回答calloutへ短く表示する回答単位Usageを返す。"""
     if not usage:
         return ""
@@ -1609,7 +1645,26 @@ def format_message_usage(usage: dict | None) -> str:
     total_cost = _format_usd(usage.get("total_cost_usd"))
     cost_label = total_cost or "換算不可"
     warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
-    return f"Usage: {total_tokens:,} tok · {cost_label}{warning}"
+    label = f"Usage: {total_tokens:,} tok · {cost_label}{warning}"
+    if subagent_usage:
+        model_parts = []
+        for model, model_usage in sorted(subagent_usage.get("by_model", {}).items()):
+            model_tokens = int(model_usage.get("total_tokens", 0))
+            model_cost = _format_usd(model_usage.get("cost_usd")) or "換算不可"
+            model_parts.append(f"{model} {model_tokens:,} tok・{model_cost}")
+        if model_parts:
+            label += f" ({'、'.join(model_parts)})"
+    return label
+
+
+def _assistant_header_model(header: str | None) -> str | None:
+    """Usage値に依存しない、連続するCodex回答のモデル行を返す。"""
+    if not header:
+        return None
+    lines = header.splitlines()
+    if not lines or lines[0] != f"> [!NOTE] {AGENT_NAME}":
+        return None
+    return next((line for line in lines[1:] if line.startswith("> <small>🤖 ")), "")
 
 
 def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | None:
@@ -1637,6 +1692,8 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
             (Decimal(str(source.get("total_cost_usd", 0))) for source in (first, second)),
             Decimal(0),
         )
+        if first.get("cost_unavailable") or second.get("cost_unavailable"):
+            merged["cost_incomplete"] = True
     elif first.get("cost_unavailable") or second.get("cost_unavailable"):
         merged["cost_unavailable"] = True
     if first.get("cost_incomplete") or second.get("cost_incomplete"):
@@ -1646,21 +1703,28 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
     return merged
 
 
-def _answer_usage_groups(messages: list[dict]) -> list[dict | None]:
-    """transcriptのAgentMessage列を、既存calloutと同じ回答単位へまとめる。"""
-    groups: list[dict | None] = []
+def _answer_usage_groups(messages: list[dict]) -> list[tuple[int, dict | None, dict | None]]:
+    """User発話ごとにAgentMessageを回答単位へまとめる。"""
+    groups: list[tuple[int, dict | None, dict | None]] = []
+    turn_index = 0
     last_model = None
     for message in messages:
         if message.get("type") == "user_message":
+            turn_index += 1
             last_model = None
             continue
         if message.get("type") != "agent_message" or not str(message.get("message", "")).strip():
             continue
         model = format_model_name(message.get("model", ""), message.get("effort", ""))
         if groups and model == last_model:
-            groups[-1] = _merge_usage_summaries(groups[-1], message.get("usage"))
+            _, usage, subagent_usage = groups[-1]
+            groups[-1] = (
+                turn_index,
+                _merge_usage_summaries(usage, message.get("usage")),
+                _merge_usage_summaries(subagent_usage, message.get("subagent_usage")),
+            )
         else:
-            groups.append(message.get("usage"))
+            groups.append((turn_index, message.get("usage"), message.get("subagent_usage")))
             last_model = model
     return groups
 
@@ -1702,26 +1766,68 @@ def refresh_answer_usage_metadata(content: str, messages: list[dict]) -> str:
     """遅れて書かれたusage recordを既存assistant calloutへ反映する。
 
     本文・ユーザーcallout・既存のquota行は変更せず、Codex metadata内のUsage行だけを
-    回答順に差し替える。従って、usage-onlyのStop hookでもsession累計との不変条件を
-    保てる。
+    親ターンとモデルの連続区間に沿って差し替える。過去に同じ回答が複数calloutへ
+    分割された場合は、その最後のcalloutにUsageを表示する。
     """
     groups = _answer_usage_groups(messages)
     spans = _assistant_header_spans(content)
     if not groups or not spans:
         return content
     lines = content.splitlines(keepends=True)
-    for group_index, (start, end) in reversed(list(enumerate(spans))):
-        if group_index >= len(groups):
+    user_positions = []
+    active_fence = None
+    for index, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
             continue
-        usage = groups[group_index]
-        metadata_lines = [
-            line for line in lines[start:end]
-            if not re.match(r"^> <small>Usage: .*?</small>\r?\n?$", line)
-        ]
-        usage_text = format_message_usage(usage)
-        if usage_text:
-            newline = "\r\n" if lines[start:end] and lines[start:end][0].endswith("\r\n") else "\n"
-            metadata_lines.append(f"> <small>{usage_text}</small>{newline}")
+        if marker is not None:
+            active_fence = marker[:2]
+            continue
+        if line.rstrip("\r\n") == "> [!QUESTION] User":
+            user_positions.append(index)
+
+    groups_by_turn: dict[int, list[tuple[dict | None, dict | None]]] = {}
+    for turn_index, usage, subagent_usage in groups:
+        groups_by_turn.setdefault(turn_index, []).append((usage, subagent_usage))
+    spans_by_turn: dict[int, list[tuple[int, int]]] = {}
+    for start, end in spans:
+        turn_index = bisect_right(user_positions, start)
+        spans_by_turn.setdefault(turn_index, []).append((start, end))
+
+    replacements = []
+    for turn_index, turn_spans in spans_by_turn.items():
+        runs: list[list[tuple[int, int]]] = []
+        last_model = None
+        for start, end in turn_spans:
+            model = next((line for line in lines[start + 1:end] if line.startswith("> <small>🤖 ")), "")
+            if runs and model == last_model:
+                runs[-1].append((start, end))
+            else:
+                runs.append([(start, end)])
+            last_model = model
+        turn_groups = groups_by_turn.get(turn_index, [])
+        if len(runs) != len(turn_groups):
+            logger.warning("回答Usageのcallout対応を特定できません: turn=%s", turn_index)
+            continue
+        for run, (usage, subagent_usage) in zip(runs, turn_groups):
+            usage_text = format_message_usage(usage, subagent_usage)
+            for run_index, (start, end) in enumerate(run):
+                metadata_lines = [
+                    line for line in lines[start:end]
+                    if not re.match(r"^> <small>Usage: .*?</small>\r?\n?$", line)
+                ]
+                if run_index == len(run) - 1 and usage_text:
+                    newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+                    metadata_lines.append(f"> <small>{usage_text}</small>{newline}")
+                replacements.append((start, end, metadata_lines))
+    for start, end, metadata_lines in sorted(replacements, reverse=True):
         lines[start:end] = metadata_lines
     return "".join(lines)
 
@@ -2103,6 +2209,9 @@ def append_messages(
             separator = "\n\n" if message.get("after_tool_use") else "\n"
             previous["message"] = previous.get("message", "").rstrip("\n") + separator + message.get("message", "")
             previous["usage"] = _merge_usage_summaries(previous.get("usage"), message.get("usage"))
+            previous["subagent_usage"] = _merge_usage_summaries(
+                previous.get("subagent_usage"), message.get("subagent_usage"),
+            )
             if previous.get("usage_records") or message.get("usage_records"):
                 previous["usage_records"] = (previous.get("usage_records") or []) + (message.get("usage_records") or [])
         else:
@@ -2140,12 +2249,12 @@ def append_messages(
         elif m_type == "agent_message":
             # 使用されたモデル名の取得
             metadata = [f"🤖 {display_model}"] if display_model else []
-            usage_metadata = format_message_usage(msg.get("usage"))
+            usage_metadata = format_message_usage(msg.get("usage"), msg.get("subagent_usage"))
             if usage_metadata:
                 metadata.append(usage_metadata)
             callout_header = assistant_callout_header(AGENT_NAME, metadata)
 
-            if callout_header == last_callout_header:
+            if _assistant_header_model(callout_header) == _assistant_header_model(last_callout_header):
                 # Codex のストリーミング結果が複数の agent_message に分割される
                 # ことがある。同じ callout の続きは区切り線を入れず、改行を残して連結し、
                 # 1つの回答として message_count に加算する。
@@ -2254,7 +2363,8 @@ def handle_stop_event(hook_input: dict) -> None:
             logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
     saved_last_line = state.get("last_line", 0)
     current_quota = retrieve_quota(jsonl_path, saved_last_line)
-    current_usage = retrieve_usage(jsonl_path, session_id)
+    subagent_records = _read_subagent_usage_records(jsonl_path, session_id)
+    current_usage = retrieve_usage(jsonl_path, session_id, subagent_records)
     if current_quota:
         first_quota = retrieve_quota(jsonl_path, saved_last_line, first=True)
         state["initial_quota"] = merge_first_quota(state.get("initial_quota"), first_quota or {})
@@ -2318,7 +2428,7 @@ def handle_stop_event(hook_input: dict) -> None:
         save_state(session_id, state)
 
     # メッセージのロードと追記
-    new_messages, new_last_line = load_jsonl_messages(jsonl_path, last_line)
+    new_messages, new_last_line = load_jsonl_messages(jsonl_path, last_line, subagent_records)
 
     if new_messages:
         appended, updated = append_messages(
@@ -2349,7 +2459,7 @@ def handle_stop_event(hook_input: dict) -> None:
     # hook 再実行でも frontmatter と本文を更新する（最後の usage record を拾う）。
     if current_usage is not None:
         content = path.read_text(encoding="utf-8")
-        all_messages, _ = load_jsonl_messages(jsonl_path, 0)
+        all_messages, _ = load_jsonl_messages(jsonl_path, 0, subagent_records)
         refreshed = update_markdown_metadata(
             content,
             now_jst(),
