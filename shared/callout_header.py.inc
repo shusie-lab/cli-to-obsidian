@@ -7,7 +7,10 @@ def get_last_callout_header(content: str) -> str | None:
     last_header = None
     header_lines = []
     for line in _iter_lines_outside_fences(content):
-        if line.startswith("> [!"):
+        if line == HIDDEN_USER_BOUNDARY:
+            last_header = None
+            header_lines = []
+        elif line.startswith("> [!"):
             header_lines = [line]
             last_header = line
         elif header_lines and is_callout_header_line(line):

@@ -139,7 +139,7 @@ class TestIntegration(unittest.TestCase):
         session_id = "test_codex_late_usage"
         jsonl_path = self.test_dir / "transcript_codex_late_usage.jsonl"
         rows = [
-            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna"}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-6-luna"}},
             {"type": "event_msg", "payload": {"type": "user_message", "turn_id": "turn-1", "message": "Question"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "turn_id": "turn-1", "message": "Answer"}},
         ]
@@ -173,8 +173,8 @@ class TestIntegration(unittest.TestCase):
 
         codex_save.handle_stop_event(hook_input)
         after = output_path.read_text(encoding="utf-8")
-        self.assertIn("Usage: 120 tok · $0.0000422", after)
-        self.assertEqual(after.count("Usage: 120 tok · $0.0000422"), 1)
+        self.assertIn("Usage: 120 tok · $0.0000191", after)
+        self.assertEqual(after.count("Usage: 120 tok · $0.0000191"), 1)
         self.assertIn("total_tokens: 120", after)
 
     def test_codex_subagent_usage_updates_session_without_double_counting(self):
@@ -200,7 +200,7 @@ class TestIntegration(unittest.TestCase):
 
         write_rows(parent, [
             {"type": "session_meta", "payload": {"id": session_id}},
-            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-6-sol"}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-6.1-sol"}},
             {"type": "event_msg", "payload": {"type": "user_message", "message": "Question"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "message": "Answer"}},
             usage(100),

@@ -103,6 +103,7 @@ class TestOpenCodeSave(unittest.TestCase):
             "  - opencode\n"
             "message_count: 2\n"
             "---\n\n"
+            "💰 **Usage (USD換算)**: N/A\n\n"
             "# Snapshot question\n"
             "> [!QUESTION] User\n"
             "> <small>⏱ 2026-09-14 10:00:00</small>\n"
@@ -131,6 +132,35 @@ class TestOpenCodeSave(unittest.TestCase):
         self.assertLess(content.index("進捗1"), content.index("進捗2"))
         self.assertLess(content.index("進捗2"), content.index("最終回答"))
         self.assertLess(content.index("最終回答"), content.index("質問2"))
+
+    def test_hidden_user_message_keeps_answer_callouts_separate(self):
+        raw = [
+            {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+            {"info": {"id": "a1", "role": "assistant", "modelID": "model-a"}, "parts": [{"type": "text", "text": "回答1"}]},
+            {"info": {"id": "u2", "role": "user"}, "parts": []},
+            {"info": {"id": "a2", "role": "assistant", "modelID": "model-a"}, "parts": [{"type": "text", "text": "回答2"}]},
+        ]
+        payload = {"session_id": "ses_hidden_user", "full_sync": True, "messages": raw}
+        path = opencode_save.handle_payload(payload)
+        content = path.read_text()
+        self.assertEqual(content.count("> [!NOTE] OpenCode"), 2)
+        self.assertIn("message_count: 3", content)
+        # 旧描画のhashを持つstateからも、同じpayloadで新形式へ更新する。
+        import hashlib
+        import json
+        state = opencode_save.load_state(payload["session_id"])
+        messages = opencode_save.extract_messages(raw)
+        hash_messages = [dict(id=m.get("id", ""), type=m["type"], text=m["text"],
+            timestamp=m.get("timestamp", ""), model=m.get("model", ""),
+            provider=opencode_save._message_provider(m), usage=m.get("usage")) for m in messages]
+        state["payload_hash"] = hashlib.sha256(json.dumps({"render_version": 2,
+            "cwd": os.getcwd(), "messages": hash_messages,
+            "usage_records": opencode_save.extract_usage_records(raw)},
+            ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        opencode_save.save_state(payload["session_id"], state)
+        path.write_text("old rendering")
+        self.assertEqual(opencode_save.handle_payload(payload), path)
+        self.assertEqual(path.read_text().count("> [!NOTE] OpenCode"), 2)
 
     def test_full_sync_after_state_loss_does_not_duplicate_grouped_reply(self):
         session_id = "ses_grouped_state_loss"
@@ -167,6 +197,86 @@ class TestOpenCodeSave(unittest.TestCase):
         for text in ("過去の進捗", "過去の回答", "新しい回答"):
             self.assertEqual(content.count(text), 1)
         self.assertEqual(content.count("> [!QUESTION] User"), 2)
+
+    def test_contributor_free_usage_is_estimated_in_usd(self):
+        payload = {
+            "session_id": "ses_muse_spark_cost",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                {"info": {"id": "a1", "role": "assistant", "modelID": "muse-spark-1.3-contributor-free",
+                          "cost": 0,
+                          "tokens": {"input": 1000000, "output": 1000000, "reasoning": 0,
+                                     "cache": {"read": 0, "write": 0}}},
+                 "parts": [{"type": "text", "text": "回答"}]},
+            ],
+        }
+        path = opencode_save.handle_payload(payload)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("total_cost_usd: 0.3", content)
+        self.assertIn("cost_usd: 0.3", content)
+        self.assertIn("Usage: 2,000,000 tok", content)
+        self.assertIn(
+            "💰 **Usage (USD換算)**: Total: $0.3 (muse-spark-1.3-contributor-free $0.3)", content
+        )
+        self.assertLess(content.index("💰 **Usage (USD換算)**:"), content.index("# 質問"))
+
+    def test_current_model_rates(self):
+        usage = {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 100000,
+            "cache_write_input_tokens": 100000,
+            "output_tokens": 100000,
+        }
+        self.assertEqual(
+            str(opencode_save._usage_cost("opencode/nemotron-3-ultra-free", usage)),
+            "0.68",
+        )
+        self.assertEqual(
+            str(opencode_save._usage_cost("anthropic/claude-opus-5-5", usage)),
+            "5.72",
+        )
+
+    def test_usage_cost_sum_keeps_decimal_precision(self):
+        payload = {
+            "session_id": "ses_muse_spark_decimal_cost",
+            "cwd": "/tmp/example",
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問"}]},
+                {"info": {"id": "a1", "role": "assistant", "modelID": "muse-spark-1.3-contributor-free",
+                          "cost": 0,
+                          "tokens": {"input": 1000000, "output": 0, "reasoning": 0,
+                                     "cache": {"read": 0, "write": 0}}},
+                 "parts": [{"type": "text", "text": "前半"}]},
+                {"info": {"id": "a2", "role": "assistant", "modelID": "muse-spark-1.3-contributor-free",
+                          "cost": 0,
+                          "tokens": {"input": 0, "output": 1000000, "reasoning": 0,
+                                     "cache": {"read": 0, "write": 0}}},
+                 "parts": [{"type": "text", "text": "後半"}]},
+            ],
+        }
+        path = opencode_save.handle_payload(payload)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("total_cost_usd: 0.3", content)
+        self.assertIn("cost_usd: 0.3", content)
+        self.assertIn("Usage: 2,000,000 tok · $0.3", content)
+        state = opencode_save.load_state(payload["session_id"])
+        self.assertEqual(state["usage_records"]["a1"]["usage"]["cost_usd"], "0.1")
+        self.assertEqual(state["usage_records"]["a2"]["usage"]["cost_usd"], "0.2")
+
+    def test_body_usage_summary_shows_only_usd_and_unknown_models(self):
+        usage = {
+            "total_cost_usd": opencode_save.Decimal("0.25"),
+            "cost_incomplete": True,
+            "by_model": {
+                "priced-model": {"cost_usd": opencode_save.Decimal("0.25")},
+                "unknown-model": {"cost_unavailable": True},
+            },
+        }
+        self.assertEqual(
+            opencode_save.build_usage_section(usage),
+            "💰 **Usage (USD換算)**: Total: $0.25（部分換算） (priced-model $0.25、unknown-model 換算不可)\n",
+        )
 
     def test_openrouter_balance_is_not_fetched_and_native_tokens_are_saved(self):
         payload = {
@@ -234,6 +344,51 @@ class TestOpenCodeSave(unittest.TestCase):
         self.assertIn("reasoning_output_tokens: 3", content)
         self.assertEqual(content.count("> [!NOTE] OpenCode"), 1)
         self.assertIn("message_count: 2", content)
+
+    def test_tool_only_usage_is_added_to_the_answer_in_its_user_turn(self):
+        def assistant(message_id, token_count, text=None):
+            message = {
+                "info": {
+                    "id": message_id,
+                    "role": "assistant",
+                    "modelID": "model-a",
+                    "tokens": {
+                        "input": token_count,
+                        "output": 0,
+                        "reasoning": 0,
+                        "cache": {"read": 0, "write": 0},
+                    },
+                },
+                "parts": [],
+            }
+            if text:
+                message["parts"] = [{"type": "text", "text": text}]
+            return message
+
+        payload = {
+            "session_id": "ses_tool_only_answer_usage",
+            "cwd": "/tmp/example",
+            "full_sync": True,
+            "messages": [
+                {"info": {"id": "u1", "role": "user"}, "parts": [{"type": "text", "text": "質問1"}]},
+                assistant("tool1", 100),
+                assistant("answer1", 10, "回答1"),
+                {"info": {"id": "u2", "role": "user"}, "parts": [{"type": "text", "text": "質問2"}]},
+                assistant("tool2", 20),
+                assistant("answer2", 30, "回答2"),
+                {"info": {"id": "u3", "role": "user"}, "parts": [{"type": "text", "text": "質問3"}]},
+                assistant("tool3", 15),
+            ],
+        }
+
+        path = opencode_save.handle_payload(payload)
+        content = path.read_text(encoding="utf-8")
+
+        self.assertIn("total_tokens: 175", content)
+        self.assertEqual(content.count("Usage: 110 tok"), 1)
+        self.assertEqual(content.count("Usage: 50 tok"), 1)
+        self.assertLess(content.index("Usage: 110 tok"), content.index("質問2"))
+        self.assertGreater(content.index("Usage: 50 tok"), content.index("質問2"))
 
     def test_provider_change_is_in_payload_hash(self):
         def payload(provider):
@@ -578,8 +733,8 @@ class TestOpenCodeSave(unittest.TestCase):
                 opencode_save.find_existing_md(session_id)
 
             payload = {"session_id": session_id, "cwd": "/tmp/example", "messages": [{"info": {"role": "user"}, "parts": [{"type": "text", "text": "テスト"}]}]}
-            res = opencode_save.handle_payload(payload)
-            self.assertIsNone(res)
+            with self.assertRaises(opencode_save.ExistingMarkdownSearchError):
+                opencode_save.handle_payload(payload)
 
         bad_path = opencode_save.OUTPUT_BASE / f"20260101_120000_myproj_{opencode_save.safe_session_key(session_id)}.md"
         bad_path.write_text("dummy", encoding="utf-8")

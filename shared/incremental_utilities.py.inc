@@ -1,3 +1,17 @@
+def session_locked(input_key: str):
+    """hook input内のsession idを使って関数を排他実行する。"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(hook_input: dict):
+            session_id = hook_input.get(input_key, "")
+            if not session_id:
+                return func(hook_input)
+            with session_lock(str(session_id)):
+                return func(hook_input)
+        return wrapper
+    return decorator
+
+
 def read_stdin() -> dict:
     """hookの標準入力を読み、空入力や不正JSONでは空のdictを返す。"""
     try:
@@ -7,24 +21,6 @@ def read_stdin() -> dict:
     except Exception as error:
         logger.info("stdinの読み込みまたはJSONパースに失敗しました: %s", error)
     return {}
-
-
-def now_jst() -> datetime:
-    return datetime.now(JST)
-
-
-def format_iso(value: datetime) -> str:
-    return value.isoformat(timespec="seconds")
-
-
-def yaml_quote(value: object) -> str:
-    """JSON互換の引用形式でYAML文字列を安全に生成する。"""
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def safe_filename_component(value: str) -> str:
-    """値を単一の安全なファイル名要素へ変換する。"""
-    return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
 
 
 def merge_first_quota(first: dict | None, observed: dict) -> dict:

@@ -8,10 +8,13 @@ Claude Code CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "3.2.0"
+__version__ = "3.8.0"
 
+from bisect import bisect_right
 import json
 import math
+import io
+import time
 from decimal import Decimal
 import re
 import sys
@@ -29,6 +32,7 @@ from logging.handlers import RotatingFileHandler
 # ============================================================
 # 定数
 # ============================================================
+LOGGER_NAME = "claude_obsidian_save"
 JST = timezone(timedelta(hours=9))
 
 OBSIDIAN_VAULT = Path(
@@ -39,6 +43,93 @@ OBSIDIAN_VAULT = Path(
 )
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
 DEFAULT_SOURCE = "claude-code"
+
+
+# Usage の標準 API 単価（USD / 1,000,000 tokens）。集計した input_tokens には
+# cached_input_tokens と cache_write_input_tokens が含まれるため、通常入力の
+# 単価はそれらを除いた残りにだけ適用する。
+# cache_write_input は5分、cache_write_input_1h は1時間のキャッシュ書き込み。
+# Claude Code の契約上の請求額・サブスクリプション消費量は表せない。
+# 無料モデルも、請求額ではなく参考値として対応する有料版の単価で換算する。
+# Claude: https://platform.claude.com/docs/en/about-claude/pricing
+# Nemotron: https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b
+
+# BEGIN GENERATED: usage-prices
+# 参考単価の正本。Opus 5.5のcache readは2026-10-06に公式資料で確認。
+# https://developers.openai.com/api/docs/pricing
+# https://platform.claude.com/docs/en/about-claude/pricing
+# https://dev.meta.ai/docs/pricing-rate-limits/
+# https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b
+# Gemini 3.8 Flash: 2026-10-06時点のStandard（年末までの割引価格）。
+# https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash
+# https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints
+# Haiku 5.5: 2026-10-09確認。10万token超は全token種別で5倍。
+# https://platform.claude.com/docs/en/models/haiku-5-5/overview
+STANDARD_USAGE_RATES = {
+    "gpt-6-astra": {
+        "input": Decimal("10.00"),
+        "cached_input": Decimal("1.00"),
+        "cache_write_input": Decimal("12.50"),
+        "output": Decimal("50.00"),
+    },
+    "gpt-6.1-sol": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+    },
+    "gpt-6-luna": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.01"),
+        "cache_write_input": Decimal("0.125"),
+        "output": Decimal("0.50"),
+    },
+    "gemini-3.8-flash": {
+        "input": Decimal("0.75"),
+        "cached_input": Decimal("0.075"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        # Googleの時間単位のstorage priceとは別の掲載単位。
+        "cache_write_input": Decimal("0.0416666666666667"),
+        "output": Decimal("3.75"),
+    },
+    "muse-spark-1.3-contributor-free": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.002"),
+        "cache_write_input": Decimal("0.10"),
+        "output": Decimal("0.20"),
+    },
+    "nemotron-3-ultra-free": {
+        "input": Decimal("0.50"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("0.50"),
+        "output": Decimal("2.20"),
+    },
+    "claude-opus-5-5": {
+        "input": Decimal("4.00"),
+        "cached_input": Decimal("0.20"),
+        "cache_write_input": Decimal("5.00"),
+        "output": Decimal("20.00"),
+        "cache_write_input_1h": Decimal("8.00"),
+    },
+    "claude-haiku-5-5": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.01"),
+        "cache_write_input": Decimal("0.125"),
+        "output": Decimal("0.50"),
+        "cache_write_input_1h": Decimal("0.20"),
+    },
+    "claude-sonnet-5-5": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.20"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+        "cache_write_input_1h": Decimal("4.00"),
+    },
+}
+
+# 従来の呼び出し名との互換alias。単価の正本は上の辞書1つだけ。
+USAGE_COST_USD_PER_1M_TOKEN_TYPE = STANDARD_USAGE_RATES
+# END GENERATED: usage-prices
 
 
 # BEGIN GENERATED: output-directory
@@ -78,18 +169,79 @@ SAFE_SESSION_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 # ============================================================
 # ロギング
 # ============================================================
-def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("claude_obsidian_save")
-    if os.environ.get("DEBUG"):
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
+# BEGIN GENERATED: utilities
+def now_jst() -> datetime:
+    return datetime.now(JST)
 
+
+def yaml_quote(value: object) -> str:
+    """JSON互換の引用形式でYAML文字列を安全に生成する。"""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def safe_filename_component(value: str) -> str:
+    """値を単一の安全なファイル名要素へ変換する。"""
+    return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
+
+
+def _try_parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).astimezone(JST)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str) and value:
+        try:
+            normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(JST)
+        except (OSError, OverflowError, TypeError, ValueError):
+            pass
+    return None
+
+
+def parse_datetime(value: object, default: datetime | None = None) -> datetime:
+    parsed = _try_parse_datetime(value)
+    if parsed is not None:
+        return parsed
+    return default or datetime.now(JST)
+
+
+def format_iso(value: datetime) -> str:
+    return value.astimezone(JST).isoformat(timespec="seconds")
+
+
+def _finite_number(value: object) -> float | None:
+    """APIレスポンスの数値を厳密に検証する。boolやNaN/Infinityは受け付けない。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def format_model_name(model_name: str, effort: str = "") -> str:
+    """モデル名に reasoning effort を付加して表示用の名前へ変換する。"""
+    model = str(model_name or "").strip()
+    effort_value = str(effort or "").strip()
+    if not model or not effort_value:
+        return model
+    if model.endswith(f"-{effort_value}"):
+        return model
+    return f"{model}-{effort_value}"
+# END GENERATED: utilities
+
+# BEGIN GENERATED: logging-setup
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger(LOGGER_NAME)
     if logger.handlers:
         return logger
-
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
+    logger.setLevel(logging.DEBUG if os.environ.get("DEBUG") else logging.INFO)
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     file_log_error = None
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -99,20 +251,21 @@ def setup_logger() -> logging.Logger:
             backupCount=3,
             encoding="utf-8",
         )
-        handler.setFormatter(fmt)
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
     except OSError as e:
         file_log_error = e
-
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(fmt)
-    logger.addHandler(stderr_handler)
+    stderr = logging.StreamHandler()
+    stderr.setFormatter(formatter)
+    logger.addHandler(stderr)
     if file_log_error is not None:
-        logger.warning(f"ファイルログを初期化できないためstderrのみ使用します: {file_log_error}")
+        logger.warning("ファイルログを初期化できないためstderrのみ使用します: %s", file_log_error)
     return logger
 
 
 logger = setup_logger()
+# END GENERATED: logging-setup
+
 
 # ============================================================
 # 状態（State）ファイル操作
@@ -203,25 +356,14 @@ def try_session_lock(session_id: str, *, is_key: bool = False):
         lock_file.close()
 
 
-def session_locked(input_key: str):
-    """hook input内のsession idを使って関数を排他実行する。"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(hook_input: dict):
-            session_id = hook_input.get(input_key, "")
-            if not session_id:
-                return func(hook_input)
-            with session_lock(str(session_id)):
-                return func(hook_input)
-        return wrapper
-    return decorator
-
-
 def load_state(session_id: str) -> dict:
     path = state_path(session_id)
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("stateはJSONオブジェクトが必要です")
+            return data
         except Exception as error:
             logger.info("stateファイルの読み込みに失敗しました（破損の可能性）: %s: %s", path, error)
             return {}
@@ -276,6 +418,20 @@ def cleanup_old_states() -> None:
 # ユーティリティ
 # ============================================================
 # BEGIN GENERATED: incremental-utilities
+def session_locked(input_key: str):
+    """hook input内のsession idを使って関数を排他実行する。"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(hook_input: dict):
+            session_id = hook_input.get(input_key, "")
+            if not session_id:
+                return func(hook_input)
+            with session_lock(str(session_id)):
+                return func(hook_input)
+        return wrapper
+    return decorator
+
+
 def read_stdin() -> dict:
     """hookの標準入力を読み、空入力や不正JSONでは空のdictを返す。"""
     try:
@@ -285,24 +441,6 @@ def read_stdin() -> dict:
     except Exception as error:
         logger.info("stdinの読み込みまたはJSONパースに失敗しました: %s", error)
     return {}
-
-
-def now_jst() -> datetime:
-    return datetime.now(JST)
-
-
-def format_iso(value: datetime) -> str:
-    return value.isoformat(timespec="seconds")
-
-
-def yaml_quote(value: object) -> str:
-    """JSON互換の引用形式でYAML文字列を安全に生成する。"""
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def safe_filename_component(value: str) -> str:
-    """値を単一の安全なファイル名要素へ変換する。"""
-    return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
 
 
 def merge_first_quota(first: dict | None, observed: dict) -> dict:
@@ -779,6 +917,569 @@ def render_assistant_message_block(
     return f"{assistant_callout_header(agent_name, metadata)}{separator}{body}\n\n"
 # END GENERATED: markdown-rendering
 
+# BEGIN GENERATED: incremental-answer-usage
+def _answer_usage_groups(messages: list[dict]) -> list[tuple[int, dict | None, dict | None]]:
+    """User発話ごとにAgentMessageを回答単位へまとめる。"""
+    groups: list[tuple[int, dict | None, dict | None]] = []
+    turn_index = 0
+    last_model = None
+    last_turn_id = None
+    for message in messages:
+        turn_id = message.get("turn_id") or None
+        if message.get("type") == "user_message":
+            last_turn_id = turn_id
+            turn_index += 1
+            last_model = None
+            continue
+        if message.get("type") != "agent_message" or not str(message.get("message", "")).strip():
+            continue
+        if message.get("after_turn_boundary") or (turn_id and last_turn_id and turn_id != last_turn_id):
+            turn_index += 1
+            last_model = None
+        last_turn_id = turn_id or last_turn_id
+        model = format_model_name(message.get("model", ""), message.get("effort", ""))
+        if groups and model == last_model:
+            _, usage, subagent_usage = groups[-1]
+            groups[-1] = (
+                turn_index,
+                _merge_usage_summaries(usage, message.get("usage")),
+                _merge_usage_summaries(subagent_usage, message.get("subagent_usage")),
+            )
+        else:
+            groups.append((turn_index, message.get("usage"), message.get("subagent_usage")))
+            last_model = model
+    return groups
+
+
+def _assistant_header_spans(content: str) -> list[tuple[int, int]]:
+    """コードフェンス外のassistant metadata行の範囲を返す。"""
+    lines = content.splitlines(keepends=True)
+    spans = []
+    index = 0
+    active_fence = None
+    while index < len(lines):
+        marker = _fence_marker(lines[index])
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
+            index += 1
+            continue
+        if marker is not None:
+            active_fence = marker[:2]
+            index += 1
+            continue
+        if lines[index].rstrip("\r\n") != f"> [!NOTE] {AGENT_NAME}":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and lines[end].startswith("> <small>"):
+            end += 1
+        spans.append((index, end))
+        index = end
+    return spans
+
+
+def refresh_answer_usage_metadata(content: str, messages: list[dict]) -> str:
+    """遅れて書かれたusage recordを既存assistant calloutへ反映する。
+
+    本文・ユーザーcallout・既存のquota行は変更せず、assistant metadata内のUsage行だけを
+    親ターンとモデルの連続区間に沿って差し替える。過去に同じ回答が複数calloutへ
+    分割された場合は、その最後のcalloutにUsageを表示する。
+    """
+    groups = _answer_usage_groups(messages)
+    spans = _assistant_header_spans(content)
+    if not groups or not spans:
+        return content
+    lines = content.splitlines(keepends=True)
+    user_positions = []
+    active_fence = None
+    for index, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
+            continue
+        if marker is not None:
+            active_fence = marker[:2]
+            continue
+        if line.rstrip("\r\n") in ("> [!QUESTION] User", HIDDEN_USER_BOUNDARY):
+            user_positions.append(index)
+
+    groups_by_turn: dict[int, list[tuple[dict | None, dict | None]]] = {}
+    for turn_index, usage, subagent_usage in groups:
+        groups_by_turn.setdefault(turn_index, []).append((usage, subagent_usage))
+    spans_by_turn: dict[int, list[tuple[int, int]]] = {}
+    for start, end in spans:
+        turn_index = bisect_right(user_positions, start)
+        spans_by_turn.setdefault(turn_index, []).append((start, end))
+
+    replacements = []
+    for turn_index, turn_spans in spans_by_turn.items():
+        runs: list[list[tuple[int, int]]] = []
+        last_model = None
+        for start, end in turn_spans:
+            model = next((line for line in lines[start + 1:end] if line.startswith("> <small>🤖 ")), "")
+            if runs and model == last_model:
+                runs[-1].append((start, end))
+            else:
+                runs.append([(start, end)])
+            last_model = model
+        turn_groups = groups_by_turn.get(turn_index, [])
+        if len(runs) != len(turn_groups):
+            logger.warning("回答Usageのcallout対応を特定できません: turn=%s", turn_index)
+            continue
+        for run, (usage, subagent_usage) in zip(runs, turn_groups):
+            usage_text = format_message_usage(usage, subagent_usage)
+            for run_index, (start, end) in enumerate(run):
+                metadata_lines = [
+                    line for line in lines[start:end]
+                    if not re.match(r"^> <small>Usage: .*?</small>\r?\n?$", line)
+                ]
+                if run_index == len(run) - 1 and usage_text:
+                    newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+                    metadata_lines.append(f"> <small>{usage_text}</small>{newline}")
+                replacements.append((start, end, metadata_lines))
+    for start, end, metadata_lines in sorted(replacements, reverse=True):
+        lines[start:end] = metadata_lines
+    return "".join(lines)
+# END GENERATED: incremental-answer-usage
+
+# BEGIN GENERATED: full-session-display
+def _display_message_groups(messages: Iterable[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    groups: List[List[Dict[str, Any]]] = []
+    for message in messages:
+        if (
+            message["type"] == "assistant"
+            and groups
+            and groups[-1][0]["type"] == "assistant"
+            and groups[-1][0].get("model", "") == message.get("model", "")
+            and groups[-1][0].get("turn_index") == message.get("turn_index")
+        ):
+            groups[-1].append(message)
+        else:
+            groups.append([message])
+    return groups
+
+
+def _usage_records_by_display_group(
+    groups: List[List[Dict[str, Any]]], usage_records: Iterable[Dict[str, Any]]
+) -> List[List[Dict[str, Any]]]:
+    """本文のないassistant usageを、同じユーザーターン内の最寄り回答calloutへ割り当てる。"""
+    result: List[List[Dict[str, Any]]] = [[] for _ in groups]
+    message_groups = {
+        str(message.get("id")): group_index
+        for group_index, group in enumerate(groups)
+        for message in group
+        if message.get("type") == "assistant" and message.get("id")
+    }
+    assistant_groups = [
+        index for index, group in enumerate(groups)
+        if group and group[0].get("type") == "assistant"
+    ]
+    for record in usage_records:
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message_id = str(record.get("id") or "")
+        target = message_groups.get(message_id)
+        if target is None:
+            sequence = record.get("sequence")
+            turn_index = record.get("turn_index")
+            candidates = [
+                index for index in assistant_groups
+                if turn_index is None or groups[index][0].get("turn_index") == turn_index
+            ]
+            model = str(record.get("model") or "")
+            same_model = [index for index in candidates if str(groups[index][0].get("model") or "") == model]
+            if same_model:
+                candidates = same_model
+            if not candidates:
+                continue
+
+            def distance(group_index: int) -> Tuple[int, int, int]:
+                positions = [
+                    message.get("sequence") for message in groups[group_index]
+                    if isinstance(message.get("sequence"), int)
+                ]
+                if not isinstance(sequence, int) or not positions:
+                    return (0, group_index, group_index)
+                start, end = min(positions), max(positions)
+                gap = start - sequence if sequence < start else sequence - end if sequence > end else 0
+                follows_record = 0 if start >= sequence else 1
+                return (gap, follows_record, group_index)
+
+            target = min(candidates, key=distance)
+        result[target].append(record)
+    return result
+# END GENERATED: full-session-display
+
+# BEGIN GENERATED: incremental-rendering
+HIDDEN_USER_BOUNDARY = "<!-- user_turn_boundary -->"
+
+
+def incremental_display_messages(messages: list[dict], model_name: str = "", effort: str = "") -> list[dict]:
+    """増分入力を共通の表示recordへ変換する。非表示のuserも境界として残す。"""
+    result = []
+    turn = -1
+    for index, message in enumerate(messages):
+        role = {"user_message": "user", "agent_message": "assistant"}.get(message.get("type"))
+        if role is None:
+            continue
+        if role == "user":
+            turn += 1
+        result.append(dict(message, type=role, text=message.get("message", ""),
+            model=format_model_name(message.get("model") or model_name, message.get("effort") or effort),
+            turn_index=message.get("turn_id") or message.get("turn_index", turn), sequence=index))
+    return result
+
+
+def render_incremental_messages(content: str, messages: list[dict], *, model_name: str = "", effort: str = "",
+                                user_transform=None, reference_renderer=None) -> tuple[str, int, bool]:
+    normalized = incremental_display_messages(messages, model_name, effort)
+    groups = _display_message_groups(normalized)
+    last_header = get_last_callout_header(content)
+    if (last_header is None and HIDDEN_USER_BOUNDARY not in content
+            and not any(message["text"].strip() for message in normalized)):
+        return content, 0, False
+    blocks = []
+    appended = 0
+    previous_turn = None
+    for group in groups:
+        message = group[0]
+        turn = message.get("turn_index")
+        if message["type"] == "assistant" and (message.get("after_turn_boundary") or
+                (previous_turn is not None and previous_turn != turn)):
+            blocks.append(HIDDEN_USER_BOUNDARY + "\n\n")
+            last_header = None
+        previous_turn = turn
+        text = message["text"]
+        if message["type"] == "user":
+            if not text.strip():
+                blocks.append(HIDDEN_USER_BOUNDARY + "\n\n")
+                last_header = None
+                continue
+            display_text, reference = user_transform(text) if user_transform else (text, None)
+            header = user_callout_header(message.get("timestamp"))
+            user_block = render_user_message_block(display_text, message.get("timestamp"), continued=header == last_header)
+            if reference is not None and reference_renderer is not None:
+                user_block += reference_renderer(reference) + "\n\n"
+            blocks.append(user_block)
+            last_header = REFERENCE_CALLOUT_HEADER if reference is not None else header
+            appended += 1
+            continue
+        visible = [item for item in group if item["text"].strip()]
+        if not visible:
+            continue
+        usage = subagent_usage = None
+        for item in group:
+            if item.get("usage"):
+                usage = _merge_usage_summaries(usage, item["usage"])
+            if item.get("subagent_usage"):
+                subagent_usage = _merge_usage_summaries(subagent_usage, item["subagent_usage"])
+        model = message.get("model", "")
+        metadata = [f"🤖 {model}"] if model else []
+        if usage:
+            metadata.append(format_message_usage(usage, subagent_usage))
+        body = visible[0]["text"]
+        for item in visible[1:]:
+            separator = "\n\n" if item.get("after_tool_use") else "\n"
+            body = body.rstrip("\n") + separator + item["text"]
+        header = assistant_callout_header(AGENT_NAME, metadata)
+        current_model = next((line for line in header.splitlines() if line.startswith("> <small>🤖 ")), "")
+        previous_model = next((line for line in (last_header or "").splitlines() if line.startswith("> <small>🤖 ")), "")
+        continued = bool(last_header and last_header.splitlines()[0] == f"> [!NOTE] {AGENT_NAME}" and previous_model == current_model)
+        if continued:
+            fragment = render_assistant_message_block(body, AGENT_NAME, metadata, continued=True)
+            separator = "\n\n" if message.get("after_tool_use") else "\n"
+            if blocks:
+                blocks[-1] = blocks[-1].rstrip("\n") + separator + fragment + "\n\n"
+            else:
+                content = content.rstrip("\n") + separator
+                blocks.append(fragment + "\n\n")
+        else:
+            blocks.append(render_assistant_message_block(body, AGENT_NAME, metadata, extra_blank_line=True))
+            appended += 1
+        last_header = header
+    return content + "".join(blocks), appended, bool(blocks)
+# END GENERATED: incremental-rendering
+
+# BEGIN GENERATED: usage-summary
+USAGE_FIELDS = (
+    "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+    "output_tokens", "reasoning_output_tokens", "total_tokens",
+)
+USAGE_TOKEN_FIELDS = USAGE_FIELDS
+
+
+def _empty_usage_totals() -> dict:
+    return {field: 0 for field in USAGE_FIELDS}
+
+
+def _decimal_cost(value: object) -> Decimal | None:
+    """数値・文字列金額を有限で非負のDecimalへ変換する。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
+def calculate_usage_cost(rates: dict, usage: dict, *, input_multiplier=1, output_multiplier=1) -> Decimal | None:
+    """各recordを換算し、キャッシュ・推論の内数を二重計上しない。"""
+    try:
+        values = [usage.get(key, 0) for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens")]
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            return None
+        total_input, cached, written, output = values
+        fresh = total_input - cached - written
+        if fresh < 0:
+            return None
+        return ((
+            (Decimal(fresh) * rates["input"] + Decimal(cached) * rates["cached_input"]
+             + Decimal(written) * rates["cache_write_input"]) * Decimal(str(input_multiplier))
+            + Decimal(output) * rates["output"] * Decimal(str(output_multiplier))
+        ) / Decimal(1_000_000)).normalize()
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return None
+
+
+def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
+    """provider側で重複排除・正規化したrecordを、各recordの金額を維持して合計する。"""
+    total = _empty_usage_totals()
+    by_model = {}
+    count = priced = 0
+    total_cost = Decimal(0)
+    long_context = False
+    for message in messages:
+        usage = message.get("usage") if message.get("type") == "assistant" else None
+        if not isinstance(usage, dict):
+            continue
+        count += 1
+        model = str(message.get("model") or "unknown")
+        entry = by_model.setdefault(model, _empty_usage_totals())
+        for field in USAGE_FIELDS:
+            value = int(usage.get(field, 0))
+            total[field] += value
+            entry[field] += value
+        long_context = long_context or bool(usage.get("long_context"))
+        value = _decimal_cost(usage.get("cost_usd"))
+        if value is None and estimate_missing:
+            value = _usage_cost(model, usage)
+        if value is not None:
+            priced += 1
+            total_cost += value
+            entry["cost_usd"] = entry.get("cost_usd", Decimal(0)) + value
+        else:
+            entry["cost_unavailable"] = True
+    if not count:
+        return None
+    for entry in by_model.values():
+        if "cost_usd" in entry and entry.pop("cost_unavailable", False):
+            entry["cost_incomplete"] = True
+    total["by_model"] = by_model
+    if priced:
+        total["total_cost_usd"] = total_cost
+        if priced < count:
+            total["cost_incomplete"] = True
+    else:
+        total["cost_unavailable"] = True
+    if long_context:
+        total["long_context"] = True
+    return total
+
+
+def usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    if not usage:
+        return []
+    lines = ["usage:"]
+    lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
+    if "total_cost_usd" in usage:
+        lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
+        if usage.get("cost_incomplete"):
+            lines.append("  cost_incomplete: true")
+    else:
+        lines.append("  cost_unavailable: true")
+    lines.append("  by_model:")
+    for model, entry in usage.get("by_model", {}).items():
+        lines.append(f"    {yaml_quote(model)}:")
+        lines.extend(f"      {field}: {int(entry.get(field, 0))}" for field in USAGE_FIELDS)
+        if "cost_usd" in entry:
+            lines.append(f"      cost_usd: {format(Decimal(str(entry['cost_usd'])), 'f')}")
+            if entry.get("cost_incomplete") or entry.get("cost_unavailable"):
+                lines.append("      cost_incomplete: true")
+        else:
+            lines.append("      cost_unavailable: true")
+    return lines
+
+
+def build_usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    """増分saverの従来API。"""
+    return usage_frontmatter_fields(usage)
+
+
+def _format_usd(value: object) -> str | None:
+    amount = _decimal_cost(value)
+    return f"${format(amount, 'f')}" if amount is not None else None
+
+
+def _usage_cost_label(usage: dict, key: str) -> str:
+    amount = _format_usd(usage.get(key))
+    if amount is None:
+        return "換算不可"
+    partial = usage.get("cost_incomplete") or usage.get("cost_unavailable")
+    return amount + ("（部分換算）" if partial else "")
+
+
+def build_usage_section(usage: dict | None) -> str:
+    if not usage:
+        return "💰 **Usage (USD換算)**: N/A\n"
+    parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')}" for model, entry in usage.get("by_model", {}).items()]
+    details = f" ({'、'.join(parts)})" if parts else ""
+    return f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+
+
+def format_message_usage(usage: dict | None, subagent_usage: dict | None = None) -> str:
+    if not usage:
+        return ""
+    warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
+    label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    if subagent_usage:
+        parts = [f"{model} {int(entry.get('total_tokens', 0)):,} tok・{_usage_cost_label(entry, 'cost_usd')}"
+                 for model, entry in sorted(subagent_usage.get("by_model", {}).items())]
+        if parts:
+            label += f" ({'、'.join(parts)})"
+    return label
+
+
+def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | None:
+    """換算済み小計を足す。再換算せず長文条件をrecord単位に維持する。"""
+    if not first:
+        return second
+    if not second:
+        return first
+    merged = _empty_usage_totals()
+    for field in USAGE_FIELDS:
+        merged[field] = int(first.get(field, 0)) + int(second.get(field, 0))
+    by_model = {}
+    for source in (first, second):
+        for model, entry in source.get("by_model", {}).items():
+            target = by_model.setdefault(model, _empty_usage_totals())
+            for field in USAGE_FIELDS:
+                target[field] += int(entry.get(field, 0))
+            if "cost_usd" in entry:
+                target["cost_usd"] = target.get("cost_usd", Decimal(0)) + Decimal(str(entry["cost_usd"]))
+            if entry.get("cost_unavailable") or entry.get("cost_incomplete"):
+                target["cost_unavailable"] = True
+    for entry in by_model.values():
+        if "cost_usd" in entry and entry.pop("cost_unavailable", False):
+            entry["cost_incomplete"] = True
+    merged["by_model"] = by_model
+    if "total_cost_usd" in first or "total_cost_usd" in second:
+        merged["total_cost_usd"] = sum((Decimal(str(source.get("total_cost_usd", 0))) for source in (first, second)), Decimal(0))
+        if any(source.get("cost_unavailable") or source.get("cost_incomplete") for source in (first, second)):
+            merged["cost_incomplete"] = True
+    else:
+        merged["cost_unavailable"] = True
+    if first.get("long_context") or second.get("long_context"):
+        merged["long_context"] = True
+    return merged
+# END GENERATED: usage-summary
+
+# BEGIN GENERATED: note-metadata
+def build_common_frontmatter(
+    session_id: str, cwd: str, created: datetime, modified: datetime,
+    count: int, title: str | None = None, *, source: str | None = None,
+    tags: list[str] | None = None, extra_fields=(),
+) -> str:
+    source = SOURCE_NAME if source is None else source
+    lines = [
+        "---", f"source: {source}",
+        *([f"title: {yaml_quote(title)}"] if title is not None else []),
+        f"session_id: {yaml_quote(session_id)}", f"project: {yaml_quote(cwd)}",
+        f"created: {yaml_quote(format_iso(created))}",
+        f"modified: {yaml_quote(format_iso(modified))}", "tags:",
+    ]
+    for tag in tags if tags is not None else ["ai-conversation", source]:
+        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
+        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
+        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
+        lines.append(f"  - {value}")
+    lines.append(f"message_count: {count}")
+    lines.extend(extra_fields)
+    lines.append("---")
+    return "\n".join(lines) + "\n\n"
+
+
+def note_output_path(session_id: str, cwd: str, created: datetime) -> Path:
+    project = safe_filename_component(Path(cwd).name) if cwd else ""
+    prefix = f"{created:%Y%m%d}_{created:%H%M%S}"
+    if project:
+        prefix += f"_{project}"
+    return OUTPUT_BASE / f"{prefix}_{safe_session_key(session_id) if session_id else 'unknown'}.md"
+
+
+def read_markdown_metadata(path: Path) -> dict:
+    """標準ライブラリで、このプロジェクトのfrontmatterの識別項目だけを読む。"""
+    content = path.read_text(encoding="utf-8")
+    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        return {}
+    result = {}
+    in_tags = False
+    for line in match.group(1).splitlines():
+        if line.startswith("tags:"):
+            in_tags = True
+            result["tags"] = []
+            continue
+        if in_tags and line.startswith("  - "):
+            raw = line[4:].strip()
+            try:
+                tag = json.loads(raw)
+            except ValueError:
+                tag = raw
+            if isinstance(tag, str):
+                result["tags"].append(tag)
+            continue
+        if line and not line.startswith((" ", "\t")):
+            in_tags = False
+        if line.startswith(("source:", "created:", "title:", "session_id:", "project:")):
+            key, raw = line.split(":", 1)
+            try:
+                value = json.loads(raw.strip())
+            except ValueError:
+                value = raw.strip()
+            if isinstance(value, str):
+                result[key] = value
+    return result
+
+
+def preserve_modified_if_unchanged(content: str, refreshed: str) -> str:
+    """更新時刻以外が一致するなら既存ノートをそのまま返す。"""
+    # Scope to frontmatter, so an assistant's code or prose is never replaced.
+    pattern = r"\A(---\s*\n)(.*?)(\n---\s*\n)"
+    old = re.match(pattern, content, re.DOTALL)
+    new = re.match(pattern, refreshed, re.DOTALL)
+    if not old or not new:
+        return refreshed
+    modified = next((line for line in old.group(2).splitlines() if line.startswith("modified:")), None)
+    if modified is None:
+        return refreshed
+    fields = re.sub(r"(?m)^modified:.*$", lambda _: modified, new.group(2), count=1)
+    unchanged_time = new.group(1) + fields + new.group(3) + refreshed[new.end():]
+    return content if unchanged_time == content else refreshed
+# END GENERATED: note-metadata
+
 
 # ============================================================
 # transcript（JSONL）のパース
@@ -883,22 +1584,66 @@ def capture_statusline_quota(data: dict) -> str:
     return build_quota_section(quota, quota).splitlines()[-1].removeprefix("- **Claude**: ")
 
 
-USAGE_TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
-                      "output_tokens", "reasoning_output_tokens", "total_tokens")
-# 標準API単価の比較値。契約上の請求額やサブスクリプション消費量ではない。
-# https://platform.claude.com/docs/en/about-claude/pricing
-CLAUDE_PRICE_PER_1M = {
-    "claude-opus-5-5": ("4", "20"),
-    "claude-opus-5": ("5", "25"),
-    "claude-opus-4-8": ("5", "25"),
-    "claude-opus-4-7": ("5", "25"),
-    "claude-opus-4-6": ("5", "25"),
-    "claude-opus-4-5": ("5", "25"),
-    "claude-sonnet-5": ("2", "10"),
-    "claude-sonnet-4-6": ("3", "15"),
-    "claude-sonnet-4-5": ("3", "15"),
-    "claude-haiku-4-5": ("1", "5"),
-}
+# BEGIN GENERATED: usage-model
+def _normalize_usage_model(model: object) -> str:
+    """プロバイダ接頭辞などを除き、単価表と照合できるモデル名へ変換する。"""
+    name = str(model or "").strip().lower()
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    aliases = {
+        "gemini3.8-flash": "gemini-3.8-flash",
+        "nemotron-3-ultra-550b-a55b:free": "nemotron-3-ultra-free",
+        "claude-opus-5.5": "claude-opus-5-5",
+        "claude-haiku-5.5": "claude-haiku-5-5",
+        "claude-sonnet-5.5": "claude-sonnet-5-5",
+        "muse-spark-1.3-contributor:free": "muse-spark-1.3-contributor-free",
+        "muse-spark-1.3-contributor": "muse-spark-1.3-contributor-free",
+    }
+    return aliases.get(name, name)
+# END GENERATED: usage-model
+
+
+# BEGIN GENERATED: usage-reference-cost
+LONG_CONTEXT_INPUT_TOKENS = 272_000
+
+
+def reference_price_model(model: object) -> str:
+    name = _normalize_usage_model(model)
+    if (name not in STANDARD_USAGE_RATES and name.endswith("-free")
+            and name[:-len("-free")] in STANDARD_USAGE_RATES):
+        name = name[:-len("-free")]
+    return name
+
+
+def is_long_context_usage(model: object, usage: dict) -> bool:
+    """登録済みGPTの1リクエストの入力総数で、参考単価の長文条件を判定する。"""
+    name = reference_price_model(model)
+    tokens = usage.get("input_tokens", 0)
+    return (isinstance(tokens, int) and not isinstance(tokens, bool)
+            and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
+            and tokens > LONG_CONTEXT_INPUT_TOKENS)
+
+
+def haiku_prompt_price_multiplier(model: object, usage: dict) -> int:
+    """通常入力・cache read/writeの合計が10万tokenを超えた場合は5倍。"""
+    tokens = usage.get("input_tokens", 0)
+    return 5 if (reference_price_model(model) == "claude-haiku-5-5"
+                 and isinstance(tokens, int) and not isinstance(tokens, bool)
+                 and tokens > 100_000) else 1
+
+
+def _usage_cost(model: object, usage: dict) -> Decimal | None:
+    """raw recordを正規化したtoken内訳から標準API参考換算を行う。"""
+    rates = STANDARD_USAGE_RATES.get(reference_price_model(model))
+    if rates is None or usage.get("pricing_unknown"):
+        return None
+    long_context = is_long_context_usage(model, usage)
+    haiku_multiplier = haiku_prompt_price_multiplier(model, usage)
+    return calculate_usage_cost(
+        rates, usage, input_multiplier=2 if long_context else haiku_multiplier,
+        output_multiplier=Decimal("1.5") if long_context else haiku_multiplier,
+    )
+# END GENERATED: usage-reference-cost
 
 
 def _claude_usage_record(message: dict) -> dict | None:
@@ -917,10 +1662,27 @@ def _claude_usage_record(message: dict) -> dict | None:
         "output_tokens": output,
         "reasoning_output_tokens": 0,
         "total_tokens": fresh + written + cached + output,
+        "pricing_unknown": True,
     }
-    model = str(message.get("model") or "unknown")
-    for prefix, (input_rate, output_rate) in CLAUDE_PRICE_PER_1M.items():
-        if model == prefix or model.startswith(prefix + "-"):
+    if (raw.get("speed", "standard") not in (None, "standard")
+            or raw.get("service_tier", "standard") not in (None, "standard")
+            or raw.get("inference_geo") not in (None, "", "global")):
+        return usage
+    model = _normalize_usage_model(message.get("model"))
+    reference_rates = STANDARD_USAGE_RATES.get(reference_price_model(model))
+    # 1時間単価のないモデルはTTLを分けず、共通の書き込み単価を使う。
+    if reference_rates is not None and "cache_write_input_1h" not in reference_rates:
+        usage.pop("pricing_unknown")
+        cost = _usage_cost(model, usage)
+        if cost is not None:
+            usage["cost_usd"] = cost
+            if is_long_context_usage(model, usage):
+                usage["long_context"] = True
+        return usage
+    # OpenRouter形式とAnthropic形式を同じ単価表に対応させる。
+    model = model.replace(".", "-")
+    for prefix, rates in STANDARD_USAGE_RATES.items():
+        if "cache_write_input_1h" in rates and (model == prefix or model.startswith(prefix + "-")):
             break
     else:
         return usage
@@ -929,25 +1691,24 @@ def _claude_usage_record(message: dict) -> dict | None:
     one_hour = cache_creation.get("ephemeral_1h_input_tokens", 0) if isinstance(cache_creation, dict) else None
     if (not isinstance(five_min, int) or not isinstance(one_hour, int)
             or isinstance(five_min, bool) or isinstance(one_hour, bool)
-            or five_min < 0 or one_hour < 0 or five_min + one_hour != written
-            or usage["input_tokens"] > 200_000
-            or raw.get("speed", "standard") not in (None, "standard")
-            or raw.get("service_tier", "standard") not in (None, "standard")
-            or raw.get("inference_geo") not in (None, "", "global")):
+            or five_min < 0 or one_hour < 0 or five_min + one_hour != written):
         return usage
-    rate = Decimal(input_rate)
-    cost = (Decimal(fresh) * rate + Decimal(cached) * rate * Decimal("0.1")
-            + Decimal(five_min) * rate * Decimal("1.25")
-            + Decimal(one_hour) * rate * 2 + Decimal(output) * Decimal(output_rate)) / Decimal(1_000_000)
+    cost = (Decimal(fresh) * rates["input"] + Decimal(cached) * rates["cached_input"]
+            + Decimal(five_min) * rates["cache_write_input"]
+            + Decimal(one_hour) * rates["cache_write_input_1h"]
+            + Decimal(output) * rates["output"]) / Decimal(1_000_000)
+    cost *= haiku_prompt_price_multiplier(prefix, usage)
+    usage.pop("pricing_unknown")
     usage["cost_usd"] = cost
     return usage
 
 
-def retrieve_usage(jsonl_path: Path) -> dict | None:
+def retrieve_usage(jsonl_path: Path, transcript_text: str | None = None) -> dict | None:
     """同じmessage IDの更新行は最後のusageだけを数える。"""
     records = {}
     try:
-        with jsonl_path.open(encoding="utf-8") as stream:
+        with (io.StringIO(transcript_text) if transcript_text is not None
+              else jsonl_path.open(encoding="utf-8")) as stream:
             for line_number, line in enumerate(stream):
                 try:
                     data = json.loads(line)
@@ -966,118 +1727,69 @@ def retrieve_usage(jsonl_path: Path) -> dict | None:
     except (OSError, UnicodeError) as error:
         logger.warning("Usage情報の読み込みに失敗: %s", error)
         return None
-    if not records:
-        return None
-    total = {field: 0 for field in USAGE_TOKEN_FIELDS}
-    by_model = {}
-    priced = 0
-    for model, usage in records.values():
-        entry = by_model.setdefault(model, {field: 0 for field in USAGE_TOKEN_FIELDS})
-        for field in USAGE_TOKEN_FIELDS:
-            total[field] += usage[field]
-            entry[field] += usage[field]
-        if "cost_usd" in usage:
-            priced += 1
-            entry["cost_usd"] = entry.get("cost_usd", Decimal(0)) + usage["cost_usd"]
-    total["by_model"] = by_model
-    if priced:
-        total["total_cost_usd"] = sum((entry.get("cost_usd", Decimal(0)) for entry in by_model.values()), Decimal(0))
-        if priced < len(records):
-            total["cost_incomplete"] = True
-    else:
-        total["cost_unavailable"] = True
-    return total
+    return summarize_usage(
+        ({"type": "assistant", "model": model, "usage": usage} for model, usage in records.values()),
+        estimate_missing=False,
+    )
 
 
-def build_usage_frontmatter_fields(usage: dict | None) -> list[str]:
-    if not usage:
-        return []
-    lines = ["usage:"]
-    lines.extend(f"  {field}: {usage[field]}" for field in USAGE_TOKEN_FIELDS)
-    if "total_cost_usd" in usage:
-        lines.append(f"  total_cost_usd: {usage['total_cost_usd']}")
-        if usage.get("cost_incomplete"):
-            lines.append("  cost_incomplete: true")
-    else:
-        lines.append("  cost_unavailable: true")
-    lines.append("  by_model:")
-    for model, entry in usage["by_model"].items():
-        lines.append(f"    {yaml_quote(model)}:")
-        lines.extend(f"      {field}: {entry[field]}" for field in USAGE_TOKEN_FIELDS)
-        if "cost_usd" in entry:
-            lines.append(f"      cost_usd: {entry['cost_usd']}")
-        else:
-            lines.append("      cost_unavailable: true")
-    return lines
-
-
-def load_jsonl_messages(jsonl_path: Path, start_line: int) -> tuple[list[dict], int]:
-    """
-    JSONLファイルを読み込み、start_line (1-indexed) より後ろの行を処理する。
-    user / assistant メッセージを抽出して返す。
-    読み込んだ最終行番号 (1-indexed) も返す。
-    """
+def load_jsonl_messages(jsonl_path: Path, start_line: int, transcript_text: str | None = None) -> tuple[list[dict], int]:
     messages = []
+    records = {}
     current_line = 0
+    turn = -1
     try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                current_line += 1
-                if current_line <= start_line:
-                    continue
-
-                raw_line = line
-                line = raw_line.strip()
-                if not line:
+        with (io.StringIO(transcript_text) if transcript_text is not None else jsonl_path.open(encoding="utf-8")) as stream:
+            for current_line, raw_line in enumerate(stream, 1):
+                if not raw_line.strip():
                     continue
                 try:
-                    data = json.loads(line)
-                    msg_type = data.get("type")
-
-                    if msg_type == "user":
-                        if data.get("isMeta"):
-                            continue
-
-                        msg_obj = data.get("message", {})
-                        text = extract_user_text(msg_obj)
-                        if not text.strip():
-                            continue
-
-                        if text.strip().startswith("<local-command-") or text.strip().startswith("<command-name>"):
-                            continue
-
-                        messages.append({
-                            "line_number": current_line,
-                            "type": "user_message",
-                            "message": text,
-                            "timestamp": data.get("timestamp", ""),
-                            "model": "",
-                        })
-
-                    elif msg_type == "assistant":
-                        text, model_name = extract_assistant_text_and_model(data)
-                        if not text.strip():
-                            continue
-
-                        messages.append({
-                            "line_number": current_line,
-                            "type": "agent_message",
-                            "message": text,
-                            "timestamp": data.get("timestamp", ""),
-                            "model": model_name,
-                        })
-
-                except json.JSONDecodeError as e:
+                    data = json.loads(raw_line)
+                except json.JSONDecodeError:
                     if not raw_line.endswith(("\n", "\r")):
-                        logger.debug(f"書き込み途中のJSONL最終行を次回へ延期: line {current_line}: {e}")
-                        return messages, current_line - 1
-                    logger.debug(f"JSONL parse error at line {current_line}: {e}")
+                        current_line -= 1
+                        break
                     continue
-    except Exception as e:
-        logger.warning(f"JSONL読み込み失敗: {jsonl_path}: {e}")
+                if not isinstance(data, dict) or data.get("isSidechain"):
+                    continue
+                kind = data.get("type")
+                msg = data.get("message") or {}
+                if not isinstance(msg, dict):
+                    continue
+                if kind == "user":
+                    if data.get("isMeta"):
+                        continue
+                    text = extract_user_text(msg)
+                    if text.strip().startswith(("<local-command-", "<command-name>")):
+                        continue
+                    turn += 1
+                    model = ""
+                elif kind == "assistant":
+                    text, model = extract_assistant_text_and_model(data)
+                    usage = _claude_usage_record(msg)
+                    message_id = str(msg.get("id") or data.get("uuid") or current_line)
+                    if usage is not None:
+                        records[message_id] = {"id": message_id, "type": "assistant", "model": model or "unknown",
+                            "turn_index": turn, "sequence": current_line, "usage": usage}
+                    if not text.strip():
+                        continue
+                else:
+                    continue
+                messages.append({"line_number": current_line, "sequence": current_line, "turn_index": turn,
+                    "id": str(msg.get("id") or data.get("uuid") or current_line),
+                    "type": "user_message" if kind == "user" else "agent_message",
+                    "message": text, "timestamp": data.get("timestamp", ""), "model": model})
+    except (OSError, UnicodeError) as error:
+        logger.warning("JSONL読み込み失敗: %s", type(error).__name__)
         return [], start_line
-
-    return messages, current_line
+    display = incremental_display_messages(messages)
+    # Single-message groups attach each deduplicated usage only once. The renderer later merges replies.
+    assigned = _usage_records_by_display_group([[message] for message in display], records.values())
+    for message, usage_records in zip(messages, assigned):
+        usage = summarize_usage(usage_records, estimate_missing=False)
+        if usage is not None:
+            message["usage"] = usage
+    return [message for message in messages if message["line_number"] > start_line], current_line
 
 # ============================================================
 # Markdownファイル生成・操作
@@ -1091,56 +1803,20 @@ def build_frontmatter(
     usage: dict | None = None,
     initial_quota: dict | None = None,
     final_quota: dict | None = None,
+    *, source: str | None = None, tags=None,
 ) -> str:
-    ts = format_iso(start_dt)
-    fm_lines = [
-        "---",
-        f"source: {SOURCE_NAME}",
-        *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
-        f"session_id: {yaml_quote(session_id)}",
-        f"project: {yaml_quote(cwd)}",
-        f"created: {yaml_quote(ts)}",
-        f"modified: {yaml_quote(ts)}",
-        "tags:",
-        "  - ai-conversation",
-        f"  - {SOURCE_NAME}",
-        f"message_count: {message_count}",
-    ]
-    fm_lines.extend(build_quota_frontmatter_fields(initial_quota, final_quota))
-    fm_lines.extend(build_usage_frontmatter_fields(usage))
-    fm_lines.append("---")
-    return "\n".join(fm_lines) + "\n\n"
+    return build_common_frontmatter(session_id, cwd, start_dt, start_dt, message_count,
+                                    title, source=source, tags=tags, extra_fields=build_quota_frontmatter_fields(initial_quota, final_quota) + build_usage_frontmatter_fields(usage))
 
 
-def create_md_file(
-    session_id: str,
-    cwd: str,
-    start_dt: datetime,
-    title: str | None = None,
-    usage: dict | None = None,
-    initial_quota: dict | None = None,
-    final_quota: dict | None = None,
-) -> Path:
-    date_dir = start_dt.strftime("%Y%m%d")
-    time_prefix = start_dt.strftime("%H%M%S")
-    session_key = safe_session_key(session_id) if session_id else "unknown"
-    session_key = session_key or "unknown"
-    project_name = safe_filename_component(Path(cwd).name) if cwd else ""
-
-    output_dir = OUTPUT_BASE
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if project_name:
-        filename = f"{date_dir}_{time_prefix}_{project_name}_{session_key}.md"
-    else:
-        filename = f"{date_dir}_{time_prefix}_{session_key}.md"
-
-    path = output_dir / filename
-    fm = build_frontmatter(session_id, cwd, start_dt, message_count=0, title=title,
-                           usage=usage, initial_quota=initial_quota, final_quota=final_quota)
-    quota_section = build_quota_section(initial_quota, final_quota)
-    usage_section = build_usage_section(usage)
-    content = fm + (quota_section + "\n" if quota_section else "") + (usage_section + "\n" if usage_section else "") + "<!-- last_line: 0 -->\n\n"
+def create_md_file(session_id: str, cwd: str, start_dt: datetime, title: str | None = None,
+                   usage: dict | None = None, initial_quota: dict | None = None, final_quota: dict | None = None,
+                   *, source: str | None = None, tags=None) -> Path:
+    path = note_output_path(session_id, cwd, start_dt)
+    fm = build_frontmatter(session_id, cwd, start_dt, title=title, source=source, tags=tags,
+        usage=usage, initial_quota=initial_quota, final_quota=final_quota)
+    quota = build_quota_section(initial_quota, final_quota)
+    content = fm + (quota + "\n" if quota else "") + build_usage_section(usage) + "\n<!-- last_line: 0 -->\n\n"
     atomic_write_md(path, content)
     return path
 
@@ -1204,6 +1880,61 @@ def find_existing_md(session_id: str) -> Path | None:
     return None
 # END GENERATED: find-existing-markdown
 
+# BEGIN GENERATED: incremental-storage
+def recover_incremental_state(session_id: str, cwd: str, state: dict, cursor_key: str, read_cursor) -> dict:
+    """state消失時は既存ノートを探索し、識別情報・quota・cursorを復旧する。"""
+    if not state.get("output_path"):
+        cleanup_old_states()
+        path = find_existing_md(session_id)
+        if path is None:
+            return state
+        metadata = read_markdown_metadata(path)
+        start = parse_datetime(metadata.get("created"), datetime.fromtimestamp(path.stat().st_mtime, tz=JST))
+        first, last = recover_quota_frontmatter(path.read_text(encoding="utf-8"))
+        state.update(output_path=str(path), start_time=format_iso(start), cwd=metadata.get("project") or cwd)
+        state[cursor_key] = read_cursor(path) or (0 if cursor_key == "last_line" else "")
+        state["initial_quota"] = merge_first_quota(first, state.get("initial_quota") or {})
+        state["final_quota"] = merge_first_quota(state.get("final_quota"), last)
+        logger.warning("stateを既存Markdownから復旧しました: %s", path)
+    path = Path(state["output_path"])
+    if path.exists():
+        metadata = read_markdown_metadata(path)
+        state["source"] = metadata.get("source") or state.get("source") or SOURCE_NAME
+        state["tags"] = metadata.get("tags", state.get("tags", ["ai-conversation", state["source"]]))
+    return state
+
+
+def ensure_incremental_note(session_id: str, cwd: str, state: dict, cursor_key: str,
+                            read_cursor, has_body: bool, create_note):
+    """保存済みノートの識別を保持し、本文がある場合だけ新規作成・再作成する。"""
+    path = Path(state["output_path"]) if state.get("output_path") else None
+    if path is None or not path.exists():
+        if not has_body:
+            return None
+        start = parse_datetime(state.get("start_time"), now_jst())
+        state.setdefault("cwd", cwd)
+        state.setdefault("source", SOURCE_NAME)
+        state.setdefault("tags", ["ai-conversation", state["source"]])
+        path = create_note(start, state)
+        state.update(output_path=str(path), start_time=format_iso(start))
+        state[cursor_key] = 0 if cursor_key == "last_line" else ""
+        logger.info("セッション初期化 %s -> %s", session_id[:8], path)
+    if cursor_key == "last_line":
+        try:
+            saved = int(state.get(cursor_key, 0))
+        except (TypeError, ValueError):
+            saved = 0
+    else:
+        saved = str(state.get(cursor_key, ""))
+    observed = read_cursor(path)
+    cursor = observed if observed is not None else saved
+    if observed is not None and observed != saved:
+        logger.warning("%sの不一致をMarkdownから復旧: state=%r, markdown=%r", cursor_key, saved, observed)
+    state[cursor_key] = cursor
+    save_state(session_id, state)
+    return path, cursor
+# END GENERATED: incremental-storage
+
 
 # BEGIN GENERATED: atomic-markdown-write
 def atomic_write_md(path: Path, content: str) -> None:
@@ -1244,7 +1975,10 @@ def get_last_callout_header(content: str) -> str | None:
     last_header = None
     header_lines = []
     for line in _iter_lines_outside_fences(content):
-        if line.startswith("> [!"):
+        if line == HIDDEN_USER_BOUNDARY:
+            last_header = None
+            header_lines = []
+        elif line.startswith("> [!"):
             header_lines = [line]
             last_header = line
         elif header_lines and is_callout_header_line(line):
@@ -1314,14 +2048,6 @@ def compose_markdown(new_fm_lines: list[str], body_text: str) -> str:
 # END GENERATED: frontmatter-update
 
 
-def build_usage_section(usage: dict | None) -> str:
-    if not usage:
-        return ""
-    cost = usage.get("total_cost_usd")
-    amount = f" · ${cost}" if cost is not None else " · USD換算不可"
-    return f"📈 **Usage**: {usage['total_tokens']:,} tokens{amount}\n"
-
-
 def _without_frontmatter_keys(content: str, keys: set[str]) -> str:
     match = re.match(r"^(---\s*\n)(.*?)(\n---\s*\n)", content, re.DOTALL)
     if not match:
@@ -1367,7 +2093,7 @@ def update_markdown_metadata(
         body_text = section + "\n" + body_text.lstrip("\n")
     if usage is not None:
         section = build_usage_section(usage)
-        body_text = re.sub(r"(?m)^📈 \*\*Usage\*\*:.*\n(?:\n)?", "", body_text, count=1)
+        body_text = re.sub(r"(?m)^(?:📈 \*\*Usage\*\*|💰 \*\*Usage \((?:API|USD)換算\)\*\*):.*\n(?:\n)?", "", body_text, count=1)
         body_text = section + "\n" + body_text.lstrip("\n")
     body_text = re.sub(
         r"<!--\s*last_line:.*?-->",
@@ -1390,77 +2116,56 @@ def append_messages(
     final_quota: dict | None = None,
 ) -> tuple[int, bool]:
     content = path.read_text(encoding="utf-8")
-
-    blocks = []
-    appended = 0
-    last_callout_header = get_last_callout_header(content)
-
-    for msg in messages:
-        m_type = msg["type"]
-        text = msg["message"]
-        m_model = msg.get("model", "")
-        if not text.strip():
-            continue
-
-        if m_type == "user_message":
-            callout_header = user_callout_header(msg.get("timestamp"))
-            blocks.append(
-                render_user_message_block(
-                    text,
-                    msg.get("timestamp"),
-                    continued=callout_header == last_callout_header,
-                )
-            )
-
-            last_callout_header = callout_header
-            appended += 1
-
-        elif m_type == "agent_message":
-            # 使用されたモデル名の取得
-            metadata = [f"🤖 {m_model}"] if m_model else []
-            callout_header = assistant_callout_header(AGENT_NAME, metadata)
-
-            if callout_header == last_callout_header:
-                # Claude Code のストリーミング結果が複数の agent_message に分割される
-                # ことがある。同じ callout の続きは区切り線を入れず、改行を残して連結し、
-                # 1つの回答として message_count に加算する。
-                fragment = render_assistant_message_block(
-                    text,
-                    AGENT_NAME,
-                    metadata,
-                    continued=True,
-                )
-                if blocks:
-                    blocks[-1] = blocks[-1].rstrip("\n") + "\n" + fragment + "\n\n"
-                else:
-                    content = content.rstrip("\n") + "\n"
-                    blocks.append(fragment + "\n\n")
-            else:
-                blocks.append(
-                    render_assistant_message_block(
-                        text,
-                        AGENT_NAME,
-                        metadata,
-                        extra_blank_line=True,
-                    )
-                )
-                appended += 1
-
-            last_callout_header = callout_header
-
-    if not blocks:
+    rendered, appended, changed = render_incremental_messages(content, messages)
+    if not changed:
         return 0, False
-
-    new_content = content + "\n".join(blocks)
-    final_content = update_markdown_metadata(new_content, modified_dt, appended, last_line, usage,
-                                             initial_quota, final_quota)
-    # 本文とメタデータを1回のatomic writeで確定する。
+    final_content = update_markdown_metadata(rendered, modified_dt, appended, last_line,
+                                             usage, initial_quota, final_quota)
     atomic_write_md(path, final_content)
     return appended, True
 
 # ============================================================
 # イベントハンドラ
 # ============================================================
+def read_stop_transcript(jsonl_path: Path, expected_answer: str = "") -> str:
+    """Stop時の遅延書き込みを最大2秒待ち、本文とUsage共通のsnapshotを返す。"""
+    deadline = time.monotonic() + 2.0
+    previous = None
+    stable_since = time.monotonic()
+    while True:
+        text = jsonl_path.read_text(encoding="utf-8")
+        now = time.monotonic()
+        if text != previous:
+            previous = text
+            stable_since = now
+        answer_ready = not expected_answer
+        last_answer = ""
+        last_usage_ready = False
+        complete = True
+        for line in text.splitlines(keepends=True):
+            try:
+                data = json.loads(line)
+            except ValueError:
+                if not line.endswith(("\n", "\r")):
+                    complete = False
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("type") == "assistant":
+                answer, _ = extract_assistant_text_and_model(data)
+                if answer.strip():
+                    last_answer = answer.strip()
+                    last_usage_ready = _claude_usage_record(data.get("message", {})) is not None
+        if expected_answer:
+            answer_ready = last_answer == expected_answer.strip() and last_usage_ready
+        if complete and answer_ready and now - stable_since >= 0.3:
+            return text
+        if now >= deadline:
+            logger.warning("Stop transcriptの書き込み待機が上限に達しました")
+            return text
+        time.sleep(0.05)
+
+
 @session_locked("session_id")
 def handle_stop_event(hook_input: dict) -> None:
     session_id = hook_input.get("session_id", "")
@@ -1478,90 +2183,33 @@ def handle_stop_event(hook_input: dict) -> None:
     if not jsonl_path.exists():
         logger.warning(f"JSONLファイルが存在しません: {jsonl_path}")
         return
-    current_usage = retrieve_usage(jsonl_path)
+    try:
+        transcript_text = read_stop_transcript(
+            jsonl_path, hook_input.get("last_assistant_message") or "",
+        )
+    except (OSError, UnicodeError) as error:
+        logger.warning("JSONL読み込み失敗: %s", error)
+        return
+    current_usage = retrieve_usage(jsonl_path, transcript_text)
 
     state = load_state(session_id)
-    if not state or "output_path" not in state:
-        cleanup_old_states()
-        try:
-            recovered_path = find_existing_md(session_id)
-        except ExistingMarkdownSearchError as e:
-            logger.error(f"既存Markdownの探索中にエラーが発生したため保存を見送ります: {e}")
-            return
-        if recovered_path is not None:
-            recovered_last_line = read_last_line_from_md(recovered_path) or 0
-            start_dt = datetime.fromtimestamp(recovered_path.stat().st_mtime, tz=JST)
-            recovered_content = recovered_path.read_text(encoding="utf-8")
-            first_quota, last_quota = recover_quota_frontmatter(recovered_content)
-            state = {
-                "output_path": str(recovered_path),
-                "start_time": start_dt.isoformat(),
-                "cwd": cwd,
-                "last_line": recovered_last_line,
-                "initial_quota": merge_first_quota(first_quota, state.get("initial_quota") or {}),
-                "final_quota": merge_first_quota(state.get("final_quota"), last_quota),
-            }
-            save_state(session_id, state)
-            logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
-
-    # 初回初期化
-    if not state or "output_path" not in state:
-        start_dt = now_jst()
-        path = create_md_file(
-            session_id,
-            cwd,
-            start_dt,
-            usage=current_usage,
-            initial_quota=state.get("initial_quota"),
-            final_quota=state.get("final_quota"),
-        )
-        state["output_path"] = str(path)
-        state["start_time"] = start_dt.isoformat()
-        state["cwd"] = cwd
-        state.setdefault("last_line", 0)
-        save_state(session_id, state)
-        logger.info(f"セッション初期化 {session_id[:8]} -> {path}")
-
-    path = Path(state["output_path"])
-
-    # MDファイル消失時のリカバリ
-    if not path.exists():
-        logger.warning(f"MDファイルが見つかりません: {path} → 再作成します")
-        try:
-            start_dt = datetime.fromisoformat(state.get("start_time", ""))
-            if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=JST)
-        except (ValueError, KeyError) as e:
-            logger.info(f"start_time のパースに失敗したため現在時刻を使用: {e}")
-            start_dt = now_jst()
-        path = create_md_file(
-            session_id,
-            state.get("cwd", cwd),
-            start_dt,
-            usage=current_usage,
-            initial_quota=state.get("initial_quota"),
-            final_quota=state.get("final_quota"),
-        )
-        state["output_path"] = str(path)
-        state["last_line"] = 0
-        save_state(session_id, state)
-        logger.info(f"MDファイルを再作成しました: {path}")
-
     try:
-        state_last_line = int(state.get("last_line", 0))
-    except (TypeError, ValueError):
-        state_last_line = 0
-    md_last_line = read_last_line_from_md(path)
-    last_line = md_last_line if md_last_line is not None else state_last_line
-    if md_last_line is not None and md_last_line != state_last_line:
-        logger.warning(
-            f"last_lineの不一致をMarkdownから復旧: state={state_last_line}, markdown={md_last_line}"
-        )
-        state["last_line"] = md_last_line
-        save_state(session_id, state)
+        state = recover_incremental_state(session_id, cwd, state, "last_line", read_last_line_from_md)
+    except ExistingMarkdownSearchError as error:
+        logger.error("既存Markdownの探索中にエラーが発生したため保存を見送ります: %s", type(error).__name__)
+        return
+    preview, _ = load_jsonl_messages(jsonl_path, 0, transcript_text)
+    prepared = ensure_incremental_note(session_id, cwd, state, "last_line", read_last_line_from_md,
+        any(str(message.get("message", "")).strip() for message in preview),
+        lambda start, saved: create_md_file(session_id, saved.get("cwd", cwd), start,
+            usage=current_usage, initial_quota=saved.get("initial_quota"), final_quota=saved.get("final_quota"),
+            source=saved.get("source"), tags=saved.get("tags")))
+    if prepared is None:
+        return
+    path, last_line = prepared
 
     # メッセージのロードと追記
-    new_messages, new_last_line = load_jsonl_messages(jsonl_path, last_line)
+    new_messages, new_last_line = load_jsonl_messages(jsonl_path, last_line, transcript_text)
 
     if new_messages:
         appended, updated = append_messages(
@@ -1582,14 +2230,17 @@ def handle_stop_event(hook_input: dict) -> None:
         state["last_line"] = new_last_line
         save_state(session_id, state)
 
-    if (current_usage is not None or state.get("final_quota")) and not new_messages:
+    # All answer Usage, including late or updated records, comes from the same Stop snapshot.
+    if current_usage is not None or state.get("final_quota"):
         content = path.read_text(encoding="utf-8")
-        refreshed = update_markdown_metadata(
-            content, now_jst(), 0, new_last_line, current_usage,
-            state.get("initial_quota"), state.get("final_quota"),
-        )
+        all_messages, _ = load_jsonl_messages(jsonl_path, 0, transcript_text)
+        refreshed = update_markdown_metadata(content, now_jst(), 0, new_last_line, current_usage,
+            state.get("initial_quota"), state.get("final_quota"))
+        refreshed = refresh_answer_usage_metadata(refreshed, all_messages)
+        refreshed = preserve_modified_if_unchanged(content, refreshed)
         if refreshed != content:
             atomic_write_md(path, refreshed)
+    save_state(session_id, state)
 
 # ============================================================
 # メイン

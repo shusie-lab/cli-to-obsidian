@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "3.2.0"
+__version__ = "3.8.0"
 
 import json
 import math
@@ -29,6 +29,7 @@ from logging.handlers import RotatingFileHandler
 # ============================================================
 # 定数
 # ============================================================
+LOGGER_NAME = "obsidian_save_antigravity"
 JST = timezone(timedelta(hours=9))
 
 OBSIDIAN_VAULT = Path(
@@ -78,19 +79,79 @@ SAFE_SESSION_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 # ============================================================
 # ロギング
 # ============================================================
-def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("obsidian_save_antigravity")
-    # デフォルトは INFO。環境変数 DEBUG で切り替え可能。
-    if os.environ.get("DEBUG"):
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
+# BEGIN GENERATED: utilities
+def now_jst() -> datetime:
+    return datetime.now(JST)
 
+
+def yaml_quote(value: object) -> str:
+    """JSON互換の引用形式でYAML文字列を安全に生成する。"""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def safe_filename_component(value: str) -> str:
+    """値を単一の安全なファイル名要素へ変換する。"""
+    return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
+
+
+def _try_parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).astimezone(JST)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str) and value:
+        try:
+            normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(JST)
+        except (OSError, OverflowError, TypeError, ValueError):
+            pass
+    return None
+
+
+def parse_datetime(value: object, default: datetime | None = None) -> datetime:
+    parsed = _try_parse_datetime(value)
+    if parsed is not None:
+        return parsed
+    return default or datetime.now(JST)
+
+
+def format_iso(value: datetime) -> str:
+    return value.astimezone(JST).isoformat(timespec="seconds")
+
+
+def _finite_number(value: object) -> float | None:
+    """APIレスポンスの数値を厳密に検証する。boolやNaN/Infinityは受け付けない。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def format_model_name(model_name: str, effort: str = "") -> str:
+    """モデル名に reasoning effort を付加して表示用の名前へ変換する。"""
+    model = str(model_name or "").strip()
+    effort_value = str(effort or "").strip()
+    if not model or not effort_value:
+        return model
+    if model.endswith(f"-{effort_value}"):
+        return model
+    return f"{model}-{effort_value}"
+# END GENERATED: utilities
+
+# BEGIN GENERATED: logging-setup
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger(LOGGER_NAME)
     if logger.handlers:
         return logger
-
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
+    logger.setLevel(logging.DEBUG if os.environ.get("DEBUG") else logging.INFO)
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     file_log_error = None
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -100,20 +161,22 @@ def setup_logger() -> logging.Logger:
             backupCount=3,
             encoding="utf-8",
         )
-        handler.setFormatter(fmt)
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
     except OSError as e:
         file_log_error = e
-
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(fmt)
-    logger.addHandler(stderr_handler)
+    stderr = logging.StreamHandler()
+    stderr.setFormatter(formatter)
+    logger.addHandler(stderr)
     if file_log_error is not None:
-        logger.warning(f"ファイルログを初期化できないためstderrのみ使用します: {file_log_error}")
+        logger.warning("ファイルログを初期化できないためstderrのみ使用します: %s", file_log_error)
     return logger
 
 
 logger = setup_logger()
+# END GENERATED: logging-setup
+
+
 AGY_QUOTA_TIMEOUT_SECONDS = 20
 
 
@@ -206,25 +269,14 @@ def try_session_lock(session_id: str, *, is_key: bool = False):
         lock_file.close()
 
 
-def session_locked(input_key: str):
-    """hook input内のsession idを使って関数を排他実行する。"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(hook_input: dict):
-            session_id = hook_input.get(input_key, "")
-            if not session_id:
-                return func(hook_input)
-            with session_lock(str(session_id)):
-                return func(hook_input)
-        return wrapper
-    return decorator
-
-
 def load_state(session_id: str) -> dict:
     path = state_path(session_id)
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("stateはJSONオブジェクトが必要です")
+            return data
         except Exception as error:
             logger.info("stateファイルの読み込みに失敗しました（破損の可能性）: %s: %s", path, error)
             return {}
@@ -280,6 +332,20 @@ def cleanup_old_states() -> None:
 # ユーティリティ
 # ============================================================
 # BEGIN GENERATED: incremental-utilities
+def session_locked(input_key: str):
+    """hook input内のsession idを使って関数を排他実行する。"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(hook_input: dict):
+            session_id = hook_input.get(input_key, "")
+            if not session_id:
+                return func(hook_input)
+            with session_lock(str(session_id)):
+                return func(hook_input)
+        return wrapper
+    return decorator
+
+
 def read_stdin() -> dict:
     """hookの標準入力を読み、空入力や不正JSONでは空のdictを返す。"""
     try:
@@ -289,24 +355,6 @@ def read_stdin() -> dict:
     except Exception as error:
         logger.info("stdinの読み込みまたはJSONパースに失敗しました: %s", error)
     return {}
-
-
-def now_jst() -> datetime:
-    return datetime.now(JST)
-
-
-def format_iso(value: datetime) -> str:
-    return value.isoformat(timespec="seconds")
-
-
-def yaml_quote(value: object) -> str:
-    """JSON互換の引用形式でYAML文字列を安全に生成する。"""
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def safe_filename_component(value: str) -> str:
-    """値を単一の安全なファイル名要素へ変換する。"""
-    return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
 
 
 def merge_first_quota(first: dict | None, observed: dict) -> dict:
@@ -783,7 +831,247 @@ def render_assistant_message_block(
     return f"{assistant_callout_header(agent_name, metadata)}{separator}{body}\n\n"
 # END GENERATED: markdown-rendering
 
+# BEGIN GENERATED: full-session-display
+def _display_message_groups(messages: Iterable[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    groups: List[List[Dict[str, Any]]] = []
+    for message in messages:
+        if (
+            message["type"] == "assistant"
+            and groups
+            and groups[-1][0]["type"] == "assistant"
+            and groups[-1][0].get("model", "") == message.get("model", "")
+            and groups[-1][0].get("turn_index") == message.get("turn_index")
+        ):
+            groups[-1].append(message)
+        else:
+            groups.append([message])
+    return groups
 
+
+def _usage_records_by_display_group(
+    groups: List[List[Dict[str, Any]]], usage_records: Iterable[Dict[str, Any]]
+) -> List[List[Dict[str, Any]]]:
+    """本文のないassistant usageを、同じユーザーターン内の最寄り回答calloutへ割り当てる。"""
+    result: List[List[Dict[str, Any]]] = [[] for _ in groups]
+    message_groups = {
+        str(message.get("id")): group_index
+        for group_index, group in enumerate(groups)
+        for message in group
+        if message.get("type") == "assistant" and message.get("id")
+    }
+    assistant_groups = [
+        index for index, group in enumerate(groups)
+        if group and group[0].get("type") == "assistant"
+    ]
+    for record in usage_records:
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message_id = str(record.get("id") or "")
+        target = message_groups.get(message_id)
+        if target is None:
+            sequence = record.get("sequence")
+            turn_index = record.get("turn_index")
+            candidates = [
+                index for index in assistant_groups
+                if turn_index is None or groups[index][0].get("turn_index") == turn_index
+            ]
+            model = str(record.get("model") or "")
+            same_model = [index for index in candidates if str(groups[index][0].get("model") or "") == model]
+            if same_model:
+                candidates = same_model
+            if not candidates:
+                continue
+
+            def distance(group_index: int) -> Tuple[int, int, int]:
+                positions = [
+                    message.get("sequence") for message in groups[group_index]
+                    if isinstance(message.get("sequence"), int)
+                ]
+                if not isinstance(sequence, int) or not positions:
+                    return (0, group_index, group_index)
+                start, end = min(positions), max(positions)
+                gap = start - sequence if sequence < start else sequence - end if sequence > end else 0
+                follows_record = 0 if start >= sequence else 1
+                return (gap, follows_record, group_index)
+
+            target = min(candidates, key=distance)
+        result[target].append(record)
+    return result
+# END GENERATED: full-session-display
+
+# BEGIN GENERATED: incremental-rendering
+HIDDEN_USER_BOUNDARY = "<!-- user_turn_boundary -->"
+
+
+def incremental_display_messages(messages: list[dict], model_name: str = "", effort: str = "") -> list[dict]:
+    """増分入力を共通の表示recordへ変換する。非表示のuserも境界として残す。"""
+    result = []
+    turn = -1
+    for index, message in enumerate(messages):
+        role = {"user_message": "user", "agent_message": "assistant"}.get(message.get("type"))
+        if role is None:
+            continue
+        if role == "user":
+            turn += 1
+        result.append(dict(message, type=role, text=message.get("message", ""),
+            model=format_model_name(message.get("model") or model_name, message.get("effort") or effort),
+            turn_index=message.get("turn_id") or message.get("turn_index", turn), sequence=index))
+    return result
+
+
+def render_incremental_messages(content: str, messages: list[dict], *, model_name: str = "", effort: str = "",
+                                user_transform=None, reference_renderer=None) -> tuple[str, int, bool]:
+    normalized = incremental_display_messages(messages, model_name, effort)
+    groups = _display_message_groups(normalized)
+    last_header = get_last_callout_header(content)
+    if (last_header is None and HIDDEN_USER_BOUNDARY not in content
+            and not any(message["text"].strip() for message in normalized)):
+        return content, 0, False
+    blocks = []
+    appended = 0
+    previous_turn = None
+    for group in groups:
+        message = group[0]
+        turn = message.get("turn_index")
+        if message["type"] == "assistant" and (message.get("after_turn_boundary") or
+                (previous_turn is not None and previous_turn != turn)):
+            blocks.append(HIDDEN_USER_BOUNDARY + "\n\n")
+            last_header = None
+        previous_turn = turn
+        text = message["text"]
+        if message["type"] == "user":
+            if not text.strip():
+                blocks.append(HIDDEN_USER_BOUNDARY + "\n\n")
+                last_header = None
+                continue
+            display_text, reference = user_transform(text) if user_transform else (text, None)
+            header = user_callout_header(message.get("timestamp"))
+            user_block = render_user_message_block(display_text, message.get("timestamp"), continued=header == last_header)
+            if reference is not None and reference_renderer is not None:
+                user_block += reference_renderer(reference) + "\n\n"
+            blocks.append(user_block)
+            last_header = REFERENCE_CALLOUT_HEADER if reference is not None else header
+            appended += 1
+            continue
+        visible = [item for item in group if item["text"].strip()]
+        if not visible:
+            continue
+        usage = subagent_usage = None
+        for item in group:
+            if item.get("usage"):
+                usage = _merge_usage_summaries(usage, item["usage"])
+            if item.get("subagent_usage"):
+                subagent_usage = _merge_usage_summaries(subagent_usage, item["subagent_usage"])
+        model = message.get("model", "")
+        metadata = [f"🤖 {model}"] if model else []
+        if usage:
+            metadata.append(format_message_usage(usage, subagent_usage))
+        body = visible[0]["text"]
+        for item in visible[1:]:
+            separator = "\n\n" if item.get("after_tool_use") else "\n"
+            body = body.rstrip("\n") + separator + item["text"]
+        header = assistant_callout_header(AGENT_NAME, metadata)
+        current_model = next((line for line in header.splitlines() if line.startswith("> <small>🤖 ")), "")
+        previous_model = next((line for line in (last_header or "").splitlines() if line.startswith("> <small>🤖 ")), "")
+        continued = bool(last_header and last_header.splitlines()[0] == f"> [!NOTE] {AGENT_NAME}" and previous_model == current_model)
+        if continued:
+            fragment = render_assistant_message_block(body, AGENT_NAME, metadata, continued=True)
+            separator = "\n\n" if message.get("after_tool_use") else "\n"
+            if blocks:
+                blocks[-1] = blocks[-1].rstrip("\n") + separator + fragment + "\n\n"
+            else:
+                content = content.rstrip("\n") + separator
+                blocks.append(fragment + "\n\n")
+        else:
+            blocks.append(render_assistant_message_block(body, AGENT_NAME, metadata, extra_blank_line=True))
+            appended += 1
+        last_header = header
+    return content + "".join(blocks), appended, bool(blocks)
+# END GENERATED: incremental-rendering
+
+# BEGIN GENERATED: note-metadata
+def build_common_frontmatter(
+    session_id: str, cwd: str, created: datetime, modified: datetime,
+    count: int, title: str | None = None, *, source: str | None = None,
+    tags: list[str] | None = None, extra_fields=(),
+) -> str:
+    source = SOURCE_NAME if source is None else source
+    lines = [
+        "---", f"source: {source}",
+        *([f"title: {yaml_quote(title)}"] if title is not None else []),
+        f"session_id: {yaml_quote(session_id)}", f"project: {yaml_quote(cwd)}",
+        f"created: {yaml_quote(format_iso(created))}",
+        f"modified: {yaml_quote(format_iso(modified))}", "tags:",
+    ]
+    for tag in tags if tags is not None else ["ai-conversation", source]:
+        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
+        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
+        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
+        lines.append(f"  - {value}")
+    lines.append(f"message_count: {count}")
+    lines.extend(extra_fields)
+    lines.append("---")
+    return "\n".join(lines) + "\n\n"
+
+
+def note_output_path(session_id: str, cwd: str, created: datetime) -> Path:
+    project = safe_filename_component(Path(cwd).name) if cwd else ""
+    prefix = f"{created:%Y%m%d}_{created:%H%M%S}"
+    if project:
+        prefix += f"_{project}"
+    return OUTPUT_BASE / f"{prefix}_{safe_session_key(session_id) if session_id else 'unknown'}.md"
+
+
+def read_markdown_metadata(path: Path) -> dict:
+    """標準ライブラリで、このプロジェクトのfrontmatterの識別項目だけを読む。"""
+    content = path.read_text(encoding="utf-8")
+    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        return {}
+    result = {}
+    in_tags = False
+    for line in match.group(1).splitlines():
+        if line.startswith("tags:"):
+            in_tags = True
+            result["tags"] = []
+            continue
+        if in_tags and line.startswith("  - "):
+            raw = line[4:].strip()
+            try:
+                tag = json.loads(raw)
+            except ValueError:
+                tag = raw
+            if isinstance(tag, str):
+                result["tags"].append(tag)
+            continue
+        if line and not line.startswith((" ", "\t")):
+            in_tags = False
+        if line.startswith(("source:", "created:", "title:", "session_id:", "project:")):
+            key, raw = line.split(":", 1)
+            try:
+                value = json.loads(raw.strip())
+            except ValueError:
+                value = raw.strip()
+            if isinstance(value, str):
+                result[key] = value
+    return result
+
+
+def preserve_modified_if_unchanged(content: str, refreshed: str) -> str:
+    """更新時刻以外が一致するなら既存ノートをそのまま返す。"""
+    # Scope to frontmatter, so an assistant's code or prose is never replaced.
+    pattern = r"\A(---\s*\n)(.*?)(\n---\s*\n)"
+    old = re.match(pattern, content, re.DOTALL)
+    new = re.match(pattern, refreshed, re.DOTALL)
+    if not old or not new:
+        return refreshed
+    modified = next((line for line in old.group(2).splitlines() if line.startswith("modified:")), None)
+    if modified is None:
+        return refreshed
+    fields = re.sub(r"(?m)^modified:.*$", lambda _: modified, new.group(2), count=1)
+    unchanged_time = new.group(1) + fields + new.group(3) + refreshed[new.end():]
+    return content if unchanged_time == content else refreshed
+# END GENERATED: note-metadata
 
 
 # ============================================================
@@ -880,7 +1168,7 @@ def load_jsonl_messages(jsonl_path: Path) -> list:
             if model_name:
                 current_model = model_name
             text = extract_user_text(msg.get("content"))
-            if text:
+            if text is not None:
                 final_messages.append({
                     "step_index": msg.get("step_index", 0),
                     "type": "user_message",
@@ -1203,59 +1491,17 @@ def build_frontmatter(
     start_dt: datetime,
     message_count: int = 0,
     title: str | None = None,
+    *, source: str | None = None, tags=None,
 ) -> str:
-    ts = format_iso(start_dt)
-
-    fm_lines = [
-        "---",
-        f"source: {SOURCE_NAME}",
-        *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
-        f"session_id: {yaml_quote(session_id)}",
-        f"project: {yaml_quote(cwd)}",
-        f"created: {yaml_quote(ts)}",
-        f"modified: {yaml_quote(ts)}",
-        "tags:",
-        "  - ai-conversation",
-        f"  - {SOURCE_NAME}",
-        f"message_count: {message_count}",
-    ]
-    fm_lines.append("---")
-    fm_text = "\n".join(fm_lines) + "\n\n"
-    return fm_text
+    return build_common_frontmatter(session_id, cwd, start_dt, start_dt, message_count,
+                                    title, source=source, tags=tags, extra_fields=())
 
 
-def create_md_file(
-    session_id: str,
-    cwd: str,
-    start_dt: datetime,
-    title: str | None = None,
-) -> Path:
-    date_dir = start_dt.strftime("%Y%m%d")
-    time_prefix = start_dt.strftime("%H%M%S")
-    session_key = safe_session_key(session_id) if session_id else "unknown"
-    session_key = session_key or "unknown"
-
-    # プロジェクト名の取得
-    project_name = safe_filename_component(Path(cwd).name) if cwd else ""
-
-    output_dir = OUTPUT_BASE
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if project_name:
-        filename = f"{date_dir}_{time_prefix}_{project_name}_{session_key}.md"
-    else:
-        filename = f"{date_dir}_{time_prefix}_{session_key}.md"
-
-    path = output_dir / filename
-    fm = build_frontmatter(
-        session_id,
-        cwd,
-        start_dt,
-        title=title,
-        message_count=0,
-    )
-    content = fm + "<!-- last_id: -->\n\n"
-    atomic_write_md(path, content)
+def create_md_file(session_id: str, cwd: str, start_dt: datetime, title: str | None = None,
+                   *, source: str | None = None, tags=None) -> Path:
+    path = note_output_path(session_id, cwd, start_dt)
+    fm = build_frontmatter(session_id, cwd, start_dt, title=title, source=source, tags=tags)
+    atomic_write_md(path, fm + "<!-- last_id: -->\n\n")
     return path
 
 
@@ -1317,6 +1563,61 @@ def find_existing_md(session_id: str) -> Path | None:
         )
     return None
 # END GENERATED: find-existing-markdown
+
+# BEGIN GENERATED: incremental-storage
+def recover_incremental_state(session_id: str, cwd: str, state: dict, cursor_key: str, read_cursor) -> dict:
+    """state消失時は既存ノートを探索し、識別情報・quota・cursorを復旧する。"""
+    if not state.get("output_path"):
+        cleanup_old_states()
+        path = find_existing_md(session_id)
+        if path is None:
+            return state
+        metadata = read_markdown_metadata(path)
+        start = parse_datetime(metadata.get("created"), datetime.fromtimestamp(path.stat().st_mtime, tz=JST))
+        first, last = recover_quota_frontmatter(path.read_text(encoding="utf-8"))
+        state.update(output_path=str(path), start_time=format_iso(start), cwd=metadata.get("project") or cwd)
+        state[cursor_key] = read_cursor(path) or (0 if cursor_key == "last_line" else "")
+        state["initial_quota"] = merge_first_quota(first, state.get("initial_quota") or {})
+        state["final_quota"] = merge_first_quota(state.get("final_quota"), last)
+        logger.warning("stateを既存Markdownから復旧しました: %s", path)
+    path = Path(state["output_path"])
+    if path.exists():
+        metadata = read_markdown_metadata(path)
+        state["source"] = metadata.get("source") or state.get("source") or SOURCE_NAME
+        state["tags"] = metadata.get("tags", state.get("tags", ["ai-conversation", state["source"]]))
+    return state
+
+
+def ensure_incremental_note(session_id: str, cwd: str, state: dict, cursor_key: str,
+                            read_cursor, has_body: bool, create_note):
+    """保存済みノートの識別を保持し、本文がある場合だけ新規作成・再作成する。"""
+    path = Path(state["output_path"]) if state.get("output_path") else None
+    if path is None or not path.exists():
+        if not has_body:
+            return None
+        start = parse_datetime(state.get("start_time"), now_jst())
+        state.setdefault("cwd", cwd)
+        state.setdefault("source", SOURCE_NAME)
+        state.setdefault("tags", ["ai-conversation", state["source"]])
+        path = create_note(start, state)
+        state.update(output_path=str(path), start_time=format_iso(start))
+        state[cursor_key] = 0 if cursor_key == "last_line" else ""
+        logger.info("セッション初期化 %s -> %s", session_id[:8], path)
+    if cursor_key == "last_line":
+        try:
+            saved = int(state.get(cursor_key, 0))
+        except (TypeError, ValueError):
+            saved = 0
+    else:
+        saved = str(state.get(cursor_key, ""))
+    observed = read_cursor(path)
+    cursor = observed if observed is not None else saved
+    if observed is not None and observed != saved:
+        logger.warning("%sの不一致をMarkdownから復旧: state=%r, markdown=%r", cursor_key, saved, observed)
+    state[cursor_key] = cursor
+    save_state(session_id, state)
+    return path, cursor
+# END GENERATED: incremental-storage
 
 # BEGIN GENERATED: frontmatter-update
 def update_frontmatter_fields(
@@ -1430,7 +1731,10 @@ def get_last_callout_header(content: str) -> str | None:
     last_header = None
     header_lines = []
     for line in _iter_lines_outside_fences(content):
-        if line.startswith("> [!"):
+        if line == HIDDEN_USER_BOUNDARY:
+            last_header = None
+            header_lines = []
+        elif line.startswith("> [!"):
             header_lines = [line]
             last_header = line
         elif header_lines and is_callout_header_line(line):
@@ -1452,84 +1756,14 @@ def append_messages(
     current_quota: dict | None = None,
     initial_quota: dict | None = None,
 ) -> tuple[str, int, bool]:
+    last_id = str(messages[-1].get("step_index", "")) if messages else ""
     content = path.read_text(encoding="utf-8")
-
-    blocks = []
-    last_id = ""
-    appended = 0
-    last_callout_header = get_last_callout_header(content)
-
-    for msg in messages:
-        m_type = msg.get("type", "")
-        msg_id = str(msg.get("step_index", ""))
-        text = msg.get("message", "")
-        m_model = msg.get("model", "")
-        
-        if not text.strip():
-            last_id = msg_id
-            continue
-
-        if m_type == "user_message":
-            callout_header = user_callout_header(msg.get("timestamp"))
-            blocks.append(
-                render_user_message_block(
-                    text,
-                    msg.get("timestamp"),
-                    continued=callout_header == last_callout_header,
-                )
-            )
-
-            last_callout_header = callout_header
-            appended += 1
-
-        elif m_type == "agent_message":
-            metadata = [f"🤖 {m_model}"] if m_model else []
-            callout_header = assistant_callout_header(AGENT_NAME, metadata)
-
-            if callout_header == last_callout_header:
-                # Antigravity のストリーミング結果が複数の agent_message に分割される
-                # ことがある。同じ callout の続きは区切り線を入れず、改行を残して連結し、
-                # 1つの回答として message_count に加算する。
-                fragment = render_assistant_message_block(
-                    text,
-                    AGENT_NAME,
-                    metadata,
-                    continued=True,
-                )
-                if blocks:
-                    blocks[-1] = blocks[-1].rstrip("\n") + "\n" + fragment + "\n\n"
-                else:
-                    content = content.rstrip("\n") + "\n"
-                    blocks.append(fragment + "\n\n")
-            else:
-                blocks.append(
-                    render_assistant_message_block(
-                        text,
-                        AGENT_NAME,
-                        metadata,
-                        extra_blank_line=True,
-                    )
-                )
-                appended += 1
-
-            last_callout_header = callout_header
-        last_id = msg_id
-
-    if not blocks:
-        logger.info(f"追記対象のブロックがありませんでした（全メッセージがスキップ）: last_id={last_id!r}")
-        return last_id, appended, False
-
-    content += "\n".join(blocks)
-    final_content = update_markdown_metadata(
-        content,
-        modified_dt,
-        appended,
-        last_id,
-        initial_quota=initial_quota,
-        current_quota=current_quota,
-    )
+    rendered, appended, changed = render_incremental_messages(content, messages)
+    if not changed:
+        return last_id, 0, False
+    final_content = update_markdown_metadata(rendered, modified_dt, appended, last_id,
+                                             initial_quota, current_quota)
     atomic_write_md(path, final_content)
-
     return last_id, appended, True
 
 
@@ -1549,90 +1783,25 @@ def handle_stop_event(hook_input: dict) -> None:
     if not transcript_path:
         logger.info("transcriptPath が未提供のため session_id から JSONL を探索します")
 
-    state = load_state(session_id)
-    if not state:
-        cleanup_old_states()
-        try:
-            recovered_path = find_existing_md(session_id)
-        except ExistingMarkdownSearchError as e:
-            logger.error(f"既存Markdownの探索中にエラーが発生したため保存を見送ります: {e}")
-            return
-        if recovered_path is not None:
-            recovered_last_id = read_last_id_from_md(recovered_path) or ""
-            start_dt = datetime.fromtimestamp(recovered_path.stat().st_mtime, tz=JST)
-            state = {
-                "output_path": str(recovered_path),
-                "start_time": start_dt.isoformat(),
-                "cwd": cwd,
-                "last_id": recovered_last_id,
-                "message_count": 0,
-            }
-            try:
-                recovered_content = recovered_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError) as error:
-                logger.warning(f"既存Markdownのquota履歴を読み取れませんでした: {error}")
-            else:
-                recovered_initial, recovered_final = recover_quota_frontmatter(recovered_content)
-                if recovered_initial:
-                    state["initial_quota"] = recovered_initial
-                if recovered_final:
-                    state["final_quota"] = recovered_final
-            save_state(session_id, state)
-            logger.warning(f"stateを既存Markdownから復旧しました: {recovered_path}")
-
-    if not state or "output_path" not in state:
-        start_dt = now_jst()
-        path = create_md_file(
-            session_id,
-            cwd,
-            start_dt,
-        )
-        state["output_path"] = str(path)
-        state["start_time"] = start_dt.isoformat()
-        state["cwd"] = cwd
-        state.setdefault("last_id", "")
-        state.setdefault("message_count", 0)
-        save_state(session_id, state)
-        logger.info(f"セッション初期化 {session_id[:8]} -> {path}")
-
-    path = Path(state["output_path"])
-
-    # MDファイルが存在しない場合（手動削除・Vault移動等）はリカバリ
-    if not path.exists():
-        logger.warning(f"MDファイルが見つかりません: {path} → 再作成します")
-        try:
-            start_dt = datetime.fromisoformat(state.get("start_time", ""))
-            if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=JST)
-        except (ValueError, KeyError) as e:
-            logger.info(f"start_time のパースに失敗したため現在時刻を使用: {e}")
-            start_dt = now_jst()
-        path = create_md_file(
-            session_id,
-            state.get("cwd", cwd),
-            start_dt,
-        )
-        state["output_path"] = str(path)
-        state["last_id"] = ""  # 再作成時は全メッセージを再取得
-        save_state(session_id, state)
-        logger.info(f"MDファイルを再作成しました: {path}")
-
-    state_last_id = str(state.get("last_id", ""))
-    md_last_id = read_last_id_from_md(path)
-    last_id = md_last_id if md_last_id is not None else state_last_id
-    if md_last_id is not None and md_last_id != state_last_id:
-        logger.warning(
-            f"last_idの不一致をMarkdownから復旧: state={state_last_id!r}, markdown={md_last_id!r}"
-        )
-        state["last_id"] = md_last_id
-        save_state(session_id, state)
-    
     jsonl_path = find_jsonl_path(session_id, transcript_path)
     if not jsonl_path:
-        logger.warning(f"JSONLファイルが見つかりません: session={session_id}")
         return
-
     all_messages = load_jsonl_messages(jsonl_path)
+
+    state = load_state(session_id)
+    try:
+        state = recover_incremental_state(session_id, cwd, state, "last_id", read_last_id_from_md)
+    except ExistingMarkdownSearchError as error:
+        logger.error("既存Markdownの探索中にエラーが発生したため保存を見送ります: %s", type(error).__name__)
+        return
+    prepared = ensure_incremental_note(session_id, cwd, state, "last_id", read_last_id_from_md,
+        any(str(message.get("message", "")).strip() for message in all_messages),
+        lambda start, saved: create_md_file(session_id, saved.get("cwd", cwd), start,
+                                           source=saved.get("source"), tags=saved.get("tags")))
+    if prepared is None:
+        return
+    path, last_id = prepared
+
     new_messages = get_new_messages(all_messages, last_id)
     if new_messages:
         current_quota = retrieve_quota()
@@ -1653,7 +1822,6 @@ def handle_stop_event(hook_input: dict) -> None:
         logger.info(f"{appended}件追記完了 {session_id[:8]}")
     else:
         save_state(session_id, state)
-
 
 
 # メイン

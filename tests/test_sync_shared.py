@@ -1,4 +1,5 @@
 import ast
+import copy
 import json
 import os
 import shutil
@@ -28,7 +29,7 @@ class TestSyncShared(unittest.TestCase):
 
     def test_no_identical_top_level_function_remains_outside_generated_blocks(self):
         implementations = {}
-        for script_name in ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py"):
+        for script_name in ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"):
             content = (sync_shared.ROOT / script_name).read_text(encoding="utf-8")
             generated_ranges = []
             start = None
@@ -50,6 +51,58 @@ class TestSyncShared(unittest.TestCase):
 
         duplicates = [locations for locations in implementations.values() if len(locations) > 1]
         self.assertEqual(duplicates, [])
+
+    def test_equivalent_functions_have_one_generated_source(self):
+        class Canonical(ast.NodeTransformer):
+            def visit_FunctionDef(self, node):
+                node = self.generic_visit(node)
+                node.returns = None
+                node.type_comment = None
+                if (node.body and isinstance(node.body[0], ast.Expr)
+                        and isinstance(node.body[0].value, ast.Constant)
+                        and isinstance(node.body[0].value.value, str)):
+                    node.body.pop(0)
+                return node
+
+            def visit_arg(self, node):
+                node.annotation = None
+                node.type_comment = None
+                return node
+
+            def visit_AnnAssign(self, node):
+                return ast.Assign(targets=[self.visit(node.target)], value=self.visit(node.value))
+
+        implementations = {}
+        for script in sorted({name for targets in sync_shared.BLOCK_TARGETS.values() for name in targets}):
+            content = (sync_shared.ROOT / script).read_text(encoding="utf-8")
+            source_by_line = {}
+            block = None
+            for index, line in enumerate(content.splitlines(), 1):
+                if line.startswith("# BEGIN GENERATED: "):
+                    block = line.split(": ", 1)[1]
+                source_by_line[index] = block
+                if line.startswith("# END GENERATED: "):
+                    block = None
+            for node in ast.parse(content).body:
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+                signature = ast.dump(Canonical().visit(copy.deepcopy(node)), include_attributes=False)
+                implementations.setdefault(signature, []).append((script, node.name, source_by_line[node.lineno]))
+        for copies in implementations.values():
+            if len(copies) < 2:
+                continue
+            sources = {item[2] for item in copies}
+            self.assertNotIn(None, sources, copies)
+            self.assertEqual(len(sources), 1, copies)
+
+    def test_common_infrastructure_is_registered_for_all_five(self):
+        scripts = {"codex_save.py", "agy_save.py", "claude_save.py", "opencode_save.py", "pi_save.py"}
+        for block in ("utilities", "logging-setup", "session-storage", "note-metadata",
+                      "find-existing-markdown", "markdown-rendering", "full-session-display"):
+            self.assertEqual(set(sync_shared.BLOCK_TARGETS[block]), scripts, block)
+        self.assertEqual(set(sync_shared.BLOCK_TARGETS["usage-summary"]), scripts - {"agy_save.py"})
+        self.assertEqual(set(sync_shared.BLOCK_TARGETS["usage-reference-cost"]),
+                         scripts - {"agy_save.py"})
 
     def test_check_detects_a_stale_generated_block(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +196,17 @@ class TestSyncShared(unittest.TestCase):
                 "transcriptPath": str(transcript),
                 "workspacePaths": [str(root / "project")],
             }
+        elif script_name == "pi_save.py":
+            entries = [
+                {"id": "u1", "type": "message", "timestamp": "2026-10-05T01:00:00Z",
+                 "message": {"role": "user", "content": "Standalone question"}},
+                {"id": "a1", "type": "message", "timestamp": "2026-10-05T01:00:01Z",
+                 "message": {"role": "assistant", "model": "gpt-6-luna",
+                             "content": [{"type": "text", "text": "Standalone answer"}],
+                             "usage": {"input": 10, "output": 2}}},
+            ]
+            return None, {"session_id": "standalone-pi", "cwd": str(root / "project"),
+                          "created": entries[0]["timestamp"], "entries": entries, "branch": entries}
         else:
             return None, {
                 "session_id": "standalone-opencode",
@@ -172,7 +236,7 @@ class TestSyncShared(unittest.TestCase):
         return transcript, hook
 
     def test_each_generated_script_saves_and_deduplicates_without_shared_files(self):
-        for script_name in ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py"):
+        for script_name in ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"):
             with self.subTest(script=script_name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 script = root / script_name

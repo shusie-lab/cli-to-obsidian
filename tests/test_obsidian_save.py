@@ -829,7 +829,7 @@ Response text
     def test_codex_usage_is_summed_per_record_and_model(self):
         transcript = self.test_dir / "usage.jsonl"
         records = [
-            {"type": "turn_context", "payload": {"model": "gpt-5.6-luna"}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-luna"}},
             {
                 "type": "token_usage_record",
                 "payload": {
@@ -844,7 +844,7 @@ Response text
                     "thread_token_usage": {"total_tokens": 999999},
                 },
             },
-            {"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}},
+            {"type": "turn_context", "payload": {"model": "gpt-6-astra"}},
             {
                 "type": "token_usage_record",
                 "payload": {
@@ -866,13 +866,13 @@ Response text
 
         self.assertEqual(usage["total_tokens"], 350)
         self.assertEqual(usage["input_tokens"], 300)
-        self.assertEqual(usage["by_model"]["gpt-5.6-luna"]["total_tokens"], 120)
-        self.assertEqual(usage["by_model"]["gpt-5.6-sol"]["total_tokens"], 230)
+        self.assertEqual(usage["by_model"]["gpt-6-luna"]["total_tokens"], 120)
+        self.assertEqual(usage["by_model"]["gpt-6-astra"]["total_tokens"], 230)
         # 通常入力（input - cached - cache write）、キャッシュ入力、cache write、
         # 出力を別単価で加算する。reasoning_output_tokens は output_tokens の内数。
-        self.assertEqual(str(usage["total_cost_usd"]), "0.0013703")
-        self.assertEqual(str(usage["by_model"]["gpt-5.6-luna"]["cost_usd"]), "0.0000423")
-        self.assertEqual(str(usage["by_model"]["gpt-5.6-sol"]["cost_usd"]), "0.001328")
+        self.assertEqual(str(usage["total_cost_usd"]), "0.00333915")
+        self.assertEqual(str(usage["by_model"]["gpt-6-luna"]["cost_usd"]), "0.00001915")
+        self.assertEqual(str(usage["by_model"]["gpt-6-astra"]["cost_usd"]), "0.00332")
 
         # 長文料金はセッション全体ではなく、272K input tokens超の各recordにだけ適用する。
         long_context = {
@@ -881,7 +881,7 @@ Response text
             "cache_write_input_tokens": 0,
             "output_tokens": 10,
         }
-        self.assertEqual(str(codex_save._usage_cost("gpt-5.6-sol", long_context)), "2.176308")
+        self.assertEqual(str(codex_save._usage_cost("gpt-6-astra", long_context)), "5.44077")
 
         gpt6_usage = {
             "input_tokens": 1000000,
@@ -889,15 +889,18 @@ Response text
             "cache_write_input_tokens": 100000,
             "output_tokens": 100000,
         }
-        self.assertEqual(str(codex_save._usage_cost("gpt-6-sol", gpt6_usage)), "4.880")
+        self.assertEqual(codex_save._usage_cost("gpt-6-astra", gpt6_usage), codex_save.Decimal("24.400"))
+        self.assertEqual(
+            codex_save._usage_cost("gpt-6.1-sol", gpt6_usage), codex_save.Decimal("4.840")
+        )
         self.assertEqual(str(codex_save._usage_cost("gpt-6-luna", gpt6_usage)), "0.244")
 
         path = codex_save.create_md_file("usage-session", "myproj", datetime.now(JST), usage=usage)
         content = path.read_text(encoding="utf-8")
         self.assertIn("usage:", content)
-        self.assertIn("total_cost_usd: 0.0013703", content)
-        self.assertIn('"gpt-5.6-luna":', content)
-        self.assertIn("💰 **Usage (USD換算)**: Total: $0.0013703 (gpt-5.6-luna $0.0000423、gpt-5.6-sol $0.001328)", content)
+        self.assertIn("total_cost_usd: 0.00333915", content)
+        self.assertIn('"gpt-6-luna":', content)
+        self.assertIn("💰 **Usage (USD換算)**: Total: $0.00333915 (gpt-6-luna $0.00001915、gpt-6-astra $0.00332)", content)
 
         refreshed = codex_save.update_markdown_metadata(
             content,
@@ -930,7 +933,7 @@ Response text
     def test_claude_usage_deduplicates_message_id_and_marks_unpriced_models(self):
         transcript = self.test_dir / "claude-usage.jsonl"
         priced = {
-            "type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-4-6",
+            "type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-5-5",
                 "content": [{"type": "text", "text": "回答"}],
                 "usage": {"input_tokens": 100, "cache_creation_input_tokens": 20,
                           "cache_read_input_tokens": 50, "output_tokens": 10,
@@ -947,19 +950,126 @@ Response text
         usage = claude_save.retrieve_usage(transcript)
         self.assertEqual(usage["total_tokens"], 187)
         self.assertEqual(usage["input_tokens"], 175)
-        self.assertEqual(usage["by_model"]["claude-sonnet-4-6"]["cost_usd"], claude_save.Decimal("0.00054"))
+        self.assertEqual(usage["by_model"]["claude-sonnet-5-5"]["cost_usd"], claude_save.Decimal("0.00036"))
         self.assertTrue(usage["cost_incomplete"])
         self.assertIn("cost_unavailable: true", "\n".join(claude_save.build_usage_frontmatter_fields(usage)))
+
+    def test_claude_uses_shared_price_registry_and_ttl_rates(self):
+        self.assertEqual(claude_save.STANDARD_USAGE_RATES, codex_save.STANDARD_USAGE_RATES)
+        self.assertIs(claude_save.USAGE_COST_USD_PER_1M_TOKEN_TYPE, claude_save.STANDARD_USAGE_RATES)
+        for rates in claude_save.USAGE_COST_USD_PER_1M_TOKEN_TYPE.values():
+            self.assertTrue({"input", "cached_input", "cache_write_input", "output"} <= set(rates))
+            self.assertTrue(all(isinstance(rate, claude_save.Decimal) for rate in rates.values()))
+        raw = {"input_tokens": 100, "output_tokens": 10}
+        self.assertNotIn("cost_usd", claude_save._claude_usage_record(
+            {"model": "claude-sonnet-4-6", "usage": raw}))
+        # 各token種別は倍率の再計算でなく表の値を直接参照する。
+        rates = {"input": claude_save.Decimal("1"), "cached_input": claude_save.Decimal("2"),
+                 "cache_write_input": claude_save.Decimal("3"),
+                 "cache_write_input_1h": claude_save.Decimal("4"),
+                 "output": claude_save.Decimal("5")}
+        with mock.patch.dict(claude_save.USAGE_COST_USD_PER_1M_TOKEN_TYPE,
+                             {"claude-opus-5-5": rates}):
+            usage = claude_save._claude_usage_record({"model": "anthropic/claude-opus-5.5",
+                "usage": {"input_tokens": 10, "cache_read_input_tokens": 20,
+                          "cache_creation_input_tokens": 70, "output_tokens": 50,
+                          "cache_creation": {"ephemeral_5m_input_tokens": 30,
+                                             "ephemeral_1h_input_tokens": 40}}})
+        self.assertEqual(usage["cost_usd"], claude_save.Decimal("0.00055"))
+
+    def test_claude_openrouter_reference_prices(self):
+        raw = {"input_tokens": 100, "cache_read_input_tokens": 50,
+               "cache_creation_input_tokens": 30, "output_tokens": 10,
+               "cache_creation": {"ephemeral_5m_input_tokens": 20,
+                                  "ephemeral_1h_input_tokens": 10}}
+        for model in ("anthropic/claude-sonnet-5.5", "claude-sonnet-5-5",
+                      "claude-sonnet-5-5-20260928"):
+            with self.subTest(model=model):
+                usage = claude_save._claude_usage_record({"model": model, "usage": raw})
+                # 100*2 + 50*0.2 + 20*2.5 + 10*4 + 10*10
+                self.assertEqual(usage["cost_usd"], claude_save.Decimal("0.0004"))
+                self.assertEqual(usage["total_tokens"], 190)
+        model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+        usage = claude_save._claude_usage_record({"model": model, "usage": raw})
+        # 100*0.5 + 50*0.1 + 30*0.5 + 10*2.2
+        self.assertEqual(usage["cost_usd"], claude_save.Decimal("0.000092"))
+        for alias in ("nemotron-3-ultra-550b-a55b:free", "nemotron-3-ultra-free",
+                      "nvidia/nemotron-3-ultra-free"):
+            with self.subTest(alias=alias):
+                self.assertEqual(claude_save._claude_usage_record(
+                    {"model": alias, "usage": raw})["cost_usd"], usage["cost_usd"])
+                self.assertEqual(claude_save._normalize_usage_model(alias),
+                                 opencode_save._normalize_usage_model(alias))
+                self.assertEqual(opencode_save._usage_cost(alias, usage), usage["cost_usd"])
+        # Anthropic用のTTL情報はNemotronの書き込み単価に影響しない。
+        without_ttl = dict(raw)
+        without_ttl.pop("cache_creation")
+        self.assertEqual(claude_save._claude_usage_record(
+            {"model": model, "usage": without_ttl})["cost_usd"], usage["cost_usd"])
+        transcript = self.test_dir / "openrouter-claude.jsonl"
+        rows = [{"type": "assistant", "message": {"id": str(i), "model": m, "usage": raw}}
+                for i, m in enumerate(("anthropic/claude-sonnet-5.5", model))]
+        transcript.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        summary = claude_save.retrieve_usage(transcript)
+        self.assertEqual(summary["total_cost_usd"], claude_save.Decimal("0.000492"))
+        self.assertIn("total_cost_usd: 0.000492", "\n".join(
+            claude_save.build_usage_frontmatter_fields(summary)))
+        self.assertIn("$0.000492", claude_save.build_usage_section(summary))
+        self.assertNotIn("cost_incomplete", summary)
+
+    def test_claude_stop_waits_for_delayed_answer_and_usage(self):
+        transcript = self.test_dir / "delayed.jsonl"
+        question = json.dumps({"type": "user", "message": {"content": "質問"}}) + "\n"
+        answer = {"type": "assistant", "message": {
+            "id": "delayed-answer", "model": "claude-sonnet-5-5",
+            "content": [{"type": "text", "text": "最終回答"}]}}
+        transcript.write_text(question, encoding="utf-8")
+        ticks = [0]
+
+        def delayed_write(_):
+            ticks[0] += 1
+            if ticks[0] == 2:
+                transcript.write_text(question + json.dumps(answer) + "\n", encoding="utf-8")
+            if ticks[0] == 4:
+                answer["message"]["usage"] = {"input_tokens": 100, "output_tokens": 10}
+                transcript.write_text(question + json.dumps(answer) + "\n", encoding="utf-8")
+
+        hook = {"session_id": "delayed", "transcript_path": str(transcript),
+                "last_assistant_message": "最終回答"}
+        with mock.patch.object(claude_save.time, "sleep", side_effect=delayed_write), \
+                mock.patch.object(claude_save.time, "monotonic", side_effect=lambda: ticks[0] * 0.05):
+            claude_save.handle_stop_event(hook)
+        state = claude_save.load_state("delayed")
+        content = Path(state["output_path"]).read_text(encoding="utf-8")
+        self.assertIn("最終回答", content)
+        self.assertIn("total_tokens: 110", content)
+        self.assertEqual(state["last_line"], 2)
+        claude_save.handle_stop_event(hook)
+        self.assertEqual(content, Path(state["output_path"]).read_text(encoding="utf-8"))
+
+    def test_claude_stop_wait_has_a_deadline(self):
+        transcript = self.test_dir / "missing-answer.jsonl"
+        transcript.write_text('{}\n', encoding="utf-8")
+        ticks = [0]
+
+        def advance(_):
+            ticks[0] += 1
+
+        with mock.patch.object(claude_save.time, "sleep", side_effect=advance), \
+                mock.patch.object(claude_save.time, "monotonic", side_effect=lambda: ticks[0] * 0.05):
+            text = claude_save.read_stop_transcript(transcript, "未到着の回答")
+        self.assertEqual(text, '{}\n')
+        self.assertLessEqual(ticks[0], 40)
 
     def test_claude_hook_saves_usage_with_existing_conversation(self):
         transcript = self.test_dir / "claude-hook-usage.jsonl"
         rows = [
             {"type": "user", "message": {"content": "質問"}},
-            {"type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-4-6",
+            {"type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-5-5",
                 "content": [{"type": "text", "text": "回答"}],
                 "usage": {"input_tokens": 100, "cache_creation_input_tokens": 0,
                           "cache_read_input_tokens": 0, "output_tokens": 10}}},
-            {"type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-4-6",
+            {"type": "assistant", "message": {"id": "msg-1", "model": "claude-sonnet-5-5",
                 "content": [], "usage": {"input_tokens": 100, "cache_creation_input_tokens": 0,
                                        "cache_read_input_tokens": 0, "output_tokens": 10}}},
         ]
@@ -971,7 +1081,7 @@ Response text
         self.assertIn("total_tokens: 110", content)
         self.assertIn("total_cost_usd:", content)
         cost_line = next(line for line in content.splitlines() if line.startswith("  total_cost_usd:"))
-        self.assertEqual(claude_save.Decimal(cost_line.split(":", 1)[1].strip()), claude_save.Decimal("0.00045"))
+        self.assertEqual(claude_save.Decimal(cost_line.split(":", 1)[1].strip()), claude_save.Decimal("0.00030"))
         self.assertEqual(content.count("回答"), 1)
         claude_save.handle_stop_event(hook)
         self.assertEqual(content, Path(state["output_path"]).read_text(encoding="utf-8"))
@@ -1010,14 +1120,14 @@ Response text
     def test_codex_answer_usage_is_assigned_once_and_marks_long_context(self):
         transcript = self.test_dir / "answer-usage.jsonl"
         rows = [
-            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna"}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-6-luna"}},
             {"type": "event_msg", "payload": {"type": "user_message", "turn_id": "turn-1", "message": "Q1"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "turn_id": "turn-1", "message": "A1"}},
             {"type": "token_usage_record", "payload": {"turn_id": "turn-1", "usage": {
                 "input_tokens": 100, "cached_input_tokens": 10, "cache_write_input_tokens": 0,
                 "output_tokens": 20, "reasoning_output_tokens": 4, "total_tokens": 120,
             }}},
-            {"type": "turn_context", "payload": {"turn_id": "turn-2", "model": "gpt-5.6-sol"}},
+            {"type": "turn_context", "payload": {"turn_id": "turn-2", "model": "gpt-6.1-sol"}},
             {"type": "event_msg", "payload": {"type": "user_message", "turn_id": "turn-2", "message": "Q2"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "turn_id": "turn-2", "message": "A2"}},
             {"type": "token_usage_record", "payload": {"turn_id": "turn-2", "usage": {
@@ -1036,14 +1146,14 @@ Response text
             sum(message["usage"]["total_tokens"] for message in answer_messages),
             session_usage["total_tokens"],
         )
-        self.assertEqual(str(answer_messages[0]["usage"]["total_cost_usd"]), "0.0000422")
+        self.assertEqual(str(answer_messages[0]["usage"]["total_cost_usd"]), "0.0000191")
         self.assertTrue(answer_messages[1]["usage"]["long_context"])
 
         path = codex_save.create_md_file("answer-usage", "myproj", datetime.now(JST))
-        codex_save.append_messages(path, messages, datetime.now(JST), "gpt-5.6-luna", last_line)
+        codex_save.append_messages(path, messages, datetime.now(JST), "gpt-6-luna", last_line)
         content = path.read_text(encoding="utf-8")
-        self.assertIn("Usage: 120 tok · $0.0000422", content)
-        self.assertIn("Usage: 272,011 tok · $2.176308 ⚠︎ 272K+", content)
+        self.assertIn("Usage: 120 tok · $0.0000191", content)
+        self.assertIn("Usage: 272,011 tok · $1.088154 ⚠︎ 272K+", content)
 
     # ------------------------------------------------------------
     # 3. claude_save テスト

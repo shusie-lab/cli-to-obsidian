@@ -3,9 +3,11 @@ from __future__ import annotations
 
 """OpenCode プラグインから渡された会話を Obsidian に保存する。"""
 
-__version__ = "3.2.0"
+__version__ = "3.8.0"
 
 import argparse
+import sys
+from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
 import json
@@ -21,10 +23,98 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+LOGGER_NAME = "opencode_obsidian_save"
 JST = timezone(timedelta(hours=9))
 OBSIDIAN_VAULT = Path(os.environ.get("OBSIDIAN_VAULT", str(Path.home() / "obsidian")))
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
 DEFAULT_SOURCE = "opencode"
+
+# Usage の標準 API 単価（USD / 1,000,000 tokens）。input_tokens には
+# cached_input_tokens と cache_write_input_tokens が含まれるため、通常入力の
+# 単価はそれらを除いた残りにだけ適用する。推論トークンは output_tokens の内数。
+# cache_write に個別単価の公表がないため入力単価で計算する。
+# OpenCode の契約上の請求額・quota 消費額や、ツール料金は表せない。
+# 無料モデルも、請求額ではなく参考値として対応する標準API単価で換算する。
+# Muse Spark 1.3 Contributor: https://dev.meta.ai/docs/pricing-rate-limits/
+# Nemotron 3 Ultra: https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b
+# Opus/Sonnet https://platform.claude.com/docs/en/about-claude/pricing
+
+# BEGIN GENERATED: usage-prices
+# 参考単価の正本。Opus 5.5のcache readは2026-10-06に公式資料で確認。
+# https://developers.openai.com/api/docs/pricing
+# https://platform.claude.com/docs/en/about-claude/pricing
+# https://dev.meta.ai/docs/pricing-rate-limits/
+# https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b
+# Gemini 3.8 Flash: 2026-10-06時点のStandard（年末までの割引価格）。
+# https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash
+# https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints
+# Haiku 5.5: 2026-10-09確認。10万token超は全token種別で5倍。
+# https://platform.claude.com/docs/en/models/haiku-5-5/overview
+STANDARD_USAGE_RATES = {
+    "gpt-6-astra": {
+        "input": Decimal("10.00"),
+        "cached_input": Decimal("1.00"),
+        "cache_write_input": Decimal("12.50"),
+        "output": Decimal("50.00"),
+    },
+    "gpt-6.1-sol": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+    },
+    "gpt-6-luna": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.01"),
+        "cache_write_input": Decimal("0.125"),
+        "output": Decimal("0.50"),
+    },
+    "gemini-3.8-flash": {
+        "input": Decimal("0.75"),
+        "cached_input": Decimal("0.075"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        # Googleの時間単位のstorage priceとは別の掲載単位。
+        "cache_write_input": Decimal("0.0416666666666667"),
+        "output": Decimal("3.75"),
+    },
+    "muse-spark-1.3-contributor-free": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.002"),
+        "cache_write_input": Decimal("0.10"),
+        "output": Decimal("0.20"),
+    },
+    "nemotron-3-ultra-free": {
+        "input": Decimal("0.50"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("0.50"),
+        "output": Decimal("2.20"),
+    },
+    "claude-opus-5-5": {
+        "input": Decimal("4.00"),
+        "cached_input": Decimal("0.20"),
+        "cache_write_input": Decimal("5.00"),
+        "output": Decimal("20.00"),
+        "cache_write_input_1h": Decimal("8.00"),
+    },
+    "claude-haiku-5-5": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.01"),
+        "cache_write_input": Decimal("0.125"),
+        "output": Decimal("0.50"),
+        "cache_write_input_1h": Decimal("0.20"),
+    },
+    "claude-sonnet-5-5": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.20"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+        "cache_write_input_1h": Decimal("4.00"),
+    },
+}
+
+# 従来の呼び出し名との互換alias。単価の正本は上の辞書1つだけ。
+USAGE_COST_USD_PER_1M_TOKEN_TYPE = STANDARD_USAGE_RATES
+# END GENERATED: usage-prices
 
 
 # BEGIN GENERATED: output-directory
@@ -57,8 +147,75 @@ STATE_RETENTION_DAYS = 30
 SAFE_SESSION_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+# BEGIN GENERATED: utilities
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def yaml_quote(value: object) -> str:
+    """JSON互換の引用形式でYAML文字列を安全に生成する。"""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def safe_filename_component(value: str) -> str:
+    """値を単一の安全なファイル名要素へ変換する。"""
+    return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
+
+
+def _try_parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).astimezone(JST)
+        except (OSError, OverflowError, ValueError):
+            return None
+    if isinstance(value, str) and value:
+        try:
+            normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(JST)
+        except (OSError, OverflowError, TypeError, ValueError):
+            pass
+    return None
+
+
+def parse_datetime(value: object, default: datetime | None = None) -> datetime:
+    parsed = _try_parse_datetime(value)
+    if parsed is not None:
+        return parsed
+    return default or datetime.now(JST)
+
+
+def format_iso(value: datetime) -> str:
+    return value.astimezone(JST).isoformat(timespec="seconds")
+
+
+def _finite_number(value: object) -> float | None:
+    """APIレスポンスの数値を厳密に検証する。boolやNaN/Infinityは受け付けない。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def format_model_name(model_name: str, effort: str = "") -> str:
+    """モデル名に reasoning effort を付加して表示用の名前へ変換する。"""
+    model = str(model_name or "").strip()
+    effort_value = str(effort or "").strip()
+    if not model or not effort_value:
+        return model
+    if model.endswith(f"-{effort_value}"):
+        return model
+    return f"{model}-{effort_value}"
+# END GENERATED: utilities
+
+# BEGIN GENERATED: logging-setup
 def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("opencode_obsidian_save")
+    logger = logging.getLogger(LOGGER_NAME)
     if logger.handlers:
         return logger
     logger.setLevel(logging.DEBUG if os.environ.get("DEBUG") else logging.INFO)
@@ -85,53 +242,11 @@ def setup_logger() -> logging.Logger:
 
 
 logger = setup_logger()
+# END GENERATED: logging-setup
 
-
-class ExistingMarkdownSearchError(Exception):
-    """既存Markdown探索中のI/Oエラー。誤上書き・重複作成を防ぐために使用。"""
-
-
-@contextmanager
-def session_lock(session_id: str):
-    lock_dir = STATE_DIR / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"{safe_session_key(session_id)}.lock"
-    with open(lock_path, "a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
-@contextmanager
-def try_session_lock(session_id: str, *, is_key: bool = False):
-    """同一セッションの hook 実行を非ブロッキングで試みる。取得できなければ False を yield。"""
-    lock_dir = STATE_DIR / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"{session_id if is_key else safe_session_key(session_id)}.lock"
-    try:
-        stream = open(lock_path, "a", encoding="utf-8")
-    except OSError:
-        yield False
-        return
-    try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (BlockingIOError, OSError):
-        stream.close()
-        yield False
-        return
-    try:
-        yield True
-    finally:
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        stream.close()
-
-
+# BEGIN GENERATED: session-storage
 def safe_session_key(session_id: str) -> str:
+    """session_idをパストラバーサルできないファイル名へ変換する。"""
     raw = str(session_id)
     safe = SAFE_SESSION_CHARS.sub("_", raw).strip("._")[:80]
     if safe and safe == raw:
@@ -144,124 +259,153 @@ def state_path(session_id: str) -> Path:
     return STATE_DIR / f"{safe_session_key(session_id)}.json"
 
 
-def atomic_write(path: Path, content: str) -> None:
+def atomic_write_text(path: Path, content: str) -> None:
+    """同じディレクトリの一時ファイルをrenameして文字列を保存する。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Optional[Path] = None
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp", delete=False
-        ) as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-            temporary = Path(stream.name)
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
         if path.exists():
-            os.chmod(temporary, path.stat().st_mode & 0o7777)
-        os.replace(temporary, path)
-        temporary = None
+            os.chmod(tmp_path, path.stat().st_mode & 0o7777)
+        os.replace(tmp_path, path)
+        tmp_path = None
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
-def load_state(session_id: str) -> Dict[str, Any]:
+class ExistingMarkdownSearchError(Exception):
+    """既存Markdown探索中のI/Oエラー。誤上書き・重複作成を防ぐために使用。"""
+
+
+@contextmanager
+def session_lock(session_id: str):
+    """同一セッションのhook実行を直列化する。"""
+    lock_dir = STATE_DIR / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{safe_session_key(session_id)}.lock"
+    with open(lock_path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def try_session_lock(session_id: str, *, is_key: bool = False):
+    """非ブロッキングでセッションロックを試み、取得結果をyieldする。"""
+    lock_dir = STATE_DIR / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{session_id if is_key else safe_session_key(session_id)}.lock"
     try:
-        return json.loads(state_path(session_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return {}
+        lock_file = open(lock_path, "a", encoding="utf-8")
+    except OSError:
+        yield False
+        return
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        lock_file.close()
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()
 
 
-def save_state(session_id: str, state: Dict[str, Any]) -> None:
-    state["last_used_at"] = format_iso(datetime.now(JST))
-    atomic_write(state_path(session_id), json.dumps(state, ensure_ascii=False, indent=2))
+def load_state(session_id: str) -> dict:
+    path = state_path(session_id)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("stateはJSONオブジェクトが必要です")
+            return data
+        except Exception as error:
+            logger.info("stateファイルの読み込みに失敗しました（破損の可能性）: %s: %s", path, error)
+            return {}
+    return {}
+
+
+def save_state(session_id: str, state: dict) -> None:
+    """stateをatomicに保存する。"""
+    state["last_used_at"] = format_iso(now_jst())
+    atomic_write_text(state_path(session_id), json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def cleanup_old_states() -> None:
-    """STATE_RETENTION_DAYS日以上前のstateファイルを削除"""
+    """保持期間を過ぎたstateを、実行中セッションを保護しながら削除する。"""
     if not STATE_DIR.exists():
         return
     cutoff = datetime.now(JST) - timedelta(days=STATE_RETENTION_DAYS)
     removed = 0
     try:
         candidates = list(STATE_DIR.glob("*.json"))
-    except OSError as e:
-        logger.warning("state探索に失敗したためクリーンアップを見送ります: %s", e)
+    except OSError as error:
+        logger.warning("state探索に失敗したためクリーンアップを見送ります: %s", error)
         return
-    for f in candidates:
-        session_key = f.stem
-        with try_session_lock(session_key, is_key=True) as acquired:
+    for path in candidates:
+        with try_session_lock(path.stem, is_key=True) as acquired:
             if not acquired:
                 continue
             try:
-                if not f.exists():
+                if not path.exists():
                     continue
-                data = json.loads(f.read_text(encoding="utf-8"))
-                last_used_str = data.get("last_used_at")
+                data = json.loads(path.read_text(encoding="utf-8"))
                 last_used = None
-                if last_used_str:
+                if data.get("last_used_at"):
                     try:
-                        last_used = datetime.fromisoformat(str(last_used_str))
+                        last_used = datetime.fromisoformat(str(data["last_used_at"]))
                         if last_used.tzinfo is None:
                             last_used = last_used.replace(tzinfo=JST)
                     except ValueError:
                         pass
                 if last_used is None:
-                    last_used = datetime.fromtimestamp(f.stat().st_mtime, tz=JST)
-
+                    last_used = datetime.fromtimestamp(path.stat().st_mtime, tz=JST)
                 if last_used < cutoff:
-                    f.unlink()
+                    path.unlink()
                     removed += 1
-            except Exception as e:
-                logger.info("stateファイルのクリーンアップ中にスキップ: %s: %s", f.name, e)
+            except Exception as error:
+                logger.info("stateファイルのクリーンアップ中にスキップ: %s: %s", path.name, error)
     if removed > 0:
         logger.info("古いstateファイル %d 件を削除しました", removed)
+# END GENERATED: session-storage
+
+# BEGIN GENERATED: full-session-storage
+def atomic_write(path: Path, content: str) -> None:
+    """既存snapshot saver APIを共通atomic writeへ接続する。"""
+    atomic_write_text(path, content)
 
 
-def yaml_quote(value: Any) -> str:
-    return json.dumps(str(value), ensure_ascii=False)
+def read_payload(path: str | None) -> dict:
+    if path:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    return json.load(sys.stdin)
 
 
-def safe_filename_component(value: str) -> str:
-    return re.sub(r"[\x00-\x1f/:*?\[\]\\]", "_", value).strip()[:80]
-
-
-def _try_parse_datetime(value: Any) -> Optional[datetime]:
-    if isinstance(value, (int, float)):
-        # OpenCode の time.created は Unix epoch milliseconds。
-        return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).astimezone(JST)
-    if isinstance(value, str) and value:
-        try:
-            normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-            parsed = datetime.fromisoformat(normalized)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(JST)
-        except ValueError:
-            pass
-    return None
-
-
-def parse_datetime(value: Any, default: Optional[datetime] = None) -> datetime:
-    parsed = _try_parse_datetime(value)
-    if parsed is not None:
-        return parsed
-    return default or datetime.now(JST)
-
-
-def format_iso(value: datetime) -> str:
-    return value.astimezone(JST).isoformat(timespec="seconds")
-
-
-def _finite_number(value: Any) -> Optional[float]:
-    """APIレスポンスの数値を厳密に検証する。boolやNaN/Infinityは受け付けない。"""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        number = float(value)
-    except (OverflowError, ValueError, TypeError):
-        return None
-    return number if math.isfinite(number) else None
-
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", help="会話snapshotのJSONファイル。省略時はstdin")
+    args = parser.parse_args()
+    handle_payload(read_payload(args.input))
+# END GENERATED: full-session-storage
 
 # BEGIN GENERATED: markdown-formatting
 def sanitize_markdown(text: str) -> str:
@@ -607,6 +751,274 @@ def render_assistant_message_block(
     return f"{assistant_callout_header(agent_name, metadata)}{separator}{body}\n\n"
 # END GENERATED: markdown-rendering
 
+# BEGIN GENERATED: usage-summary
+USAGE_FIELDS = (
+    "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+    "output_tokens", "reasoning_output_tokens", "total_tokens",
+)
+USAGE_TOKEN_FIELDS = USAGE_FIELDS
+
+
+def _empty_usage_totals() -> dict:
+    return {field: 0 for field in USAGE_FIELDS}
+
+
+def _decimal_cost(value: object) -> Decimal | None:
+    """数値・文字列金額を有限で非負のDecimalへ変換する。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
+def calculate_usage_cost(rates: dict, usage: dict, *, input_multiplier=1, output_multiplier=1) -> Decimal | None:
+    """各recordを換算し、キャッシュ・推論の内数を二重計上しない。"""
+    try:
+        values = [usage.get(key, 0) for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens")]
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            return None
+        total_input, cached, written, output = values
+        fresh = total_input - cached - written
+        if fresh < 0:
+            return None
+        return ((
+            (Decimal(fresh) * rates["input"] + Decimal(cached) * rates["cached_input"]
+             + Decimal(written) * rates["cache_write_input"]) * Decimal(str(input_multiplier))
+            + Decimal(output) * rates["output"] * Decimal(str(output_multiplier))
+        ) / Decimal(1_000_000)).normalize()
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return None
+
+
+def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
+    """provider側で重複排除・正規化したrecordを、各recordの金額を維持して合計する。"""
+    total = _empty_usage_totals()
+    by_model = {}
+    count = priced = 0
+    total_cost = Decimal(0)
+    long_context = False
+    for message in messages:
+        usage = message.get("usage") if message.get("type") == "assistant" else None
+        if not isinstance(usage, dict):
+            continue
+        count += 1
+        model = str(message.get("model") or "unknown")
+        entry = by_model.setdefault(model, _empty_usage_totals())
+        for field in USAGE_FIELDS:
+            value = int(usage.get(field, 0))
+            total[field] += value
+            entry[field] += value
+        long_context = long_context or bool(usage.get("long_context"))
+        value = _decimal_cost(usage.get("cost_usd"))
+        if value is None and estimate_missing:
+            value = _usage_cost(model, usage)
+        if value is not None:
+            priced += 1
+            total_cost += value
+            entry["cost_usd"] = entry.get("cost_usd", Decimal(0)) + value
+        else:
+            entry["cost_unavailable"] = True
+    if not count:
+        return None
+    for entry in by_model.values():
+        if "cost_usd" in entry and entry.pop("cost_unavailable", False):
+            entry["cost_incomplete"] = True
+    total["by_model"] = by_model
+    if priced:
+        total["total_cost_usd"] = total_cost
+        if priced < count:
+            total["cost_incomplete"] = True
+    else:
+        total["cost_unavailable"] = True
+    if long_context:
+        total["long_context"] = True
+    return total
+
+
+def usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    if not usage:
+        return []
+    lines = ["usage:"]
+    lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
+    if "total_cost_usd" in usage:
+        lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
+        if usage.get("cost_incomplete"):
+            lines.append("  cost_incomplete: true")
+    else:
+        lines.append("  cost_unavailable: true")
+    lines.append("  by_model:")
+    for model, entry in usage.get("by_model", {}).items():
+        lines.append(f"    {yaml_quote(model)}:")
+        lines.extend(f"      {field}: {int(entry.get(field, 0))}" for field in USAGE_FIELDS)
+        if "cost_usd" in entry:
+            lines.append(f"      cost_usd: {format(Decimal(str(entry['cost_usd'])), 'f')}")
+            if entry.get("cost_incomplete") or entry.get("cost_unavailable"):
+                lines.append("      cost_incomplete: true")
+        else:
+            lines.append("      cost_unavailable: true")
+    return lines
+
+
+def build_usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    """増分saverの従来API。"""
+    return usage_frontmatter_fields(usage)
+
+
+def _format_usd(value: object) -> str | None:
+    amount = _decimal_cost(value)
+    return f"${format(amount, 'f')}" if amount is not None else None
+
+
+def _usage_cost_label(usage: dict, key: str) -> str:
+    amount = _format_usd(usage.get(key))
+    if amount is None:
+        return "換算不可"
+    partial = usage.get("cost_incomplete") or usage.get("cost_unavailable")
+    return amount + ("（部分換算）" if partial else "")
+
+
+def build_usage_section(usage: dict | None) -> str:
+    if not usage:
+        return "💰 **Usage (USD換算)**: N/A\n"
+    parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')}" for model, entry in usage.get("by_model", {}).items()]
+    details = f" ({'、'.join(parts)})" if parts else ""
+    return f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+
+
+def format_message_usage(usage: dict | None, subagent_usage: dict | None = None) -> str:
+    if not usage:
+        return ""
+    warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
+    label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    if subagent_usage:
+        parts = [f"{model} {int(entry.get('total_tokens', 0)):,} tok・{_usage_cost_label(entry, 'cost_usd')}"
+                 for model, entry in sorted(subagent_usage.get("by_model", {}).items())]
+        if parts:
+            label += f" ({'、'.join(parts)})"
+    return label
+
+
+def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | None:
+    """換算済み小計を足す。再換算せず長文条件をrecord単位に維持する。"""
+    if not first:
+        return second
+    if not second:
+        return first
+    merged = _empty_usage_totals()
+    for field in USAGE_FIELDS:
+        merged[field] = int(first.get(field, 0)) + int(second.get(field, 0))
+    by_model = {}
+    for source in (first, second):
+        for model, entry in source.get("by_model", {}).items():
+            target = by_model.setdefault(model, _empty_usage_totals())
+            for field in USAGE_FIELDS:
+                target[field] += int(entry.get(field, 0))
+            if "cost_usd" in entry:
+                target["cost_usd"] = target.get("cost_usd", Decimal(0)) + Decimal(str(entry["cost_usd"]))
+            if entry.get("cost_unavailable") or entry.get("cost_incomplete"):
+                target["cost_unavailable"] = True
+    for entry in by_model.values():
+        if "cost_usd" in entry and entry.pop("cost_unavailable", False):
+            entry["cost_incomplete"] = True
+    merged["by_model"] = by_model
+    if "total_cost_usd" in first or "total_cost_usd" in second:
+        merged["total_cost_usd"] = sum((Decimal(str(source.get("total_cost_usd", 0))) for source in (first, second)), Decimal(0))
+        if any(source.get("cost_unavailable") or source.get("cost_incomplete") for source in (first, second)):
+            merged["cost_incomplete"] = True
+    else:
+        merged["cost_unavailable"] = True
+    if first.get("long_context") or second.get("long_context"):
+        merged["long_context"] = True
+    return merged
+# END GENERATED: usage-summary
+
+# BEGIN GENERATED: note-metadata
+def build_common_frontmatter(
+    session_id: str, cwd: str, created: datetime, modified: datetime,
+    count: int, title: str | None = None, *, source: str | None = None,
+    tags: list[str] | None = None, extra_fields=(),
+) -> str:
+    source = SOURCE_NAME if source is None else source
+    lines = [
+        "---", f"source: {source}",
+        *([f"title: {yaml_quote(title)}"] if title is not None else []),
+        f"session_id: {yaml_quote(session_id)}", f"project: {yaml_quote(cwd)}",
+        f"created: {yaml_quote(format_iso(created))}",
+        f"modified: {yaml_quote(format_iso(modified))}", "tags:",
+    ]
+    for tag in tags if tags is not None else ["ai-conversation", source]:
+        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
+        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
+        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
+        lines.append(f"  - {value}")
+    lines.append(f"message_count: {count}")
+    lines.extend(extra_fields)
+    lines.append("---")
+    return "\n".join(lines) + "\n\n"
+
+
+def note_output_path(session_id: str, cwd: str, created: datetime) -> Path:
+    project = safe_filename_component(Path(cwd).name) if cwd else ""
+    prefix = f"{created:%Y%m%d}_{created:%H%M%S}"
+    if project:
+        prefix += f"_{project}"
+    return OUTPUT_BASE / f"{prefix}_{safe_session_key(session_id) if session_id else 'unknown'}.md"
+
+
+def read_markdown_metadata(path: Path) -> dict:
+    """標準ライブラリで、このプロジェクトのfrontmatterの識別項目だけを読む。"""
+    content = path.read_text(encoding="utf-8")
+    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not match:
+        return {}
+    result = {}
+    in_tags = False
+    for line in match.group(1).splitlines():
+        if line.startswith("tags:"):
+            in_tags = True
+            result["tags"] = []
+            continue
+        if in_tags and line.startswith("  - "):
+            raw = line[4:].strip()
+            try:
+                tag = json.loads(raw)
+            except ValueError:
+                tag = raw
+            if isinstance(tag, str):
+                result["tags"].append(tag)
+            continue
+        if line and not line.startswith((" ", "\t")):
+            in_tags = False
+        if line.startswith(("source:", "created:", "title:", "session_id:", "project:")):
+            key, raw = line.split(":", 1)
+            try:
+                value = json.loads(raw.strip())
+            except ValueError:
+                value = raw.strip()
+            if isinstance(value, str):
+                result[key] = value
+    return result
+
+
+def preserve_modified_if_unchanged(content: str, refreshed: str) -> str:
+    """更新時刻以外が一致するなら既存ノートをそのまま返す。"""
+    # Scope to frontmatter, so an assistant's code or prose is never replaced.
+    pattern = r"\A(---\s*\n)(.*?)(\n---\s*\n)"
+    old = re.match(pattern, content, re.DOTALL)
+    new = re.match(pattern, refreshed, re.DOTALL)
+    if not old or not new:
+        return refreshed
+    modified = next((line for line in old.group(2).splitlines() if line.startswith("modified:")), None)
+    if modified is None:
+        return refreshed
+    fields = re.sub(r"(?m)^modified:.*$", lambda _: modified, new.group(2), count=1)
+    unchanged_time = new.group(1) + fields + new.group(3) + refreshed[new.end():]
+    return content if unchanged_time == content else refreshed
+# END GENERATED: note-metadata
+
 
 def _message_text(envelope: Dict[str, Any]) -> str:
     parts = envelope.get("parts") or []
@@ -620,8 +1032,74 @@ def _message_text(envelope: Dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
-USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
-                "output_tokens", "reasoning_output_tokens", "total_tokens")
+# BEGIN GENERATED: usage-model
+def _normalize_usage_model(model: object) -> str:
+    """プロバイダ接頭辞などを除き、単価表と照合できるモデル名へ変換する。"""
+    name = str(model or "").strip().lower()
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    aliases = {
+        "gemini3.8-flash": "gemini-3.8-flash",
+        "nemotron-3-ultra-550b-a55b:free": "nemotron-3-ultra-free",
+        "claude-opus-5.5": "claude-opus-5-5",
+        "claude-haiku-5.5": "claude-haiku-5-5",
+        "claude-sonnet-5.5": "claude-sonnet-5-5",
+        "muse-spark-1.3-contributor:free": "muse-spark-1.3-contributor-free",
+        "muse-spark-1.3-contributor": "muse-spark-1.3-contributor-free",
+    }
+    return aliases.get(name, name)
+# END GENERATED: usage-model
+
+
+# BEGIN GENERATED: usage-reference-cost
+LONG_CONTEXT_INPUT_TOKENS = 272_000
+
+
+def reference_price_model(model: object) -> str:
+    name = _normalize_usage_model(model)
+    if (name not in STANDARD_USAGE_RATES and name.endswith("-free")
+            and name[:-len("-free")] in STANDARD_USAGE_RATES):
+        name = name[:-len("-free")]
+    return name
+
+
+def is_long_context_usage(model: object, usage: dict) -> bool:
+    """登録済みGPTの1リクエストの入力総数で、参考単価の長文条件を判定する。"""
+    name = reference_price_model(model)
+    tokens = usage.get("input_tokens", 0)
+    return (isinstance(tokens, int) and not isinstance(tokens, bool)
+            and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
+            and tokens > LONG_CONTEXT_INPUT_TOKENS)
+
+
+def haiku_prompt_price_multiplier(model: object, usage: dict) -> int:
+    """通常入力・cache read/writeの合計が10万tokenを超えた場合は5倍。"""
+    tokens = usage.get("input_tokens", 0)
+    return 5 if (reference_price_model(model) == "claude-haiku-5-5"
+                 and isinstance(tokens, int) and not isinstance(tokens, bool)
+                 and tokens > 100_000) else 1
+
+
+def _usage_cost(model: object, usage: dict) -> Decimal | None:
+    """raw recordを正規化したtoken内訳から標準API参考換算を行う。"""
+    rates = STANDARD_USAGE_RATES.get(reference_price_model(model))
+    if rates is None or usage.get("pricing_unknown"):
+        return None
+    long_context = is_long_context_usage(model, usage)
+    haiku_multiplier = haiku_prompt_price_multiplier(model, usage)
+    return calculate_usage_cost(
+        rates, usage, input_multiplier=2 if long_context else haiku_multiplier,
+        output_multiplier=Decimal("1.5") if long_context else haiku_multiplier,
+    )
+# END GENERATED: usage-reference-cost
+
+
+def _usage_model(info: Dict[str, Any]) -> str:
+    """assistantレコードから単価照合用のモデル名を取り出す。"""
+    model = info.get("modelID") or info.get("model") or "unknown"
+    if isinstance(model, dict):
+        model = model.get("modelID") or model.get("id") or "unknown"
+    return str(model)
 
 
 def _message_usage(info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -647,18 +1125,32 @@ def _message_usage(info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
     cost = _finite_number(info.get("cost"))
     if cost is not None and cost > 0:
-        usage["cost_usd"] = cost
+        usage["cost_usd"] = str(Decimal(str(info["cost"])).normalize())
+    else:
+        # OpenCode が正の cost を返さない場合（無料枠など）は単価表で概算する。
+        estimated = _usage_cost(_usage_model(info), usage)
+        if estimated is not None:
+            usage["cost_usd"] = str(estimated)
+            if is_long_context_usage(_usage_model(info), usage):
+                usage["long_context"] = True
     return usage
 
 
 def extract_usage_records(raw_messages: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """本文のないツール専用assistantも含め、message IDごとに最後のusageを保持する。"""
+    """全assistantのusageをmessage IDごとに保持し、順番とユーザーターンを記録する。"""
     records = {}
-    for envelope in raw_messages:
+    turn_index = -1
+    for sequence, envelope in enumerate(raw_messages):
         if not isinstance(envelope, dict):
             continue
         info = envelope.get("info") or envelope.get("message") or envelope
-        if not isinstance(info, dict) or (info.get("role") or info.get("type")) != "assistant":
+        if not isinstance(info, dict):
+            continue
+        role = info.get("role") or info.get("type")
+        if role == "user":
+            turn_index += 1
+            continue
+        if role != "assistant":
             continue
         usage = _message_usage(info)
         message_id = str(info.get("id") or info.get("messageID") or envelope.get("id") or "")
@@ -667,68 +1159,21 @@ def extract_usage_records(raw_messages: Iterable[Dict[str, Any]]) -> Dict[str, D
         model = info.get("modelID") or info.get("model") or "unknown"
         if isinstance(model, dict):
             model = model.get("modelID") or model.get("id") or "unknown"
-        records[message_id] = {"type": "assistant", "model": str(model), "usage": usage}
+        records[message_id] = {
+            "id": message_id,
+            "type": "assistant",
+            "model": str(model),
+            "sequence": sequence,
+            "turn_index": turn_index,
+            "usage": usage,
+        }
     return records
-
-
-def summarize_usage(messages: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    total = {field: 0 for field in USAGE_FIELDS}
-    by_model: Dict[str, Dict[str, Any]] = {}
-    count = priced = 0
-    total_cost = 0.0
-    for message in messages:
-        usage = message.get("usage") if message.get("type") == "assistant" else None
-        if not isinstance(usage, dict):
-            continue
-        count += 1
-        model = str(message.get("model") or "unknown")
-        entry = by_model.setdefault(model, {field: 0 for field in USAGE_FIELDS})
-        for field in USAGE_FIELDS:
-            value = int(usage.get(field, 0))
-            total[field] += value
-            entry[field] += value
-        if "cost_usd" in usage:
-            priced += 1
-            value = float(usage["cost_usd"])
-            total_cost += value
-            entry["cost_usd"] = entry.get("cost_usd", 0.0) + value
-    if not count:
-        return None
-    total["by_model"] = by_model
-    if priced:
-        total["total_cost_usd"] = total_cost
-        if priced < count:
-            total["cost_incomplete"] = True
-    else:
-        total["cost_unavailable"] = True
-    return total
-
-
-def usage_frontmatter_fields(usage: Optional[Dict[str, Any]]) -> List[str]:
-    if not usage:
-        return []
-    lines = ["usage:"]
-    lines.extend(f"  {field}: {usage[field]}" for field in USAGE_FIELDS)
-    if "total_cost_usd" in usage:
-        lines.append(f"  total_cost_usd: {usage['total_cost_usd']}")
-        if usage.get("cost_incomplete"):
-            lines.append("  cost_incomplete: true")
-    else:
-        lines.append("  cost_unavailable: true")
-    lines.append("  by_model:")
-    for model, entry in usage["by_model"].items():
-        lines.append(f"    {yaml_quote(model)}:")
-        lines.extend(f"      {field}: {entry[field]}" for field in USAGE_FIELDS)
-        if "cost_usd" in entry:
-            lines.append(f"      cost_usd: {entry['cost_usd']}")
-        else:
-            lines.append("      cost_unavailable: true")
-    return lines
 
 
 def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = []
-    for envelope in raw_messages:
+    turn_index = -1
+    for sequence, envelope in enumerate(raw_messages):
         if not isinstance(envelope, dict):
             continue
         info = envelope.get("info") or envelope.get("message") or {}
@@ -748,6 +1193,8 @@ def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, A
             parts = envelope.get("content") or []
         if role not in ("user", "assistant"):
             continue
+        if role == "user":
+            turn_index += 1
         if parts:
             text = _message_text({"parts": parts})
         else:
@@ -776,6 +1223,8 @@ def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, A
                 "timestamp": timestamp,
                 "model": model,
                 "provider": provider,
+                "sequence": sequence,
+                "turn_index": turn_index,
                 **({"usage": usage} if role == "assistant" and (usage := _message_usage(info)) else {}),
             }
         )
@@ -997,7 +1446,9 @@ def _find_matching_message(messages: Iterable[Dict[str, Any]], incoming: Dict[st
     )
 
 
-def find_existing_md(session_id: str) -> Optional[Path]:
+# BEGIN GENERATED: find-existing-markdown
+def find_existing_md(session_id: str) -> Path | None:
+    """state消失時にfrontmatterのsession_idから既存Markdownを探す。"""
     if not OUTPUT_BASE.exists():
         return None
     identifiers = []
@@ -1014,26 +1465,24 @@ def find_existing_md(session_id: str) -> Optional[Path]:
         f"session_id: {yaml_quote(session_id)}",
         f"session_id: {session_id}",
     }
-
     candidates = set()
     try:
-        # globは一部の読み取りエラーを抑制するため、ディレクトリを直接列挙する。
         for path in OUTPUT_BASE.iterdir():
             if any(path.name.endswith(f"_{identifier}.md") for identifier in identifiers):
                 candidates.add(path)
-    except OSError as e:
-        raise ExistingMarkdownSearchError(f"既存Markdown候補の列挙に失敗しました: {e}")
+    except OSError as error:
+        raise ExistingMarkdownSearchError(f"既存Markdown候補の列挙に失敗しました: {error}")
 
     candidate_entries = []
     for candidate in candidates:
         try:
             candidate_entries.append((candidate, candidate.stat().st_mtime))
-        except OSError as e:
-            raise ExistingMarkdownSearchError(f"既存Markdown候補の情報取得に失敗しました: {candidate}: {e}")
-
+        except OSError as error:
+            raise ExistingMarkdownSearchError(
+                f"既存Markdown候補の情報取得に失敗しました: {candidate}: {error}"
+            )
     candidate_entries.sort(key=lambda item: item[1], reverse=True)
 
-    had_read_error = False
     last_read_error = None
     for candidate, _ in candidate_entries:
         try:
@@ -1041,22 +1490,32 @@ def find_existing_md(session_id: str) -> Optional[Path]:
             parts = content.split("---", 2)
             if len(parts) >= 3:
                 frontmatter_lines = [line.strip() for line in parts[1].splitlines()]
-                if any(exp in frontmatter_lines for exp in expected):
+                if any(item in frontmatter_lines for item in expected):
                     return candidate
-        except (OSError, UnicodeError) as e:
-            had_read_error = True
-            last_read_error = e
-            logger.warning(f"既存Markdown候補の読み込みに失敗したためスキップします: {candidate}: {e}")
-            continue
+        except (OSError, UnicodeError) as error:
+            last_read_error = error
+            logger.warning("既存Markdown候補の読み込みに失敗したためスキップします: %s: %s", candidate, error)
         except IndexError:
             continue
-
-    if had_read_error:
+    if last_read_error is not None:
         raise ExistingMarkdownSearchError(
-            f"既存Markdown候補の読み取りに失敗したファイルが存在し、一致を確認できなかったため探索を中断します: {last_read_error}"
+            "既存Markdown候補の読み取りに失敗したファイルが存在し、"
+            f"一致を確認できなかったため探索を中断します: {last_read_error}"
         )
-
     return None
+# END GENERATED: find-existing-markdown
+
+# BEGIN GENERATED: full-session-search
+def recover_snapshot_metadata(path: Path | None, state: dict, created: object) -> dict:
+    """既存frontmatterを優先し、state消失や環境設定変更でもノートの識別を保持する。"""
+    metadata = read_markdown_metadata(path) if path is not None and path.exists() else {}
+    source = metadata.get("source") or state.get("source") or SOURCE_NAME
+    return {
+        "created": parse_datetime(metadata.get("created") or state.get("created") or created),
+        "source": source,
+        "tags": metadata.get("tags", state.get("tags", ["ai-conversation", source])),
+    }
+# END GENERATED: full-session-search
 
 
 def _markdown_timestamp(value: str) -> str:
@@ -1150,33 +1609,14 @@ def parse_existing_markdown(path: Path) -> List[Dict[str, Any]]:
     return messages
 
 
-def build_frontmatter(
-    session_id: str,
-    cwd: str,
-    created: datetime,
-    modified: datetime,
-    count: int,
-    usage: Optional[Dict[str, Any]] = None,
-    title: Optional[str] = None,
-) -> str:
-    lines = [
-        "---",
-        f"source: {SOURCE_NAME}",
-        *( [f"title: {yaml_quote(title)}"] if title is not None else [] ),
-        f"session_id: {yaml_quote(session_id)}",
-        f"project: {yaml_quote(cwd)}",
-        f"created: {yaml_quote(format_iso(created))}",
-        f"modified: {yaml_quote(format_iso(modified))}",
-        "tags:",
-        "  - ai-conversation",
-        f"  - {SOURCE_NAME}",
-        f"message_count: {count}",
-    ]
-    lines.extend(usage_frontmatter_fields(usage))
-    lines.append("---")
-    return "\n".join(lines) + "\n\n"
+def build_frontmatter(session_id: str, cwd: str, created: datetime, modified: datetime,
+                      count: int, usage: dict | None = None, title: str | None = None,
+                      *, source: str | None = None, tags: list[str] | None = None) -> str:
+    return build_common_frontmatter(session_id, cwd, created, modified, count, title,
+        source=source, tags=tags, extra_fields=usage_frontmatter_fields(usage))
 
 
+# BEGIN GENERATED: full-session-display
 def _display_message_groups(messages: Iterable[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     groups: List[List[Dict[str, Any]]] = []
     for message in messages:
@@ -1185,6 +1625,7 @@ def _display_message_groups(messages: Iterable[Dict[str, Any]]) -> List[List[Dic
             and groups
             and groups[-1][0]["type"] == "assistant"
             and groups[-1][0].get("model", "") == message.get("model", "")
+            and groups[-1][0].get("turn_index") == message.get("turn_index")
         ):
             groups[-1].append(message)
         else:
@@ -1192,44 +1633,96 @@ def _display_message_groups(messages: Iterable[Dict[str, Any]]) -> List[List[Dic
     return groups
 
 
-def render_markdown(
-    session_id: str,
-    cwd: str,
-    created: datetime,
-    messages: List[Dict[str, str]],
-    *,
-    modified: Optional[datetime] = None,
-    usage_records: Optional[Iterable[Dict[str, Any]]] = None,
+def _usage_records_by_display_group(
+    groups: List[List[Dict[str, Any]]], usage_records: Iterable[Dict[str, Any]]
+) -> List[List[Dict[str, Any]]]:
+    """本文のないassistant usageを、同じユーザーターン内の最寄り回答calloutへ割り当てる。"""
+    result: List[List[Dict[str, Any]]] = [[] for _ in groups]
+    message_groups = {
+        str(message.get("id")): group_index
+        for group_index, group in enumerate(groups)
+        for message in group
+        if message.get("type") == "assistant" and message.get("id")
+    }
+    assistant_groups = [
+        index for index, group in enumerate(groups)
+        if group and group[0].get("type") == "assistant"
+    ]
+    for record in usage_records:
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message_id = str(record.get("id") or "")
+        target = message_groups.get(message_id)
+        if target is None:
+            sequence = record.get("sequence")
+            turn_index = record.get("turn_index")
+            candidates = [
+                index for index in assistant_groups
+                if turn_index is None or groups[index][0].get("turn_index") == turn_index
+            ]
+            model = str(record.get("model") or "")
+            same_model = [index for index in candidates if str(groups[index][0].get("model") or "") == model]
+            if same_model:
+                candidates = same_model
+            if not candidates:
+                continue
+
+            def distance(group_index: int) -> Tuple[int, int, int]:
+                positions = [
+                    message.get("sequence") for message in groups[group_index]
+                    if isinstance(message.get("sequence"), int)
+                ]
+                if not isinstance(sequence, int) or not positions:
+                    return (0, group_index, group_index)
+                start, end = min(positions), max(positions)
+                gap = start - sequence if sequence < start else sequence - end if sequence > end else 0
+                follows_record = 0 if start >= sequence else 1
+                return (gap, follows_record, group_index)
+
+            target = min(candidates, key=distance)
+        result[target].append(record)
+    return result
+# END GENERATED: full-session-display
+
+# BEGIN GENERATED: full-session-rendering
+def render_full_session_markdown(
+    session_id: str, cwd: str, created: datetime, messages: list[dict],
+    agent_name: str, *, modified: datetime | None = None,
+    usage_records=None, display_usage_records=None, source: str | None = None, tags=None,
 ) -> str:
-    modified = modified or datetime.now(JST)
+    groups = _display_message_groups(messages)
+    all_records = list(usage_records) if usage_records is not None else messages
+    display_records = list(display_usage_records) if display_usage_records is not None else all_records
+    usage = summarize_usage(all_records)
+    group_records = _usage_records_by_display_group(groups, display_records)
     first_user = next((message["text"] for message in messages if message["type"] == "user"), None)
     title = heading_title(first_user) if first_user is not None else None
-    display_messages = _display_message_groups(messages)
-    blocks = [
-        build_frontmatter(
-            session_id,
-            cwd,
-            created,
-            modified,
-            len(display_messages),
-            summarize_usage(messages if usage_records is None else usage_records),
-            title,
-        )
-    ]
-    for group in display_messages:
+    blocks = [build_common_frontmatter(
+        session_id, cwd, created, modified or now_jst(), len(groups), title,
+        source=source, tags=tags, extra_fields=usage_frontmatter_fields(usage),
+    ), build_usage_section(usage) + "\n"]
+    for index, group in enumerate(groups):
         message = group[0]
         if message["type"] == "user":
             blocks.append(render_user_message_block(message["text"], message.get("timestamp")))
-        else:
-            model = message.get("model", "")
-            metadata = [f"🤖 {model}"] if model else []
-            usage = summarize_usage(group)
-            if usage:
-                cost = f" · ${usage['total_cost_usd']}" if "total_cost_usd" in usage and not usage.get("cost_incomplete") else ""
-                metadata.append(f"Usage: {usage['total_tokens']:,} tok{cost}")
-            body = "\n\n".join(item["text"].strip("\n") for item in group)
-            blocks.append(render_assistant_message_block(body, "OpenCode", metadata))
+            continue
+        model = str(message.get("model") or "")
+        metadata = [f"🤖 {model}"] if model else []
+        answer_usage = summarize_usage(group_records[index]) or summarize_usage(group)
+        usage_text = format_message_usage(answer_usage)
+        if usage_text:
+            metadata.append(usage_text)
+        body = "\n\n".join(item["text"].strip("\n") for item in group)
+        blocks.append(render_assistant_message_block(body, agent_name, metadata))
     return "".join(blocks)
+# END GENERATED: full-session-rendering
+
+
+def render_markdown(session_id: str, cwd: str, created: datetime, messages: list[dict], *,
+                    modified: datetime | None = None, usage_records=None,
+                    source: str | None = None, tags=None) -> str:
+    return render_full_session_markdown(session_id, cwd, created, messages, "OpenCode",
+        modified=modified, usage_records=usage_records, source=source, tags=tags)
 
 
 def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
@@ -1246,8 +1739,8 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
     try:
         output_path = Path(state["output_path"]) if state.get("output_path") else find_existing_md(session_id)
     except ExistingMarkdownSearchError as e:
-        logger.error("既存Markdownの探索中にエラーが発生したため保存を見送ります: %s", e)
-        return None
+        logger.error("既存Markdownの探索中にエラーが発生したため保存を見送ります: %s", type(e).__name__)
+        raise
     stored_messages = state.get("messages") if isinstance(state.get("messages"), list) else []
     if not stored_messages and output_path is not None:
         stored_messages = parse_existing_markdown(output_path)
@@ -1257,6 +1750,7 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
     if not messages:
         logger.debug("本文がないため保存をスキップ %s", session_id[:8])
         return output_path
+    metadata = recover_snapshot_metadata(output_path, state, payload.get("created"))
     hash_messages = [
         {
             "id": item.get("id", ""),
@@ -1266,11 +1760,14 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
             "model": item.get("model", ""),
             "provider": _message_provider(item),
             "usage": item.get("usage"),
+            "turn_index": item.get("turn_index"),
+            "sequence": item.get("sequence"),
         }
         for item in messages
     ]
     payload_hash = hashlib.sha256(
-        json.dumps({"render_version": 2, "cwd": cwd, "messages": hash_messages, "usage_records": usage_records},
+        json.dumps({"render_version": __version__, "cwd": cwd, "messages": hash_messages, "usage_records": usage_records,
+                    "source": metadata["source"], "tags": metadata["tags"]},
                    ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     if state.get("payload_hash") == payload_hash and output_path is not None and output_path.exists():
@@ -1278,31 +1775,20 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
         save_state(session_id, state)
         return output_path
 
+    created = metadata["created"]
     if output_path is None:
-        created = parse_datetime(payload.get("created"))
-        project = safe_filename_component(Path(cwd).name) if cwd else ""
-        session_key = safe_session_key(session_id) or "unknown"
-        OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
-        if project:
-            output_path = OUTPUT_BASE / f"{created:%Y%m%d}_{created:%H%M%S}_{project}_{session_key}.md"
-        else:
-            output_path = OUTPUT_BASE / f"{created:%Y%m%d}_{created:%H%M%S}_{session_key}.md"
-        state = {"output_path": str(output_path), "created": format_iso(created), "cwd": cwd}
-    else:
-        fallback_created = datetime.now(JST)
-        try:
-            fallback_created = datetime.fromtimestamp(output_path.stat().st_mtime, tz=JST)
-        except OSError:
-            pass
-        created = parse_datetime(state.get("created"), fallback_created)
+        output_path = note_output_path(session_id, cwd, created)
     atomic_write(output_path, render_markdown(
-        session_id, cwd, created, messages, usage_records=usage_records.values()
+        session_id, cwd, created, messages, usage_records=usage_records.values(),
+        source=metadata["source"], tags=metadata["tags"]
     ))
     state.update({
         "output_path": str(output_path),
         "created": format_iso(created),
         "cwd": cwd,
-        "message_count": len(messages),
+        "message_count": len(_display_message_groups(messages)),
+        "source": metadata["source"],
+        "tags": metadata["tags"],
         "messages": messages,
         "usage_records": usage_records,
         "payload_hash": payload_hash,
@@ -1320,24 +1806,9 @@ def handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
         return _handle_payload(payload)
 
 
-def read_payload(path: Optional[str]) -> Dict[str, Any]:
-    if path:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    import sys
-
-    return json.load(sys.stdin)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", help="プラグインが作成した JSON ファイル")
-    args = parser.parse_args()
-    handle_payload(read_payload(args.input))
-
-
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        logger.exception("保存に失敗しました: %s", error)
-        raise SystemExit(0)
+        logger.error("OpenCodeの会話保存に失敗しました (%s)", type(error).__name__)
+        raise SystemExit(1)

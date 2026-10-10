@@ -7,6 +7,106 @@
 
 ## [Unreleased]
 
+### Added
+
+- セッションIDから全履歴を再構成する `rebuild_session.py` を追加。テスト用出力と、バックアップ付きの既存Obsidianノート置換に対応
+
+## [3.8.0] - 2026-10-09
+
+### Added
+
+- Claude Haiku 5.5のUSD参考換算に対応。入力10万token超の料金と、Claude Codeの5分・1時間キャッシュ書込を換算
+
+## [3.7.0] - 2026-10-06
+
+### Added
+
+- Claude Codeの回答calloutにも、回答ごとのtoken数とUSD参考換算を表示
+- Codex・Claude Code・OpenCode・Piで、共通単価表に登録されたモデルをすべてUSD参考換算の対象にする
+- Gemini 3.8 FlashのUSD参考換算に対応し、OpenRouterの`google/gemini-3.8-flash`を認識
+
+### Changed
+
+- Codex・Claude Code・OpenCode・PiのUsageサマリ、換算不可・部分換算の表示、金額の固定小数表記を統一
+- GPT-6 Sol・GPT-5.6系列の参考単価を削除。これらのモデルは本文とtoken数を保存し、参考金額は換算不可とする
+- 保存対象の本文がない新規セッションでは、空の会話ノートを作成しない
+
+### Fixed
+
+- Claude CodeのOpus 5.5キャッシュ読込を100万tokenあたり$0.20へ修正し、他の保存スクリプトと統一
+- OpenCodeのGPT参考換算にもリクエスト単位の272K超料金を適用し、Piとともに対象回答へ長文料金の印を表示（記録済みの正のcostは優先）
+- Claude CodeのOpus 5.5・Sonnet 5.5は入力20万token超でも標準単価で換算
+- 同じ内容のStop hookを再実行しても、Codexのノートの更新時刻だけが変わらないよう修正
+- 本文のないユーザー発話やCodexの明示的なturn ID変更を挟んだ回答を、増分保存でも別のcalloutとして表示
+- OpenCode・Piで既存ノートを再構成する際、作成日時・source・タグを保持
+- OpenCodeの保存失敗をプラグインへ返し、失敗した会話を保存済みとして扱わないよう修正
+- OpenCodeでもClaude・Muse Sparkのプロバイダ接頭辞付きモデル別名を認識
+
+## [3.6.2] - 2026-10-05
+
+### Fixed
+
+- Piで同じユーザー発話に対する同一モデルの途中経過と最終回答を1つのcalloutにまとめ、回答のUsageと表示件数も集約
+- Piのツール専用Usageを同じユーザー発話内の同一モデルを優先した最寄り回答へ加算
+- Piで本文が同じ分岐間の切替でも回答のUsageを更新し、本文のない分岐へ切り替えた際に以前の本文が残る問題を修正
+- Piでプロジェクト名がない場合の保存ファイル名を共通仕様に統一
+- OpenCodeで本文のないユーザー発話を挟んだ回答を別々のcalloutとして表示
+
+## [3.6.1] - 2026-10-05
+
+### Changed
+
+- Piでquotaを取得できなかったため、quota取得コードを削除
+
+## [3.6.0] - 2026-10-05
+
+### Added
+
+- PiのTypeScript extensionから会話をObsidianへ自動保存。本文は現在の分岐を表示し、Usageは別分岐・圧縮なども含むセッション全体を集計
+- PiでGPT系とMuse Spark・Claude・Nemotronの標準API単価によるUSD参考換算に対応
+
+## [3.5.3] - 2026-10-04
+
+### Changed
+
+- Claude CodeのUSD換算対象をOpus 5.5、Sonnet 5.5、Nemotron 3 Ultraの3モデルに限定
+
+### Fixed
+
+- Claude CodeとOpenCodeでNemotronのプロバイダ接頭辞付き正式モデルIDを共通の単価表名に対応
+- Claude CodeのUSD換算で`anthropic/claude-sonnet-5.5`を認識し、`nvidia/nemotron-3-ultra-550b-a55b:free`も有料版の参考単価で換算
+
+## [3.5.2] - 2026-10-04
+
+### Fixed
+
+- Claude Codeの会話ログの書き込みが遅れた場合に、最終回答やtoken使用量が保存されない問題を修正
+
+## [3.5.1] - 2026-09-30
+
+### Changed
+
+- OpenCodeの無料モデルも、対応する有料モデルの単価を参考値としてUSD換算
+- Claude Opus 5.5のモデルIDを正しく認識
+
+## [3.5.0] - 2026-09-29
+
+### Changed
+
+- OpenCodeの回答ごとのUsageに、同じユーザー発話中の本文のないツール専用レコードも加算
+
+## [3.4.0] - 2026-09-29
+
+### Added
+
+- OpenCodeの保存本文先頭に、quotaを含めずUSD換算額とモデル別金額のサマリを表示
+
+## [3.3.0] - 2026-09-29
+
+### Added
+
+- OpenCodeの会話UsageにMuse Spark 1.3系の標準API単価によるUSD概算を追加し、`muse-spark-1.3-contributor-free`などOpenCodeが正の`cost`を返さない場合も金額を記録
+
 ## [3.2.0] - 2026-09-29
 
 ### Added

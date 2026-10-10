@@ -83,25 +83,14 @@ def try_session_lock(session_id: str, *, is_key: bool = False):
         lock_file.close()
 
 
-def session_locked(input_key: str):
-    """hook input内のsession idを使って関数を排他実行する。"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(hook_input: dict):
-            session_id = hook_input.get(input_key, "")
-            if not session_id:
-                return func(hook_input)
-            with session_lock(str(session_id)):
-                return func(hook_input)
-        return wrapper
-    return decorator
-
-
 def load_state(session_id: str) -> dict:
     path = state_path(session_id)
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("stateはJSONオブジェクトが必要です")
+            return data
         except Exception as error:
             logger.info("stateファイルの読み込みに失敗しました（破損の可能性）: %s: %s", path, error)
             return {}
