@@ -31,39 +31,6 @@ def _answer_usage_groups(messages: list[dict]) -> list[tuple[int, dict | None, d
     return groups
 
 
-def _assistant_header_spans(content: str) -> list[tuple[int, int]]:
-    """コードフェンス外のassistant metadata行の範囲を返す。"""
-    lines = content.splitlines(keepends=True)
-    spans = []
-    index = 0
-    active_fence = None
-    while index < len(lines):
-        marker = _fence_marker(lines[index])
-        if active_fence is not None:
-            if (
-                marker is not None
-                and marker[0] == active_fence[0]
-                and marker[1] >= active_fence[1]
-                and not marker[2].strip()
-            ):
-                active_fence = None
-            index += 1
-            continue
-        if marker is not None:
-            active_fence = marker[:2]
-            index += 1
-            continue
-        if lines[index].rstrip("\r\n") != f"> [!NOTE] {AGENT_NAME}":
-            index += 1
-            continue
-        end = index + 1
-        while end < len(lines) and lines[end].startswith("> <small>"):
-            end += 1
-        spans.append((index, end))
-        index = end
-    return spans
-
-
 def refresh_answer_usage_metadata(content: str, messages: list[dict]) -> str:
     """遅れて書かれたusage recordを既存assistant calloutへ反映する。
 
@@ -127,7 +94,9 @@ def refresh_answer_usage_metadata(content: str, messages: list[dict]) -> str:
                 ]
                 if run_index == len(run) - 1 and usage_text:
                     newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
-                    metadata_lines.append(f"> <small>{usage_text}</small>{newline}")
+                    timing_index = next((index for index, line in enumerate(metadata_lines)
+                                         if line.startswith("> <small>⏱ 回答所要時間: ")), len(metadata_lines))
+                    metadata_lines.insert(timing_index, f"> <small>{usage_text}</small>{newline}")
                 replacements.append((start, end, metadata_lines))
     for start, end, metadata_lines in sorted(replacements, reverse=True):
         lines[start:end] = metadata_lines

@@ -110,7 +110,8 @@ class TestOpenCodeSave(unittest.TestCase):
             ">\n"
             "> Snapshot question\n\n"
             "> [!NOTE] OpenCode\n"
-            "> <small>🤖 snapshot-model</small>\n\n"
+            "> <small>🤖 snapshot-model</small>\n"
+            "> <small>⏱ 回答所要時間: 取得不可</small>\n\n"
             "Snapshot answer\n\n"
         )
         self.assertEqual(actual, expected)
@@ -177,7 +178,7 @@ class TestOpenCodeSave(unittest.TestCase):
         self.assertEqual(content.count("> [!QUESTION] User"), 1)
         self.assertEqual(content.count("> [!NOTE] OpenCode"), 1)
         self.assertEqual(content.count("進捗"), 1)
-        self.assertEqual(content.count("回答"), 1)
+        self.assertEqual(content.count("\n回答\n"), 1)
 
     def test_full_sync_after_state_loss_preserves_reply_missing_from_payload(self):
         session_id = "ses_grouped_partial_recovery"
@@ -322,7 +323,7 @@ class TestOpenCodeSave(unittest.TestCase):
         content = path.read_text(encoding="utf-8")
         self.assertIn("total_tokens: 12", content)
         self.assertEqual(content.count("Usage: 12 tok"), 1)
-        self.assertEqual(content.count("回答"), 1)
+        self.assertEqual(content.count("\n回答\n"), 1)
 
     def test_usage_includes_assistant_without_visible_text(self):
         payload = {"session_id": "ses_hidden_usage", "cwd": "/tmp/example", "full_sync": True,
@@ -426,7 +427,7 @@ class TestOpenCodeSave(unittest.TestCase):
         self.assertIn("message_count: 2", content)
         self.assertEqual(content.count("質問"), 3)
         self.assertIn('title: "質問"', content)
-        self.assertEqual(content.count("回答"), 1)
+        self.assertEqual(content.count("\n回答\n"), 1)
         self.assertIn("payload_hash", opencode_save.load_state("ses_test_123"))
 
     def test_partial_payloads_preserve_previous_turns(self):

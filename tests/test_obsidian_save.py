@@ -874,14 +874,16 @@ Response text
         self.assertEqual(str(usage["by_model"]["gpt-6-luna"]["cost_usd"]), "0.00001915")
         self.assertEqual(str(usage["by_model"]["gpt-6-astra"]["cost_usd"]), "0.00332")
 
-        # 長文料金はセッション全体ではなく、272K input tokens超の各recordにだけ適用する。
+        # 既定では272K超も通常単価。設定を有効にすると各recordへ長文倍率を適用する。
         long_context = {
             "input_tokens": 272001,
             "cached_input_tokens": 0,
             "cache_write_input_tokens": 0,
             "output_tokens": 10,
         }
-        self.assertEqual(str(codex_save._usage_cost("gpt-6-astra", long_context)), "5.44077")
+        self.assertEqual(str(codex_save._usage_cost("gpt-6-astra", long_context)), "2.72051")
+        with mock.patch.object(codex_save, "APPLY_LONG_CONTEXT_PRICING", True):
+            self.assertEqual(str(codex_save._usage_cost("gpt-6-astra", long_context)), "5.44077")
 
         gpt6_usage = {
             "input_tokens": 1000000,
@@ -889,11 +891,11 @@ Response text
             "cache_write_input_tokens": 100000,
             "output_tokens": 100000,
         }
-        self.assertEqual(codex_save._usage_cost("gpt-6-astra", gpt6_usage), codex_save.Decimal("24.400"))
+        self.assertEqual(codex_save._usage_cost("gpt-6-astra", gpt6_usage), codex_save.Decimal("13.45"))
         self.assertEqual(
-            codex_save._usage_cost("gpt-6.1-sol", gpt6_usage), codex_save.Decimal("4.840")
+            codex_save._usage_cost("gpt-6.1-sol", gpt6_usage), codex_save.Decimal("2.67")
         )
-        self.assertEqual(str(codex_save._usage_cost("gpt-6-luna", gpt6_usage)), "0.244")
+        self.assertEqual(str(codex_save._usage_cost("gpt-6-luna", gpt6_usage)), "0.1345")
 
         path = codex_save.create_md_file("usage-session", "myproj", datetime.now(JST), usage=usage)
         content = path.read_text(encoding="utf-8")
@@ -1082,7 +1084,7 @@ Response text
         self.assertIn("total_cost_usd:", content)
         cost_line = next(line for line in content.splitlines() if line.startswith("  total_cost_usd:"))
         self.assertEqual(claude_save.Decimal(cost_line.split(":", 1)[1].strip()), claude_save.Decimal("0.00030"))
-        self.assertEqual(content.count("回答"), 1)
+        self.assertEqual(content.count("\n回答\n"), 1)
         claude_save.handle_stop_event(hook)
         self.assertEqual(content, Path(state["output_path"]).read_text(encoding="utf-8"))
 
@@ -1117,6 +1119,7 @@ Response text
         self.assertEqual(recovered["initial_quota"]["claude"]["weekly"]["remaining"], 90.0)
         self.assertEqual(recovered["final_quota"]["claude"]["weekly"]["remaining"], 85.0)
 
+    @mock.patch.object(codex_save, "APPLY_LONG_CONTEXT_PRICING", True)
     def test_codex_answer_usage_is_assigned_once_and_marks_long_context(self):
         transcript = self.test_dir / "answer-usage.jsonl"
         rows = [

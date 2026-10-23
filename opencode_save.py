@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """OpenCode プラグインから渡された会話を Obsidian に保存する。"""
 
-__version__ = "3.8.0"
+__version__ = "3.11.1"
 
 import argparse
 import sys
@@ -29,6 +29,9 @@ OBSIDIAN_VAULT = Path(os.environ.get("OBSIDIAN_VAULT", str(Path.home() / "obsidi
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
 DEFAULT_SOURCE = "opencode"
 
+# GPT参考換算の272K超倍率（入力・キャッシュ系2倍、出力1.5倍）。
+APPLY_LONG_CONTEXT_PRICING = True
+
 # Usage の標準 API 単価（USD / 1,000,000 tokens）。input_tokens には
 # cached_input_tokens と cache_write_input_tokens が含まれるため、通常入力の
 # 単価はそれらを除いた残りにだけ適用する。推論トークンは output_tokens の内数。
@@ -50,7 +53,16 @@ DEFAULT_SOURCE = "opencode"
 # https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints
 # Haiku 5.5: 2026-10-09確認。10万token超は全token種別で5倍。
 # https://platform.claude.com/docs/en/models/haiku-5-5/overview
+# DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
+# https://api-docs.deepseek.com/quick_start/pricing/
 STANDARD_USAGE_RATES = {
+    "deepseek-v4.1-flash": {
+        "input": Decimal("0.30"),
+        "cached_input": Decimal("0.006"),
+        # 自動キャッシュの書込分もcache missの入力単価で換算。
+        "cache_write_input": Decimal("0.30"),
+        "output": Decimal("1.20"),
+    },
     "gpt-6-astra": {
         "input": Decimal("10.00"),
         "cached_input": Decimal("1.00"),
@@ -671,6 +683,54 @@ def callout_lines(text: str) -> str:
 
 
 # BEGIN GENERATED: message-metadata
+def annotate_answer_timings(messages: list[dict]) -> list[dict]:
+    """依頼から最後の回答完了までを測る。元の入力は変更しない。"""
+    result = [dict(message) for message in messages]
+    started = None
+    last_answer = None
+    last_turn = None
+
+    def finish():
+        if last_answer is None:
+            return
+        value = result[last_answer].get("completed_at")
+        ended = _try_parse_datetime(value) if not isinstance(value, bool) else None
+        seconds = (ended - started).total_seconds() if started is not None and ended is not None else None
+        result[last_answer]["answer_duration_seconds"] = seconds if seconds is not None and seconds >= 0 else None
+
+    for index, message in enumerate(result):
+        message.pop("answer_duration_seconds", None)
+        role = message.get("type")
+        turn = message.get("turn_id") or None
+        if role in ("user", "user_message"):
+            finish()
+            value = message.get("timestamp")
+            started = _try_parse_datetime(value) if not isinstance(value, bool) else None
+            last_answer = None
+            last_turn = turn
+        elif role in ("assistant", "agent_message"):
+            if message.get("after_turn_boundary") or (turn and last_turn and turn != last_turn):
+                finish()
+                started = None
+                last_answer = None
+            last_turn = turn or last_turn
+            if str(message.get("text", message.get("message", ""))).strip():
+                last_answer = index
+    finish()
+    return result
+
+
+def format_answer_duration(seconds: object) -> str:
+    """取得できない時間を推測せず、全saverで同じ表示を使う。"""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 <= seconds < float("inf"):
+        return "⏱ 回答所要時間: 取得不可"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    duration = (f"{hours}時間" if hours else "") + (f"{minutes}分" if minutes or hours else "") + f"{secs}秒"
+    return f"⏱ 回答所要時間: {duration}"
+
+
 def format_message_time(timestamp: object) -> str:
     """ISO日時またはUnix epoch millisecondsをJSTの共通メタデータ行へ変換する。"""
     if timestamp in (None, ""):
@@ -1039,6 +1099,10 @@ def _normalize_usage_model(model: object) -> str:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     aliases = {
+        "deepseek-flash": "deepseek-v4.1-flash",
+        "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash:free": "deepseek-v4.1-flash",
         "gemini3.8-flash": "gemini-3.8-flash",
         "nemotron-3-ultra-550b-a55b:free": "nemotron-3-ultra-free",
         "claude-opus-5.5": "claude-opus-5-5",
@@ -1064,10 +1128,11 @@ def reference_price_model(model: object) -> str:
 
 
 def is_long_context_usage(model: object, usage: dict) -> bool:
-    """登録済みGPTの1リクエストの入力総数で、参考単価の長文条件を判定する。"""
+    """設定が有効な場合、登録済みGPTのリクエスト単位で長文料金を判定する。"""
     name = reference_price_model(model)
     tokens = usage.get("input_tokens", 0)
-    return (isinstance(tokens, int) and not isinstance(tokens, bool)
+    return (APPLY_LONG_CONTEXT_PRICING
+            and isinstance(tokens, int) and not isinstance(tokens, bool)
             and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
             and tokens > LONG_CONTEXT_INPUT_TOKENS)
 
@@ -1221,6 +1286,7 @@ def extract_messages(raw_messages: Iterable[Dict[str, Any]]) -> List[Dict[str, A
                 "type": role,
                 "text": text,
                 "timestamp": timestamp,
+                "completed_at": message_time.get("completed") if isinstance(message_time, dict) and role == "assistant" else None,
                 "model": model,
                 "provider": provider,
                 "sequence": sequence,
@@ -1600,6 +1666,8 @@ def parse_existing_markdown(path: Path) -> List[Dict[str, Any]]:
                 index += 1
         if index < end and lines[index].startswith("> <small>Usage: "):
             index += 1
+        if index < end and lines[index].startswith("> <small>⏱ 回答所要時間: "):
+            index += 1
         if index < end and lines[index] == "":
             index += 1
         body = "\n".join(lines[index:end]).strip("\n")
@@ -1690,6 +1758,7 @@ def render_full_session_markdown(
     agent_name: str, *, modified: datetime | None = None,
     usage_records=None, display_usage_records=None, source: str | None = None, tags=None,
 ) -> str:
+    messages = annotate_answer_timings(messages)
     groups = _display_message_groups(messages)
     all_records = list(usage_records) if usage_records is not None else messages
     display_records = list(display_usage_records) if display_usage_records is not None else all_records
@@ -1712,6 +1781,9 @@ def render_full_session_markdown(
         usage_text = format_message_usage(answer_usage)
         if usage_text:
             metadata.append(usage_text)
+        for item in group:
+            if "answer_duration_seconds" in item:
+                metadata.append(format_answer_duration(item["answer_duration_seconds"]))
         body = "\n\n".join(item["text"].strip("\n") for item in group)
         blocks.append(render_assistant_message_block(body, agent_name, metadata))
     return "".join(blocks)
@@ -1757,6 +1829,7 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
             "type": item["type"],
             "text": item["text"],
             "timestamp": item.get("timestamp", ""),
+            "completed_at": item.get("completed_at"),
             "model": item.get("model", ""),
             "provider": _message_provider(item),
             "usage": item.get("usage"),

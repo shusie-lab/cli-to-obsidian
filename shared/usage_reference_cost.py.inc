@@ -10,10 +10,11 @@ def reference_price_model(model: object) -> str:
 
 
 def is_long_context_usage(model: object, usage: dict) -> bool:
-    """登録済みGPTの1リクエストの入力総数で、参考単価の長文条件を判定する。"""
+    """設定が有効な場合、登録済みGPTのリクエスト単位で長文料金を判定する。"""
     name = reference_price_model(model)
     tokens = usage.get("input_tokens", 0)
-    return (isinstance(tokens, int) and not isinstance(tokens, bool)
+    return (APPLY_LONG_CONTEXT_PRICING
+            and isinstance(tokens, int) and not isinstance(tokens, bool)
             and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
             and tokens > LONG_CONTEXT_INPUT_TOKENS)
 

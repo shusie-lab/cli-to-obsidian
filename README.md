@@ -28,6 +28,28 @@ cli-to-obsidianは、対応するAIツールの会話をMarkdownとしてObsidia
 
 USD参考換算は、実際のサブスクリプション請求額やquota消費量を示すものではありません。また、token数や参考金額の比重は作業時間の比重とは異なります。取得できる情報は、次の対応表を確認してください。
 
+### 回答所要時間
+
+各ツールの最後の回答には、`⏱ 回答所要時間: 2分15秒` の形式で時間を表示します。
+ユーザーの発話から回答完了までの経過時間で、途中経過・ツール実行・通信・回答生成を含みます。
+AI内部の推論だけに費やした時間ではありません。同じ依頼でモデルが変わって複数の回答calloutに
+分かれる場合も、その依頼の最後のcalloutに総時間を表示します。秒未満は切り捨てます。
+
+- Codex: ターン完了イベントの完了時刻を使用します。まだ記録されていない場合は、明示的に
+  最終回答と識別できる回答完了イベントの時刻を使用します。
+- Claude Code: `turn_duration` 終了記録の時刻を使用します。Stopフックより後に記録される場合は
+  一旦「取得不可」となり、次の保存で読み取れた終了記録を反映します。
+- OpenCode: 回答の `time.completed` を使用します。
+- Pi: 回答終了時に履歴へ保存されるentryの時刻を使用します。モデル側の開始時刻とは区別します。
+- Antigravity: `terminationReason: model_stop`・`fullyIdle: true`・エラーなしのStopフックを
+  受信した時刻を、今回の回答の終了観測時刻として使用します。フック起動までの遅れを含みますが、
+  ロック待ち・quota取得など保存処理の時間は含みません。同じ回答の再実行では時刻を上書きしません。
+  観測時刻はstateとノート内の非表示コメントに保持し、state復旧・既存ノートの再構成でも引き継ぎます。
+  終了状態の情報が不足するStopや、終了を観測していない過去履歴だけからの再構成では「取得不可」と表示します。
+
+依頼時刻・完了時刻の欠落、不正な日時、完了が依頼より前になる記録でも「取得不可」と表示し、
+作成時刻やフック再実行時の現在時刻から推測しません。過去ノートを一括で再生成する処理は行いません。
+
 ## 対応ツール
 
 **Codex対応を中心に開発しています。** 開発者自身がメインで利用し、日々の開発・動作確認の中心にしています。
@@ -41,6 +63,8 @@ OpenCodeは補助として利用し、Piは使い始めた段階です。両ツ�
 | [Pi](#pi) | 今後拡充 | CLI（extension） | 対応 | なし | 2個 |
 | [Claude Code](#claude-code) | 参考実装 | CLI | 対応 | statusLine設定時に対応 | 1個 |
 | [Antigravity](#antigravity-cliとアプリ) | 参考実装 | CLI・Antigravityアプリ | なし | 対応 | 1個 |
+
+DeepSeek V4.1 Flashは`deepseek-flash`、`deepseek-v4.1-flash`（プロバイダ接頭辞付き・無料版の表記を含む）に対応します。[公式料金](https://api-docs.deepseek.com/quick_start/pricing/)のピーク単価（100万tokenあたり入力$0.30、キャッシュ読込$0.006、出力$1.20）で固定の参考換算を行います。キャッシュ書込は通常入力と同単価です。オフピークの半額料金への時刻別切り替えは行いません。無料版も有料API単価での参考値です。
 
 USD参考換算は登録済みモデルが対象です。単価が未登録の場合も、会話と取得できたtoken数は保存します。
 
@@ -337,15 +361,15 @@ Gemini 3.8 Flashは`google/gemini-3.8-flash`・`gemini-3.8-flash`・`gemini3.8-f
 
 Haiku 5.5は`claude-haiku-5-5`・`anthropic/claude-haiku-5.5`に対応します。100万tokenあたり入力$0.10、キャッシュ読込$0.01、5分書込$0.125、1時間書込$0.20、出力$0.50です。1リクエストの入力総数（キャッシュ読込・書込を含む）が10万tokenを超える場合は、すべての単価を5倍にします。[公式料金表](https://platform.claude.com/docs/en/about-claude/pricing)を2026-10-09に確認しました。
 
-CodexのUsageは、親セッションと`parent_thread_id`で紐付くサブエージェントのtranscriptにある`token_usage_record.payload.usage`を各レコード一度ずつ加算して集計します。子のusageは同じ`session_id`を持つレコードだけを対象にします。`thread_token_usage`の累計値は二重計上を避けるため使用しません。frontmatterの`usage`にはtoken総計・モデル別内訳・`total_cost_usd`・モデル別`cost_usd`を保存します。USD概算は、`shared/usage_prices.py.inc`から各スクリプトへ埋め込むモデル別標準API単価を用い、通常入力（`input_tokens`からキャッシュ入力・cache writeを除いた値）、キャッシュ入力、cache write、出力を別々に計算します。推論トークンは出力の内数のため二重計上しません。272K input tokensを超えるリクエストは、標準API価格どおり入力・キャッシュ系を2倍、出力を1.5倍にします。これはCodexの契約上の請求額やquota消費額ではなく、ツール料金・割引モードなどを含まない標準API単価による概算です。係数が未登録のモデルはtokenだけを保存し、金額を換算しません。既知モデルが一部でもある場合はその分の`total_cost_usd`を保存し、`cost_incomplete: true`で総計が部分換算であることを示します。USD表示・frontmatterの金額は小数桁を丸めません。
+CodexのUsageは、親セッションと`parent_thread_id`で紐付くサブエージェントのtranscriptにある`token_usage_record.payload.usage`を各レコード一度ずつ加算して集計します。子のusageは同じ`session_id`を持つレコードだけを対象にします。`thread_token_usage`の累計値は二重計上を避けるため使用しません。frontmatterの`usage`にはtoken総計・モデル別内訳・`total_cost_usd`・モデル別`cost_usd`を保存します。USD概算は、`shared/usage_prices.py.inc`から各スクリプトへ埋め込むモデル別標準API単価を用い、通常入力（`input_tokens`からキャッシュ入力・cache writeを除いた値）、キャッシュ入力、cache write、出力を別々に計算します。推論トークンは出力の内数のため二重計上しません。Codexでは、スクリプト先頭の`APPLY_LONG_CONTEXT_PRICING = False`により、272K input tokensを超えても通常単価で換算します。`True`にすると、従来どおりリクエスト単位で入力・キャッシュ系を2倍、出力を1.5倍にします。これはCodexの契約上の請求額やquota消費額ではなく、ツール料金・割引モードなどを含まない参考単価による概算です。係数が未登録のモデルはtokenだけを保存し、金額を換算しません。既知モデルが一部でもある場合はその分の`total_cost_usd`を保存し、`cost_incomplete: true`で総計が部分換算であることを示します。USD表示・frontmatterの金額は小数桁を丸めません。
 
-本文中のCodex回答calloutには、親transcriptの回答と、同じ親ターンに紐付くサブエージェントのUsage（`total_tokens`とUSD概算）を表示します。子の`root_turn_id`で親ターンを特定し、そのターンの最後に表示される回答calloutへ加えます。サブエージェント分がある回答では、合計のtoken数とUSD概算に加え、括弧内にサブエージェントのモデル別token数・USD概算を表示します。換算できないモデルは`換算不可`と表示します。親ターンを特定できない子のusageや、表示できる親回答がないターンのusageはセッション累計だけに含めます。本文冒頭のUsageセクションとfrontmatterの`usage`はセッション累計です。272K input tokensを超えるusage recordが回答に含まれる場合は、回答のUSD表示に`⚠︎ 272K+`を付けます。
+本文中のCodex回答calloutには、親transcriptの回答と、同じ親ターンに紐付くサブエージェントのUsage（`total_tokens`とUSD概算）を表示します。子の`root_turn_id`で親ターンを特定し、そのターンの最後に表示される回答calloutへ加えます。サブエージェント分がある回答では、合計のtoken数とUSD概算に加え、括弧内にサブエージェントのモデル別token数・USD概算を表示します。換算できないモデルは`換算不可`と表示します。親ターンを特定できない子のusageや、表示できる親回答がないターンのusageはセッション累計だけに含めます。本文冒頭のUsageセクションとfrontmatterの`usage`はセッション累計です。`APPLY_LONG_CONTEXT_PRICING = True`で272K input tokensを超えるusage recordが回答に含まれる場合は、回答のUSD表示に`⚠︎ 272K+`を付けます。無効時はこの印を表示しません。設定変更後にhookが動くと、そのセッションの累計と既存の回答Usageも再計算します。他の過去ノートを一括更新することはありません。
 
 Claude CodeのUsageはtranscriptの`message.usage`をmessage IDごとに最後の値だけ集計します。通常入力、キャッシュ読み込み、キャッシュ書き込み、出力を合わせてtoken総数を出します。換算対象は他のUsage対応saverと共通です。`shared/usage_prices.py.inc`から埋め込むtoken種別ごとの単価表からUSD概算を計算します。Opus 5.5のキャッシュ読込は100万tokenあたり$0.20です。Opus 5.5・Sonnet 5.5は入力20万token超でも標準単価で換算します。キャッシュ書込は5分・1時間の内訳に応じて換算し、価格に影響する条件を確定できない場合や未登録モデルはtokenのみを保存します。`anthropic/claude-sonnet-5.5`にも対応し、`nvidia/nemotron-3-ultra-550b-a55b:free`は対応する有料版の単価を参考値として換算します。これはClaude Codeのサブスクリプション請求額ではありません。quotaは任意のstatusLine設定から5h・weeklyの残量を観測し、Codexと同じ`first_observed`・`last_observed`形式で保存します。statusLineがquotaを返さない場合は省略します。
 
 Claude Codeの本文冒頭にも共通形式のUSD換算サマリを表示し、回答calloutには同じユーザー発話内の連続する同一モデルの回答に対応するtoken数・USD参考換算を表示します。遅れて書き込まれたUsageは既存calloutへ反映します。Codex・Claude Code・OpenCode・Piで、換算できない金額は`換算不可`、既知モデル分だけの金額は`部分換算`と表示します。金額は小数桁を丸めず、固定小数で出力します。
 
-OpenCodeのUsageはSQLiteのassistantレコードにある`tokens`をmessage IDごとに集計します。本文のないツール専用レコードもfrontmatterの合計に含めます。OpenCodeが正の`cost`を返した回答はその値を記録し、返さない回答は対応モデルの標準API単価でUSD概算します。モデルごとの単価は他のUsage対応saverと共通です。GPT系の参考換算ではCodex・Piと同じく、1リクエストの入力総数が272Kを超えた場合に入力・キャッシュ系2倍、出力1.5倍を適用します。長文料金で参考換算した回答には`⚠︎ 272K+`を付けます。記録済みの正の`cost`にはこの倍率を掛けません。無料モデルも無料利用の請求額ではなく、対応する有料モデルの単価を参考値として換算します。`cost: 0`は無料利用と断定せず、単価が未登録のモデルに限り換算不可として扱います。本文先頭にはCodexと同じ形式で合計・モデル別のUSD換算サマリを表示します。OpenRouter残高APIには接続しません。
+OpenCodeのUsageはSQLiteのassistantレコードにある`tokens`をmessage IDごとに集計します。本文のないツール専用レコードもfrontmatterの合計に含めます。OpenCodeが正の`cost`を返した回答はその値を記録し、返さない回答は対応モデルの標準API単価でUSD概算します。モデルごとの単価は他のUsage対応saverと共通です。GPT系の参考換算ではPiと同じく、1リクエストの入力総数が272Kを超えた場合に入力・キャッシュ系2倍、出力1.5倍を適用します。長文料金で参考換算した回答には`⚠︎ 272K+`を付けます。記録済みの正の`cost`にはこの倍率を掛けません。無料モデルも無料利用の請求額ではなく、対応する有料モデルの単価を参考値として換算します。`cost: 0`は無料利用と断定せず、単価が未登録のモデルに限り換算不可として扱います。本文先頭にはCodexと同じ形式で合計・モデル別のUSD換算サマリを表示します。OpenRouter残高APIには接続しません。
 
 OpenCodeの連続する同一モデルの回答は、途中経過と最終回答を1つのcalloutにまとめます。本文のないassistantのツール専用レコードは、同じユーザー発話内で最も近い回答calloutのUsageへ加算します。frontmatterのUsageにはすべてのassistantレコードを含みます。
 
@@ -502,7 +526,7 @@ Markdownの出力形式では、[Obsidian AI Exporter](https://github.com/sho765
 
 ## バージョン管理
 
-このソースのバージョンは3.8.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`、ルートの[VERSION](./VERSION)、Gitタグは同じ値です。
+このソースのバージョンは3.11.1です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`、ルートの[VERSION](./VERSION)、Gitタグは同じ値です。
 
 ## ライセンス
 

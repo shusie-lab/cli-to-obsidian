@@ -64,6 +64,9 @@ def render_incremental_messages(content: str, messages: list[dict], *, model_nam
         metadata = [f"🤖 {model}"] if model else []
         if usage:
             metadata.append(format_message_usage(usage, subagent_usage))
+        for item in group:
+            if "answer_duration_seconds" in item:
+                metadata.append(format_answer_duration(item["answer_duration_seconds"]))
         body = visible[0]["text"]
         for item in visible[1:]:
             separator = "\n\n" if item.get("after_tool_use") else "\n"

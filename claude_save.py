@@ -8,7 +8,7 @@ Claude Code CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "3.8.0"
+__version__ = "3.11.1"
 
 from bisect import bisect_right
 import json
@@ -34,6 +34,9 @@ from logging.handlers import RotatingFileHandler
 # ============================================================
 LOGGER_NAME = "claude_obsidian_save"
 JST = timezone(timedelta(hours=9))
+
+# GPT参考換算の272K超倍率（入力・キャッシュ系2倍、出力1.5倍）。
+APPLY_LONG_CONTEXT_PRICING = True
 
 OBSIDIAN_VAULT = Path(
     os.environ.get(
@@ -65,7 +68,16 @@ DEFAULT_SOURCE = "claude-code"
 # https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints
 # Haiku 5.5: 2026-10-09確認。10万token超は全token種別で5倍。
 # https://platform.claude.com/docs/en/models/haiku-5-5/overview
+# DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
+# https://api-docs.deepseek.com/quick_start/pricing/
 STANDARD_USAGE_RATES = {
+    "deepseek-v4.1-flash": {
+        "input": Decimal("0.30"),
+        "cached_input": Decimal("0.006"),
+        # 自動キャッシュの書込分もcache missの入力単価で換算。
+        "cache_write_input": Decimal("0.30"),
+        "output": Decimal("1.20"),
+    },
     "gpt-6-astra": {
         "input": Decimal("10.00"),
         "cached_input": Decimal("1.00"),
@@ -833,10 +845,143 @@ def _iter_lines_outside_fences(text: str):
             active_fence = marker[:2]
             continue
         yield line
+
+
+def _assistant_header_spans(content: str) -> list[tuple[int, int]]:
+    """コードフェンス外のassistant metadata行の範囲を返す。"""
+    lines = content.splitlines(keepends=True)
+    spans = []
+    index = 0
+    active_fence = None
+    while index < len(lines):
+        marker = _fence_marker(lines[index])
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
+            index += 1
+            continue
+        if marker is not None:
+            active_fence = marker[:2]
+            index += 1
+            continue
+        if lines[index].rstrip("\r\n") != f"> [!NOTE] {AGENT_NAME}":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and lines[end].startswith("> <small>"):
+            end += 1
+        spans.append((index, end))
+        index = end
+    return spans
+
+
+def refresh_answer_timing_metadata(content: str, messages: list[dict]) -> str:
+    """終了記録が後から届いた場合も、依頼の最後のcalloutだけを更新する。"""
+    timings = {}
+    turn_index = 0
+    last_turn_id = None
+    for message in messages:
+        turn_id = message.get("turn_id") or None
+        if message.get("type") == "user_message":
+            turn_index += 1
+            last_turn_id = turn_id
+            continue
+        if message.get("type") != "agent_message":
+            continue
+        if message.get("after_turn_boundary") or (turn_id and last_turn_id and turn_id != last_turn_id):
+            turn_index += 1
+        last_turn_id = turn_id or last_turn_id
+        if "answer_duration_seconds" in message:
+            timings[turn_index] = message["answer_duration_seconds"]
+    lines = content.splitlines(keepends=True)
+    user_positions = []
+    active_fence = None
+    for index, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if active_fence is not None:
+            if marker and marker[0] == active_fence[0] and marker[1] >= active_fence[1] and not marker[2].strip():
+                active_fence = None
+            continue
+        if marker:
+            active_fence = marker[:2]
+            continue
+        if line.rstrip("\r\n") in ("> [!QUESTION] User", HIDDEN_USER_BOUNDARY):
+            user_positions.append(index)
+    spans_by_turn = {}
+    for start, end in _assistant_header_spans(content):
+        turn = sum(position < start for position in user_positions)
+        spans_by_turn.setdefault(turn, []).append((start, end))
+    replacements = []
+    for turn, spans in spans_by_turn.items():
+        if turn not in timings:
+            continue
+        for index, (start, end) in enumerate(spans):
+            metadata = [line for line in lines[start:end]
+                        if not line.startswith("> <small>⏱ 回答所要時間: ")]
+            if index == len(spans) - 1:
+                newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+                metadata.append("> <small>" + format_answer_duration(timings[turn]) + "</small>" + newline)
+            replacements.append((start, end, metadata))
+    for start, end, metadata in reversed(replacements):
+        lines[start:end] = metadata
+    return "".join(lines)
 # END GENERATED: incremental-callout
 
 
 # BEGIN GENERATED: message-metadata
+def annotate_answer_timings(messages: list[dict]) -> list[dict]:
+    """依頼から最後の回答完了までを測る。元の入力は変更しない。"""
+    result = [dict(message) for message in messages]
+    started = None
+    last_answer = None
+    last_turn = None
+
+    def finish():
+        if last_answer is None:
+            return
+        value = result[last_answer].get("completed_at")
+        ended = _try_parse_datetime(value) if not isinstance(value, bool) else None
+        seconds = (ended - started).total_seconds() if started is not None and ended is not None else None
+        result[last_answer]["answer_duration_seconds"] = seconds if seconds is not None and seconds >= 0 else None
+
+    for index, message in enumerate(result):
+        message.pop("answer_duration_seconds", None)
+        role = message.get("type")
+        turn = message.get("turn_id") or None
+        if role in ("user", "user_message"):
+            finish()
+            value = message.get("timestamp")
+            started = _try_parse_datetime(value) if not isinstance(value, bool) else None
+            last_answer = None
+            last_turn = turn
+        elif role in ("assistant", "agent_message"):
+            if message.get("after_turn_boundary") or (turn and last_turn and turn != last_turn):
+                finish()
+                started = None
+                last_answer = None
+            last_turn = turn or last_turn
+            if str(message.get("text", message.get("message", ""))).strip():
+                last_answer = index
+    finish()
+    return result
+
+
+def format_answer_duration(seconds: object) -> str:
+    """取得できない時間を推測せず、全saverで同じ表示を使う。"""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 <= seconds < float("inf"):
+        return "⏱ 回答所要時間: 取得不可"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    duration = (f"{hours}時間" if hours else "") + (f"{minutes}分" if minutes or hours else "") + f"{secs}秒"
+    return f"⏱ 回答所要時間: {duration}"
+
+
 def format_message_time(timestamp: object) -> str:
     """ISO日時またはUnix epoch millisecondsをJSTの共通メタデータ行へ変換する。"""
     if timestamp in (None, ""):
@@ -951,39 +1096,6 @@ def _answer_usage_groups(messages: list[dict]) -> list[tuple[int, dict | None, d
     return groups
 
 
-def _assistant_header_spans(content: str) -> list[tuple[int, int]]:
-    """コードフェンス外のassistant metadata行の範囲を返す。"""
-    lines = content.splitlines(keepends=True)
-    spans = []
-    index = 0
-    active_fence = None
-    while index < len(lines):
-        marker = _fence_marker(lines[index])
-        if active_fence is not None:
-            if (
-                marker is not None
-                and marker[0] == active_fence[0]
-                and marker[1] >= active_fence[1]
-                and not marker[2].strip()
-            ):
-                active_fence = None
-            index += 1
-            continue
-        if marker is not None:
-            active_fence = marker[:2]
-            index += 1
-            continue
-        if lines[index].rstrip("\r\n") != f"> [!NOTE] {AGENT_NAME}":
-            index += 1
-            continue
-        end = index + 1
-        while end < len(lines) and lines[end].startswith("> <small>"):
-            end += 1
-        spans.append((index, end))
-        index = end
-    return spans
-
-
 def refresh_answer_usage_metadata(content: str, messages: list[dict]) -> str:
     """遅れて書かれたusage recordを既存assistant calloutへ反映する。
 
@@ -1047,7 +1159,9 @@ def refresh_answer_usage_metadata(content: str, messages: list[dict]) -> str:
                 ]
                 if run_index == len(run) - 1 and usage_text:
                     newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
-                    metadata_lines.append(f"> <small>{usage_text}</small>{newline}")
+                    timing_index = next((index for index, line in enumerate(metadata_lines)
+                                         if line.startswith("> <small>⏱ 回答所要時間: ")), len(metadata_lines))
+                    metadata_lines.insert(timing_index, f"> <small>{usage_text}</small>{newline}")
                 replacements.append((start, end, metadata_lines))
     for start, end, metadata_lines in sorted(replacements, reverse=True):
         lines[start:end] = metadata_lines
@@ -1189,6 +1303,9 @@ def render_incremental_messages(content: str, messages: list[dict], *, model_nam
         metadata = [f"🤖 {model}"] if model else []
         if usage:
             metadata.append(format_message_usage(usage, subagent_usage))
+        for item in group:
+            if "answer_duration_seconds" in item:
+                metadata.append(format_answer_duration(item["answer_duration_seconds"]))
         body = visible[0]["text"]
         for item in visible[1:]:
             separator = "\n\n" if item.get("after_tool_use") else "\n"
@@ -1591,6 +1708,10 @@ def _normalize_usage_model(model: object) -> str:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     aliases = {
+        "deepseek-flash": "deepseek-v4.1-flash",
+        "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash:free": "deepseek-v4.1-flash",
         "gemini3.8-flash": "gemini-3.8-flash",
         "nemotron-3-ultra-550b-a55b:free": "nemotron-3-ultra-free",
         "claude-opus-5.5": "claude-opus-5-5",
@@ -1616,10 +1737,11 @@ def reference_price_model(model: object) -> str:
 
 
 def is_long_context_usage(model: object, usage: dict) -> bool:
-    """登録済みGPTの1リクエストの入力総数で、参考単価の長文条件を判定する。"""
+    """設定が有効な場合、登録済みGPTのリクエスト単位で長文料金を判定する。"""
     name = reference_price_model(model)
     tokens = usage.get("input_tokens", 0)
-    return (isinstance(tokens, int) and not isinstance(tokens, bool)
+    return (APPLY_LONG_CONTEXT_PRICING
+            and isinstance(tokens, int) and not isinstance(tokens, bool)
             and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
             and tokens > LONG_CONTEXT_INPUT_TOKENS)
 
@@ -1753,6 +1875,13 @@ def load_jsonl_messages(jsonl_path: Path, start_line: int, transcript_text: str 
                 if not isinstance(data, dict) or data.get("isSidechain"):
                     continue
                 kind = data.get("type")
+                if kind == "system" and data.get("subtype") == "turn_duration":
+                    for answer in reversed(messages):
+                        if answer["type"] == "user_message":
+                            break
+                        if answer["type"] == "agent_message":
+                            answer["completed_at"] = data.get("timestamp")
+                            break
                 msg = data.get("message") or {}
                 if not isinstance(msg, dict):
                     continue
@@ -1789,6 +1918,7 @@ def load_jsonl_messages(jsonl_path: Path, start_line: int, transcript_text: str 
         usage = summarize_usage(usage_records, estimate_missing=False)
         if usage is not None:
             message["usage"] = usage
+    messages = annotate_answer_timings(messages)
     return [message for message in messages if message["line_number"] > start_line], current_line
 
 # ============================================================
@@ -2240,6 +2370,11 @@ def handle_stop_event(hook_input: dict) -> None:
         refreshed = preserve_modified_if_unchanged(content, refreshed)
         if refreshed != content:
             atomic_write_md(path, refreshed)
+    content = path.read_text(encoding="utf-8")
+    all_messages, _ = load_jsonl_messages(jsonl_path, 0, transcript_text)
+    refreshed = refresh_answer_timing_metadata(content, all_messages)
+    if refreshed != content:
+        atomic_write_md(path, refreshed)
     save_state(session_id, state)
 
 # ============================================================

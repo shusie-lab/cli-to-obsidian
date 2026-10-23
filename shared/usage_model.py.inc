@@ -4,6 +4,10 @@ def _normalize_usage_model(model: object) -> str:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     aliases = {
+        "deepseek-flash": "deepseek-v4.1-flash",
+        "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash:free": "deepseek-v4.1-flash",
         "gemini3.8-flash": "gemini-3.8-flash",
         "nemotron-3-ultra-550b-a55b:free": "nemotron-3-ultra-free",
         "claude-opus-5.5": "claude-opus-5-5",

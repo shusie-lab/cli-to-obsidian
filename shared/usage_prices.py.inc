@@ -8,7 +8,16 @@
 # https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints
 # Haiku 5.5: 2026-10-09確認。10万token超は全token種別で5倍。
 # https://platform.claude.com/docs/en/models/haiku-5-5/overview
+# DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
+# https://api-docs.deepseek.com/quick_start/pricing/
 STANDARD_USAGE_RATES = {
+    "deepseek-v4.1-flash": {
+        "input": Decimal("0.30"),
+        "cached_input": Decimal("0.006"),
+        # 自動キャッシュの書込分もcache missの入力単価で換算。
+        "cache_write_input": Decimal("0.30"),
+        "output": Decimal("1.20"),
+    },
     "gpt-6-astra": {
         "input": Decimal("10.00"),
         "cached_input": Decimal("1.00"),

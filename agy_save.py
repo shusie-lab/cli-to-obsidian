@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "3.8.0"
+__version__ = "3.11.1"
 
 import json
 import math
@@ -747,10 +747,143 @@ def _iter_lines_outside_fences(text: str):
             active_fence = marker[:2]
             continue
         yield line
+
+
+def _assistant_header_spans(content: str) -> list[tuple[int, int]]:
+    """コードフェンス外のassistant metadata行の範囲を返す。"""
+    lines = content.splitlines(keepends=True)
+    spans = []
+    index = 0
+    active_fence = None
+    while index < len(lines):
+        marker = _fence_marker(lines[index])
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
+            index += 1
+            continue
+        if marker is not None:
+            active_fence = marker[:2]
+            index += 1
+            continue
+        if lines[index].rstrip("\r\n") != f"> [!NOTE] {AGENT_NAME}":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and lines[end].startswith("> <small>"):
+            end += 1
+        spans.append((index, end))
+        index = end
+    return spans
+
+
+def refresh_answer_timing_metadata(content: str, messages: list[dict]) -> str:
+    """終了記録が後から届いた場合も、依頼の最後のcalloutだけを更新する。"""
+    timings = {}
+    turn_index = 0
+    last_turn_id = None
+    for message in messages:
+        turn_id = message.get("turn_id") or None
+        if message.get("type") == "user_message":
+            turn_index += 1
+            last_turn_id = turn_id
+            continue
+        if message.get("type") != "agent_message":
+            continue
+        if message.get("after_turn_boundary") or (turn_id and last_turn_id and turn_id != last_turn_id):
+            turn_index += 1
+        last_turn_id = turn_id or last_turn_id
+        if "answer_duration_seconds" in message:
+            timings[turn_index] = message["answer_duration_seconds"]
+    lines = content.splitlines(keepends=True)
+    user_positions = []
+    active_fence = None
+    for index, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if active_fence is not None:
+            if marker and marker[0] == active_fence[0] and marker[1] >= active_fence[1] and not marker[2].strip():
+                active_fence = None
+            continue
+        if marker:
+            active_fence = marker[:2]
+            continue
+        if line.rstrip("\r\n") in ("> [!QUESTION] User", HIDDEN_USER_BOUNDARY):
+            user_positions.append(index)
+    spans_by_turn = {}
+    for start, end in _assistant_header_spans(content):
+        turn = sum(position < start for position in user_positions)
+        spans_by_turn.setdefault(turn, []).append((start, end))
+    replacements = []
+    for turn, spans in spans_by_turn.items():
+        if turn not in timings:
+            continue
+        for index, (start, end) in enumerate(spans):
+            metadata = [line for line in lines[start:end]
+                        if not line.startswith("> <small>⏱ 回答所要時間: ")]
+            if index == len(spans) - 1:
+                newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+                metadata.append("> <small>" + format_answer_duration(timings[turn]) + "</small>" + newline)
+            replacements.append((start, end, metadata))
+    for start, end, metadata in reversed(replacements):
+        lines[start:end] = metadata
+    return "".join(lines)
 # END GENERATED: incremental-callout
 
 
 # BEGIN GENERATED: message-metadata
+def annotate_answer_timings(messages: list[dict]) -> list[dict]:
+    """依頼から最後の回答完了までを測る。元の入力は変更しない。"""
+    result = [dict(message) for message in messages]
+    started = None
+    last_answer = None
+    last_turn = None
+
+    def finish():
+        if last_answer is None:
+            return
+        value = result[last_answer].get("completed_at")
+        ended = _try_parse_datetime(value) if not isinstance(value, bool) else None
+        seconds = (ended - started).total_seconds() if started is not None and ended is not None else None
+        result[last_answer]["answer_duration_seconds"] = seconds if seconds is not None and seconds >= 0 else None
+
+    for index, message in enumerate(result):
+        message.pop("answer_duration_seconds", None)
+        role = message.get("type")
+        turn = message.get("turn_id") or None
+        if role in ("user", "user_message"):
+            finish()
+            value = message.get("timestamp")
+            started = _try_parse_datetime(value) if not isinstance(value, bool) else None
+            last_answer = None
+            last_turn = turn
+        elif role in ("assistant", "agent_message"):
+            if message.get("after_turn_boundary") or (turn and last_turn and turn != last_turn):
+                finish()
+                started = None
+                last_answer = None
+            last_turn = turn or last_turn
+            if str(message.get("text", message.get("message", ""))).strip():
+                last_answer = index
+    finish()
+    return result
+
+
+def format_answer_duration(seconds: object) -> str:
+    """取得できない時間を推測せず、全saverで同じ表示を使う。"""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 <= seconds < float("inf"):
+        return "⏱ 回答所要時間: 取得不可"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    duration = (f"{hours}時間" if hours else "") + (f"{minutes}分" if minutes or hours else "") + f"{secs}秒"
+    return f"⏱ 回答所要時間: {duration}"
+
+
 def format_message_time(timestamp: object) -> str:
     """ISO日時またはUnix epoch millisecondsをJSTの共通メタデータ行へ変換する。"""
     if timestamp in (None, ""):
@@ -966,6 +1099,9 @@ def render_incremental_messages(content: str, messages: list[dict], *, model_nam
         metadata = [f"🤖 {model}"] if model else []
         if usage:
             metadata.append(format_message_usage(usage, subagent_usage))
+        for item in group:
+            if "answer_duration_seconds" in item:
+                metadata.append(format_answer_duration(item["answer_duration_seconds"]))
         body = visible[0]["text"]
         for item in visible[1:]:
             separator = "\n\n" if item.get("after_tool_use") else "\n"
@@ -1213,7 +1349,8 @@ def load_jsonl_messages(jsonl_path: Path) -> list:
                     "model": current_model or "",
                 })
 
-    return final_messages
+    # この形式のcreated_atは完了時刻と確定できないため、時間は推測しない。
+    return annotate_answer_timings(final_messages)
 
 
 def extract_user_text(content) -> str:
@@ -1770,8 +1907,70 @@ def append_messages(
 # ============================================================
 # イベントハンドラ
 # ============================================================
+ANSWER_COMPLETIONS_PREFIX = "<!-- agy_answer_completions: "
+
+
+def recover_answer_completions(content: str) -> dict:
+    """state消失・履歴再構成でも、以前観測した完了時刻を復元する。"""
+    for line in _iter_lines_outside_fences(content):
+        if line.startswith(ANSWER_COMPLETIONS_PREFIX) and line.endswith(" -->"):
+            try:
+                values = json.loads(line[len(ANSWER_COMPLETIONS_PREFIX):-4])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(values, dict):
+                return {key: value for key, value in values.items()
+                        if re.fullmatch(r"[0-9a-f]{64}", key) and isinstance(value, str)
+                        and _try_parse_datetime(value) is not None}
+    return {}
+
+
+def apply_stop_completion(messages: list[dict], state: dict, content: str,
+                          last_id: str, hook_input: dict) -> list[dict]:
+    """今回の正常終了だけを観測し、回答の識別子ごとに最初の観測時刻を保持する。"""
+    completions = dict(state.get("answer_completions") or {})
+    completions.update(recover_answer_completions(content))
+    result = [dict(message) for message in messages]
+    user = None
+    keys = {}
+    for index, message in enumerate(result):
+        if message["type"] == "user_message":
+            user = [message.get("step_index"), message.get("timestamp"), message.get("message")]
+        elif message["type"] == "agent_message":
+            identity = [user, message.get("step_index"), message.get("timestamp"), message.get("message")]
+            keys[index] = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
+    latest = len(result) - 1
+    received_at = hook_input.get("_stop_received_at")
+    if latest in keys and received_at:
+        key = keys[latest]
+        # 復旧したcursor以前の履歴を、今回完了した回答と誤認しない。
+        fresh = bool(get_new_messages([result[latest]], last_id))
+        pending = state.get("pending_answer_completion") == key
+        if fresh or pending:
+            normal_stop = (hook_input.get("fullyIdle") is True
+                           and hook_input.get("terminationReason") == "model_stop"
+                           and not hook_input.get("error"))
+            if normal_stop:
+                completions.setdefault(key, received_at)
+                state.pop("pending_answer_completion", None)
+            else:
+                state["pending_answer_completion"] = key
+    for index, key in keys.items():
+        if key in completions:
+            result[index]["completed_at"] = completions[key]
+    if completions:
+        state["answer_completions"] = completions
+    return annotate_answer_timings(result)
+
+
+def handle_stop_event(hook_input: dict, *, observe_completion: bool = True) -> None:
+    # ロック待ち・履歴読み込み・quota取得より前に、フック受信時刻を固定する。
+    received_at = now_jst().isoformat() if observe_completion else None
+    _handle_stop_event(dict(hook_input, _stop_received_at=received_at))
+
+
 @session_locked("conversationId")
-def handle_stop_event(hook_input: dict) -> None:
+def _handle_stop_event(hook_input: dict) -> None:
     session_id = hook_input.get("conversationId", "")
     transcript_path = hook_input.get("transcriptPath", "")
     workspace_paths = hook_input.get("workspacePaths", [])
@@ -1802,6 +2001,7 @@ def handle_stop_event(hook_input: dict) -> None:
         return
     path, last_id = prepared
 
+    all_messages = apply_stop_completion(all_messages, state, path.read_text(encoding="utf-8"), last_id, hook_input)
     new_messages = get_new_messages(all_messages, last_id)
     if new_messages:
         current_quota = retrieve_quota()
@@ -1822,6 +2022,38 @@ def handle_stop_event(hook_input: dict) -> None:
         logger.info(f"{appended}件追記完了 {session_id[:8]}")
     else:
         save_state(session_id, state)
+
+    content = path.read_text(encoding="utf-8")
+    refreshed = refresh_answer_timing_metadata(content, all_messages)
+    completions = state.get("answer_completions")
+    if completions:
+        marker = ANSWER_COMPLETIONS_PREFIX + json.dumps(completions, sort_keys=True) + " -->"
+        # 本文中のコード例には触れず、コードフェンス外のコメント行だけを更新する。
+        lines = refreshed.splitlines(keepends=True)
+        active_fence = None
+        for index, line in enumerate(lines):
+            fence = _fence_marker(line)
+            if active_fence:
+                if fence and fence[0] == active_fence[0] and fence[1] >= active_fence[1] and not fence[2].strip():
+                    active_fence = None
+                continue
+            if fence:
+                active_fence = fence[:2]
+                continue
+            if line.startswith(ANSWER_COMPLETIONS_PREFIX) and line.rstrip("\r\n").endswith(" -->"):
+                lines[index] = marker + "\n"
+                break
+        else:
+            # 回答が未閉鎖のコードフェンスを含んでも、観測記録は本文より前に置く。
+            frontmatter = re.match(r"\A---\s*\n.*?\n---(?:\r?\n|$)", refreshed, re.DOTALL)
+            offset = frontmatter.end() if frontmatter else 0
+            lines = [refreshed[:offset], marker + "\n", refreshed[offset:]]
+        refreshed = "".join(lines)
+    if refreshed != content:
+        refreshed = update_markdown_metadata(refreshed, now_jst(), 0, state.get("last_id", last_id),
+                                              state.get("initial_quota"), state.get("final_quota"))
+        atomic_write_md(path, refreshed)
+    save_state(session_id, state)
 
 
 # メイン

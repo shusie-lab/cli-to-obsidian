@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -86,6 +87,40 @@ class TestRebuildSession(unittest.TestCase):
                 self.assertIsNone(backup)
                 self.assertFalse(normal_state.exists())
                 self.assertFalse(module.OUTPUT_BASE.exists())
+
+    def test_agy_rebuild_preserves_observed_completion_even_without_state(self):
+        module = self.module('agy')
+        transcript = self.transcript('agy')
+        rows = [json.loads(line) for line in transcript.read_text().splitlines()]
+        for row in rows:
+            row['created_at'] = '2026-09-01T01:02:03Z'
+        transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        received = datetime.fromisoformat('2026-09-01T10:02:03+09:00') + timedelta(seconds=135)
+        with mock.patch.object(module, 'now_jst', return_value=received), mock.patch.object(module, 'retrieve_quota', return_value=None):
+            module.handle_stop_event({'conversationId': self.session, 'transcriptPath': str(transcript),
+                                      'fullyIdle': True, 'terminationReason': 'model_stop'})
+        target = Path(module.load_state(self.session)['output_path'])
+        original = target.read_text()
+        self.assertIn('回答所要時間: 2分15秒', original)
+        observations = module.recover_answer_completions(original)
+        module.state_path(self.session).unlink()
+        target, backup = rebuild.rebuild('agy', self.session, transcript=transcript, module=module)
+        content = target.read_text()
+        self.assertIsNotNone(backup)
+        self.assertIn('回答所要時間: 2分15秒', content)
+        self.assertEqual(module.recover_answer_completions(content), observations)
+
+    def test_agy_rebuild_does_not_create_current_completion_for_old_history(self):
+        module = self.module('agy')
+        transcript = self.transcript('agy')
+        rows = [json.loads(line) for line in transcript.read_text().splitlines()]
+        for row in rows:
+            row['created_at'] = '2026-09-01T01:02:03Z'
+        transcript.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        target, _ = rebuild.rebuild('agy', self.session, output_dir=self.root/'export', transcript=transcript, module=module)
+        content = target.read_text()
+        self.assertIn('回答所要時間: 取得不可', content)
+        self.assertNotIn('agy_answer_completions:', content)
 
     def test_normal_replaces_same_file_backs_up_and_resume_does_not_duplicate(self):
         for provider in rebuild.PROVIDERS:

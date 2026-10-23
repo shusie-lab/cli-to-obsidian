@@ -211,12 +211,20 @@ def rebuild(provider, session_id, output_dir=None, transcript=None, database=Non
                         first, last = module.recover_quota_frontmatter(old_content)
                         seed.update(initial_quota=first or old_state.get("initial_quota", {}),
                                     final_quota=last or old_state.get("final_quota", {}))
+                    if provider == "agy":
+                        completions = dict(old_state.get("answer_completions") or {})
+                        completions.update(module.recover_answer_completions(old_content))
+                        if completions:
+                            seed["answer_completions"] = completions
                     module.save_state(session_id, seed)
                     quota_function = getattr(module, "retrieve_quota", None)
                     try:
                         if provider == "agy":
                             module.retrieve_quota = lambda: {}  # 過去セッションへ現在quotaを混入させない。
-                        module.handle_stop_event(payload)
+                        if provider == "agy":
+                            module.handle_stop_event(payload, observe_completion=False)
+                        else:
+                            module.handle_stop_event(payload)
                     finally:
                         if provider == "agy":
                             module.retrieve_quota = quota_function
