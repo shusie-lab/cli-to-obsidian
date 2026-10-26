@@ -8,7 +8,7 @@ Claude Code CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "3.11.1"
+__version__ = "4.2.0"
 
 from bisect import bisect_right
 import json
@@ -71,6 +71,14 @@ DEFAULT_SOURCE = "claude-code"
 # DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
 # https://api-docs.deepseek.com/quick_start/pricing/
 STANDARD_USAGE_RATES = {
+    # 2026-10-25: https://platform.claude.com/docs/en/models/fable-5-1/overview
+    "claude-fable-5-1": {
+        "input": Decimal("10.00"),
+        "cached_input": Decimal("0.25"),
+        "cache_write_input": Decimal("12.50"),
+        "output": Decimal("50.00"),
+        "cache_write_input_1h": Decimal("20.00"),
+    },
     "deepseek-v4.1-flash": {
         "input": Decimal("0.30"),
         "cached_input": Decimal("0.006"),
@@ -89,6 +97,14 @@ STANDARD_USAGE_RATES = {
         "cached_input": Decimal("0.10"),
         "cache_write_input": Decimal("2.50"),
         "output": Decimal("10.00"),
+    },
+    # GPT-6.1 Terra: 2026-10-27確認。cache writeは30分保持の標準単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.1-terra
+    "gpt-6.1-terra": {
+        "input": Decimal("1.00"),
+        "cached_input": Decimal("0.05"),
+        "cache_write_input": Decimal("1.25"),
+        "output": Decimal("5.00"),
     },
     "gpt-6-luna": {
         "input": Decimal("0.10"),
@@ -132,7 +148,8 @@ STANDARD_USAGE_RATES = {
     },
     "claude-sonnet-5-5": {
         "input": Decimal("2.00"),
-        "cached_input": Decimal("0.20"),
+        # 2026-10-25: https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+        "cached_input": Decimal("0.10"),
         "cache_write_input": Decimal("2.50"),
         "output": Decimal("10.00"),
         "cache_write_input_1h": Decimal("4.00"),
@@ -142,6 +159,104 @@ STANDARD_USAGE_RATES = {
 # 従来の呼び出し名との互換alias。単価の正本は上の辞書1つだけ。
 USAGE_COST_USD_PER_1M_TOKEN_TYPE = STANDARD_USAGE_RATES
 # END GENERATED: usage-prices
+
+# BEGIN GENERATED: usage-price-history
+from contextvars import ContextVar
+
+PRICE_VERSION = "4.2.0"
+PRICE_RECORDED_AT = "2026-10-27"
+PRICE_CHECKED_AT = {
+    "gpt-6.1-terra": "2026-10-27",
+    "claude-fable-5-1": "2026-10-25", "claude-sonnet-5-5": "2026-10-25",
+    "claude-opus-5-5": "2026-10-25", "claude-haiku-5-5": "2026-10-25",
+    "gemini-3.8-flash": "2026-10-06", "deepseek-v4.1-flash": "2026-10-16",
+}
+PRICE_SOURCES = {
+    "claude": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "gpt": "https://developers.openai.com/api/docs/pricing",
+    "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "muse": "https://dev.meta.ai/docs/pricing-rate-limits/",
+    "nemotron": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b",
+}
+# 過去表を現在表への差分として生成せず、独立した値で保持する。
+PRICE_HISTORY = {
+    "3.12.0": {"recorded_at": "2026-10-25", "rates": {
+        'claude-fable-5-1': {'input': Decimal('10.00'), 'cached_input': Decimal('0.25'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00'), 'cache_write_input_1h': Decimal('20.00')},
+        'deepseek-v4.1-flash': {'input': Decimal('0.30'), 'cached_input': Decimal('0.006'), 'cache_write_input': Decimal('0.30'), 'output': Decimal('1.20')},
+        'gpt-6-astra': {'input': Decimal('10.00'), 'cached_input': Decimal('1.00'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00')},
+        'gpt-6.1-sol': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00')},
+        'gpt-6-luna': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50')},
+        'gemini-3.8-flash': {'input': Decimal('0.75'), 'cached_input': Decimal('0.075'), 'cache_write_input': Decimal('0.0416666666666667'), 'output': Decimal('3.75')},
+        'muse-spark-1.3-contributor-free': {'input': Decimal('0.10'), 'cached_input': Decimal('0.002'), 'cache_write_input': Decimal('0.10'), 'output': Decimal('0.20')},
+        'nemotron-3-ultra-free': {'input': Decimal('0.50'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('0.50'), 'output': Decimal('2.20')},
+        'claude-opus-5-5': {'input': Decimal('4.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('5.00'), 'output': Decimal('20.00'), 'cache_write_input_1h': Decimal('8.00')},
+        'claude-haiku-5-5': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50'), 'cache_write_input_1h': Decimal('0.20')},
+        'claude-sonnet-5-5': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00'), 'cache_write_input_1h': Decimal('4.00')},
+    }},
+    "3.11.1": {"recorded_at": "2026-10-21", "rates": {
+        'deepseek-v4.1-flash': {'input': Decimal('0.30'), 'cached_input': Decimal('0.006'), 'cache_write_input': Decimal('0.30'), 'output': Decimal('1.20')},
+        'gpt-6-astra': {'input': Decimal('10.00'), 'cached_input': Decimal('1.00'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00')},
+        'gpt-6.1-sol': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00')},
+        'gpt-6-luna': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50')},
+        'gemini-3.8-flash': {'input': Decimal('0.75'), 'cached_input': Decimal('0.075'), 'cache_write_input': Decimal('0.0416666666666667'), 'output': Decimal('3.75')},
+        'muse-spark-1.3-contributor-free': {'input': Decimal('0.10'), 'cached_input': Decimal('0.002'), 'cache_write_input': Decimal('0.10'), 'output': Decimal('0.20')},
+        'nemotron-3-ultra-free': {'input': Decimal('0.50'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('0.50'), 'output': Decimal('2.20')},
+        'claude-opus-5-5': {'input': Decimal('4.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('5.00'), 'output': Decimal('20.00'), 'cache_write_input_1h': Decimal('8.00')},
+        'claude-haiku-5-5': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50'), 'cache_write_input_1h': Decimal('0.20')},
+        'claude-sonnet-5-5': {'input': Decimal('2.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00'), 'cache_write_input_1h': Decimal('4.00')},
+    }},
+}
+_PRICE_CONTEXT = ContextVar("obsidian_usage_price_version", default=PRICE_VERSION)
+
+
+def active_price_version() -> str:
+    return _PRICE_CONTEXT.get()
+
+
+def active_usage_rates() -> dict:
+    version = active_price_version()
+    return STANDARD_USAGE_RATES if version == PRICE_VERSION else PRICE_HISTORY[version]["rates"]
+
+
+@contextmanager
+def usage_price_version(version: str):
+    if version != PRICE_VERSION and version not in PRICE_HISTORY:
+        raise ValueError("未登録の価格版: " + str(version))
+    token = _PRICE_CONTEXT.set(version)
+    try:
+        yield
+    finally:
+        _PRICE_CONTEXT.reset(token)
+
+
+def note_price_version(content: str) -> str | None:
+    frontmatter = re.match(r"\A---\s*\n(.*?)\n---", content, re.DOTALL)
+    if not frontmatter:
+        return None
+    usage = re.search(r"(?m)^usage:\n((?:[ \t].*\n|\n)*)", frontmatter.group(1) + "\n")
+    match = re.search(r'^  price_version: (.+)$', usage.group(1), re.M) if usage else None
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except ValueError:
+        value = match.group(1).strip()
+    return value if isinstance(value, str) else None
+
+
+def usage_price_fields() -> list[str]:
+    version = active_price_version()
+    recorded = PRICE_RECORDED_AT if version == PRICE_VERSION else PRICE_HISTORY[version]["recorded_at"]
+    # 過去料金の正確な適用開始日は確認できないため推定しない。
+    return ["  price_version: " + yaml_quote(version),
+            "  price_recorded_at: " + yaml_quote(recorded),
+            "  price_effective_from: null", "  price_checked_at:",
+            *("    " + yaml_quote(model) + ": " + (yaml_quote(PRICE_CHECKED_AT[model])
+              if version == PRICE_VERSION and model in PRICE_CHECKED_AT else "null")
+              for model in active_usage_rates()), "  price_sources:",
+            *("    " + yaml_quote(key) + ": " + yaml_quote(value) for key, value in PRICE_SOURCES.items())]
+# END GENERATED: usage-price-history
 
 
 # BEGIN GENERATED: output-directory
@@ -293,6 +408,85 @@ def safe_session_key(session_id: str) -> str:
     return f"{safe or 'session'}-{digest}"
 
 
+from contextvars import ContextVar
+
+_SAVE_SKIP_REASON = ContextVar("obsidian_save_skip_reason", default=None)
+
+
+def mark_save_skipped(reason: str) -> None:
+    """入力本文やパスを記録せず、保存を見送った理由だけを残す。"""
+    if _SAVE_SKIP_REASON.get() is None:
+        _SAVE_SKIP_REASON.set(reason)
+
+
+def diagnostic_path(session_id: str) -> Path:
+    return STATE_DIR / ".diagnostics" / (safe_session_key(session_id) + ".status")
+
+
+def record_save_observation(session_id: str, details: dict) -> None:
+    """本文・例外メッセージを含めず、診断情報を保存する。診断失敗は保存を妨げない。"""
+    try:
+        path = diagnostic_path(session_id)
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        if details.get("last_outcome") != "skipped":
+            previous.pop("skip_reason", None)
+        previous.update(details, session_id=str(session_id), saver_version=__version__)
+        atomic_write_text(path, json.dumps(previous, ensure_ascii=False, indent=2))
+    except (OSError, ValueError):
+        logger.warning("診断情報を保存できませんでした")
+
+
+@contextmanager
+def observe_save(session_id: str, payload: dict):
+    """hook/bridgeの完了・例外を記録する。通常の終了コード契約は呼出元へ任せる。"""
+    details = {"last_attempt_at": format_iso(now_jst()), "last_outcome": "skipped"}
+    transcript = payload.get("transcript_path") or payload.get("transcriptPath")
+    if isinstance(transcript, str) and transcript:
+        details["transcript_path"] = transcript
+    state_file = state_path(session_id)
+    try:
+        before = state_file.stat().st_mtime_ns
+    except OSError:
+        before = None
+    class ErrorObserver(logging.Handler):
+        def emit(self, record):
+            details.update(last_outcome="failed", last_failure_at=format_iso(now_jst()),
+                           last_failure_type="logged_error")
+    observer = ErrorObserver(level=logging.ERROR)
+    logger.addHandler(observer)
+    skip_token = _SAVE_SKIP_REASON.set(None)
+    try:
+        yield
+    except Exception as error:
+        details.update(last_outcome="failed", last_failure_at=format_iso(now_jst()),
+                       last_failure_type=type(error).__name__)
+        raise
+    else:
+        state = load_state(session_id)
+        output = state.get("output_path")
+        try:
+            after = state_file.stat().st_mtime_ns
+        except OSError:
+            after = None
+        if details["last_outcome"] == "skipped" and _SAVE_SKIP_REASON.get() is not None:
+            details["skip_reason"] = _SAVE_SKIP_REASON.get()
+        elif (details["last_outcome"] != "failed" and isinstance(output, str)
+                and Path(output).is_file() and after != before):
+            details.update(last_outcome="saved", last_success_at=format_iso(now_jst()),
+                           output_path=str(output))
+        elif details["last_outcome"] == "skipped":
+            details["skip_reason"] = _SAVE_SKIP_REASON.get() or "unchanged"
+    finally:
+        _SAVE_SKIP_REASON.reset(skip_token)
+        logger.removeHandler(observer)
+        record_save_observation(session_id, details)
+
+
 def state_path(session_id: str) -> Path:
     return STATE_DIR / f"{safe_session_key(session_id)}.json"
 
@@ -310,10 +504,10 @@ def atomic_write_text(path: Path, content: str) -> None:
             suffix=".tmp",
             delete=False,
         ) as tmp:
+            tmp_path = Path(tmp.name)
             tmp.write(content)
             tmp.flush()
             os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
         if path.exists():
             os.chmod(tmp_path, path.stat().st_mode & 0o7777)
         os.replace(tmp_path, path)
@@ -419,6 +613,8 @@ def cleanup_old_states() -> None:
                     last_used = datetime.fromtimestamp(path.stat().st_mtime, tz=JST)
                 if last_used < cutoff:
                     path.unlink()
+                    diagnostic = STATE_DIR / ".diagnostics" / (path.stem + ".status")
+                    diagnostic.unlink(missing_ok=True)
                     removed += 1
             except Exception as error:
                 logger.info("stateファイルのクリーンアップ中にスキップ: %s: %s", path.name, error)
@@ -430,7 +626,7 @@ def cleanup_old_states() -> None:
 # ユーティリティ
 # ============================================================
 # BEGIN GENERATED: incremental-utilities
-def session_locked(input_key: str):
+def session_locked(input_key: str, *, observe: bool = True):
     """hook input内のsession idを使って関数を排他実行する。"""
     def decorator(func):
         @wraps(func)
@@ -439,7 +635,10 @@ def session_locked(input_key: str):
             if not session_id:
                 return func(hook_input)
             with session_lock(str(session_id)):
-                return func(hook_input)
+                if not observe:
+                    return func(hook_input)
+                with observe_save(str(session_id), hook_input):
+                    return func(hook_input)
         return wrapper
     return decorator
 
@@ -449,7 +648,8 @@ def read_stdin() -> dict:
     try:
         data = sys.stdin.read()
         if data.strip():
-            return json.loads(data)
+            parsed = json.loads(data)
+            return parsed if isinstance(parsed, dict) else {}
     except Exception as error:
         logger.info("stdinの読み込みまたはJSONパースに失敗しました: %s", error)
     return {}
@@ -1371,6 +1571,77 @@ def calculate_usage_cost(rates: dict, usage: dict, *, input_multiplier=1, output
         return None
 
 
+def sum_reported_costs(reports) -> dict | None:
+    """CLIの回答単位の報告値を合計する。セッション累計は加算しない。"""
+    reports = [report for report in reports if report and report.get("scope") == "message_sum"]
+    if not reports:
+        return None
+    total = {"source": ", ".join(sorted({report["source"] for report in reports})),
+             "scope": "message_sum", "available_records": 0, "total_records": 0}
+    for report in reports:
+        total["total_records"] += report.get("total_records", 1)
+        total["available_records"] += report.get("available_records", 0)
+        amount = _decimal_cost(report.get("usd"))
+        if amount is not None:
+            total["usd"] = total.get("usd", Decimal(0)) + amount
+    if "usd" in total and total["available_records"] < total["total_records"]:
+        total["incomplete"] = True
+    return total
+
+
+def reported_cost_fields(report: dict | None) -> list[str]:
+    if not report:
+        return []
+    lines = ["reported_cost:", "  source: " + yaml_quote(report["source"]),
+             "  scope: " + yaml_quote(report["scope"])]
+    amount = _decimal_cost(report.get("usd"))
+    lines.append("  usd: " + (format(amount, "f") if amount is not None else "null"))
+    if report.get("incomplete"):
+        lines.append("  incomplete: true")
+    for key in ("available_records", "total_records"):
+        if key in report:
+            lines.append("  " + key + ": " + str(report[key]))
+    if report.get("observed_at"):
+        lines.append("  observed_at: " + yaml_quote(report["observed_at"]))
+    return lines
+
+
+def recover_reported_cost(content: str) -> dict | None:
+    """state喪失・再構成時にノートの最後のCLI報告値を復旧する。"""
+    fm = re.match(r"\A---\s*\n(.*?)\n---", content, re.S)
+    block = re.search(r"(?m)^reported_cost:\n((?:  .*\n)*)", fm.group(1) + "\n") if fm else None
+    if not block:
+        return None
+    fields = {}
+    for key, raw in re.findall(r"(?m)^  ([a-z_]+): (.*)$", block.group(1)):
+        try:
+            fields[key] = json.loads(raw, parse_float=Decimal)
+        except ValueError:
+            fields[key] = raw
+    if not isinstance(fields.get("source"), str) or fields.get("scope") not in {"session", "message_sum"}:
+        return None
+    amount = _decimal_cost(fields.get("usd"))
+    if amount is not None:
+        fields["usd"] = str(amount)
+    else:
+        fields.pop("usd", None)
+    return fields
+
+
+def reported_cost_label(report: dict) -> str:
+    amount = _format_usd(report.get("usd"))
+    if amount is None:
+        return "未取得"
+    return amount + ("（部分取得）" if report.get("incomplete") else "")
+
+
+def build_reported_cost_section(report: dict | None) -> str:
+    if not report:
+        return ""
+    scope = "セッション累計" if report.get("scope") == "session" else "回答の合計"
+    return "💵 **取得コスト (CLI報告値)**: " + reported_cost_label(report) + "（" + scope + "）\n"
+
+
 def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
     """provider側で重複排除・正規化したrecordを、各recordの金額を維持して合計する。"""
     total = _empty_usage_totals()
@@ -1378,6 +1649,8 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
     count = priced = 0
     total_cost = Decimal(0)
     long_context = False
+    reports = []
+    model_reports = {}
     for message in messages:
         usage = message.get("usage") if message.get("type") == "assistant" else None
         if not isinstance(usage, dict):
@@ -1385,6 +1658,14 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
         count += 1
         model = str(message.get("model") or "unknown")
         entry = by_model.setdefault(model, _empty_usage_totals())
+        if usage.get("reported_cost_source"):
+            amount = _decimal_cost(usage.get("reported_cost_usd"))
+            report = {"source": usage["reported_cost_source"], "scope": "message_sum",
+                      "available_records": int(amount is not None), "total_records": 1}
+            if amount is not None:
+                report["usd"] = amount
+            reports.append(report)
+            model_reports.setdefault(model, []).append(report)
         for field in USAGE_FIELDS:
             value = int(usage.get(field, 0))
             total[field] += value
@@ -1405,6 +1686,10 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
         if "cost_usd" in entry and entry.pop("cost_unavailable", False):
             entry["cost_incomplete"] = True
     total["by_model"] = by_model
+    if reports:
+        total["reported_cost"] = sum_reported_costs(reports)
+        for model, items in model_reports.items():
+            by_model[model]["reported_cost"] = sum_reported_costs(items)
     if priced:
         total["total_cost_usd"] = total_cost
         if priced < count:
@@ -1419,7 +1704,7 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
 def usage_frontmatter_fields(usage: dict | None) -> list[str]:
     if not usage:
         return []
-    lines = ["usage:"]
+    lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields()]
     lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
     if "total_cost_usd" in usage:
         lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
@@ -1427,6 +1712,11 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
             lines.append("  cost_incomplete: true")
     else:
         lines.append("  cost_unavailable: true")
+    scope = usage.get("scope")
+    if scope:
+        lines.append("  scope:")
+        for key in ("parent_tokens", "subagent_tokens", "unattributed_subagent_tokens"):
+            lines.append(f"    {key}: {int(scope.get(key, 0))}")
     lines.append("  by_model:")
     for model, entry in usage.get("by_model", {}).items():
         lines.append(f"    {yaml_quote(model)}:")
@@ -1437,6 +1727,13 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
                 lines.append("      cost_incomplete: true")
         else:
             lines.append("      cost_unavailable: true")
+        report = entry.get("reported_cost")
+        if report:
+            amount = _decimal_cost(report.get("usd"))
+            lines.append("      reported_cost_usd: " + (format(amount, "f") if amount is not None else "null"))
+            if report.get("incomplete"):
+                lines.append("      reported_cost_incomplete: true")
+    lines.extend(reported_cost_fields(usage.get("reported_cost")))
     return lines
 
 
@@ -1463,7 +1760,14 @@ def build_usage_section(usage: dict | None) -> str:
         return "💰 **Usage (USD換算)**: N/A\n"
     parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')}" for model, entry in usage.get("by_model", {}).items()]
     details = f" ({'、'.join(parts)})" if parts else ""
-    return f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+    scope = usage.get("scope")
+    scope_line = ""
+    if scope:
+        scope_line = ("📊 **Usage集計範囲**: 親 " + f"{int(scope.get('parent_tokens', 0)):,} tok"
+            + "・子 " + f"{int(scope.get('subagent_tokens', 0)):,} tok"
+            + "（回答に紐付かない子 " + f"{int(scope.get('unattributed_subagent_tokens', 0)):,} tok）\n")
+    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+            + scope_line + build_reported_cost_section(usage.get("reported_cost")))
 
 
 def format_message_usage(usage: dict | None, subagent_usage: dict | None = None) -> str:
@@ -1471,6 +1775,8 @@ def format_message_usage(usage: dict | None, subagent_usage: dict | None = None)
         return ""
     warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
     label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    if usage.get("reported_cost"):
+        label += " · 取得コスト: " + reported_cost_label(usage["reported_cost"])
     if subagent_usage:
         parts = [f"{model} {int(entry.get('total_tokens', 0)):,} tok・{_usage_cost_label(entry, 'cost_usd')}"
                  for model, entry in sorted(subagent_usage.get("by_model", {}).items())]
@@ -1502,6 +1808,14 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
         if "cost_usd" in entry and entry.pop("cost_unavailable", False):
             entry["cost_incomplete"] = True
     merged["by_model"] = by_model
+    reported = sum_reported_costs(source.get("reported_cost") for source in (first, second))
+    if reported:
+        merged["reported_cost"] = reported
+    for model, entry in by_model.items():
+        reported = sum_reported_costs(source.get("by_model", {}).get(model, {}).get("reported_cost")
+                                     for source in (first, second))
+        if reported:
+            entry["reported_cost"] = reported
     if "total_cost_usd" in first or "total_cost_usd" in second:
         merged["total_cost_usd"] = sum((Decimal(str(source.get("total_cost_usd", 0))) for source in (first, second)), Decimal(0))
         if any(source.get("cost_unavailable") or source.get("cost_incomplete") for source in (first, second)):
@@ -1598,6 +1912,32 @@ def preserve_modified_if_unchanged(content: str, refreshed: str) -> str:
 # END GENERATED: note-metadata
 
 
+# BEGIN GENERATED: jsonl-snapshot
+import io
+
+
+def read_jsonl_snapshot(path: Path, text: str | None = None) -> dict:
+    """読み取り時点のJSONLを一度だけ解析する。不完全な末尾はcursorへ含めない。"""
+    text = path.read_text(encoding="utf-8") if text is None else text
+    rows = []
+    last_line = 0
+    malformed = 0
+    for number, line in enumerate(io.StringIO(text, newline=None), 1):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            if line.strip() and not line.endswith(("\n", "\r")):
+                break
+            malformed += bool(line.strip())
+        else:
+            if isinstance(data, dict):
+                rows.append((number, data))
+            else:
+                malformed += 1
+        last_line = number
+    return {"rows": rows, "last_line": last_line, "malformed_rows": malformed}
+# END GENERATED: jsonl-snapshot
+
 # ============================================================
 # transcript（JSONL）のパース
 # ============================================================
@@ -1612,13 +1952,17 @@ def extract_user_text(message: dict) -> str:
                 texts.append(item)
             elif isinstance(item, dict):
                 if item.get("type") == "text":
-                    texts.append(item.get("text", ""))
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        texts.append(text)
         return "\n".join(texts)
     return ""
 
 
 def extract_assistant_text_and_model(data: dict) -> tuple[str, str]:
     msg = data.get("message", {})
+    if not isinstance(msg, dict):
+        return "", ""
     model_name = msg.get("model", "") or data.get("model", "")
     content = msg.get("content")
 
@@ -1629,7 +1973,7 @@ def extract_assistant_text_and_model(data: dict) -> tuple[str, str]:
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
                 t = item.get("text", "")
-                if t:
+                if isinstance(t, str) and t:
                     texts.append(t)
     return "\n".join(texts), model_name
 
@@ -1676,17 +2020,27 @@ def build_quota_section(first: dict | None, last: dict | None) -> str:
     return "📊 **Quota**:\n- **Claude**: " + " / ".join(parts) + "\n" if parts else ""
 
 
-@session_locked("session_id")
+@session_locked("session_id", observe=False)
 def capture_statusline_quota(data: dict) -> str:
     """statusLine経由の観測値を保存し、statusLineに表示する短い文字列を返す。"""
     session_id = str(data.get("session_id") or "")
     quota = parse_statusline_quota(data)
-    if not session_id or not quota:
-        return ""
+    raw_cost = data.get("cost")
+    cost = _decimal_cost(raw_cost.get("total_cost_usd")) if isinstance(raw_cost, dict) else None
+    cost_label = "CLI概算: $" + format(cost, "f") if cost is not None else ""
+    if not session_id or (not quota and cost is None):
+        return cost_label
     state = load_state(session_id)
-    state["initial_quota"] = merge_first_quota(state.get("initial_quota"), quota)
-    quota = merge_first_quota(quota, state.get("final_quota") or {})
-    state["final_quota"] = quota
+    if quota:
+        state["initial_quota"] = merge_first_quota(state.get("initial_quota"), quota)
+        quota = merge_first_quota(quota, state.get("final_quota") or {})
+        state["final_quota"] = quota
+    if cost is not None:
+        previous = state.get("reported_cost") or {}
+        report = {"source": "claude.statusLine.cost.total_cost_usd", "scope": "session", "usd": str(cost)}
+        report["observed_at"] = ((previous.get("observed_at") or format_iso(now_jst())) if _decimal_cost(previous.get("usd")) == cost
+                                 else format_iso(now_jst()))
+        state["reported_cost"] = report
     save_state(session_id, state)
     output_path = state.get("output_path")
     if output_path and Path(output_path).exists():
@@ -1694,11 +2048,47 @@ def capture_statusline_quota(data: dict) -> str:
         content = path.read_text(encoding="utf-8")
         refreshed = update_markdown_metadata(
             content, now_jst(), 0, read_last_line_from_md(path) or 0,
-            initial_quota=state["initial_quota"], final_quota=quota,
-        )
+            initial_quota=state.get("initial_quota"), final_quota=state.get("final_quota"),
+        ) if quota else content
+        refreshed = refresh_reported_cost_metadata(refreshed, state.get("reported_cost"))
+        refreshed = preserve_modified_if_unchanged(content, refreshed)
         if refreshed != content:
             atomic_write_md(path, refreshed)
-    return build_quota_section(quota, quota).splitlines()[-1].removeprefix("- **Claude**: ")
+    quota_label = (build_quota_section(quota, quota).splitlines()[-1].removeprefix("- **Claude**: ")
+                   if quota else "")
+    return " | ".join(part for part in (quota_label, cost_label) if part)
+
+
+def split_cost_preamble(body: str) -> tuple[str, str]:
+    """会話本文のコード例を変更しないよう、先頭の集計部分だけを取り出す。"""
+    boundary = re.search(r"(?m)^<!--\s*last_line:|^# |^> \[!", body)
+    return (body[:boundary.start()], body[boundary.start():]) if boundary else (body, "")
+
+
+def refresh_reported_cost_metadata(content: str, report: dict | None) -> str:
+    """statusLine観測値だけを更新し、transcript換算や回答単位のUsageへ加算しない。"""
+    if not report:
+        return content
+    match = re.match(r"\A---\s*\n(.*?)\n---\n", content, re.S)
+    if match is None:
+        return content
+    fields, body = match.group(1) + "\n", content[match.end():]
+    body, conversation = split_cost_preamble(body)
+    recovered = recover_reported_cost(content)
+    section = build_reported_cost_section(report)
+    if (recovered and reported_cost_fields(recovered) == reported_cost_fields(report)
+            and section in body):
+        return content
+    replacement = "\n".join(reported_cost_fields(report)) + "\n"
+    fields, replaced = re.subn(r"(?m)^reported_cost:\n(?:  .*\n)*", lambda _: replacement, fields, count=1)
+    if not replaced:
+        fields += replacement
+    fields = re.sub(r"(?m)^modified:.*$", lambda _: "modified: " + yaml_quote(format_iso(now_jst())), fields)
+    body, replaced = re.subn(r"(?m)^💵 \*\*取得コスト \(CLI報告値\)\*\*:.*\n", lambda _: section, body, count=1)
+    if not replaced:
+        match = re.search(r"(?m)^💰 \*\*Usage \(USD換算\)\*\*:.*\n", body)
+        body = body[:match.end()] + section + body[match.end():] if match else section + body
+    return "---\n" + fields.rstrip("\n") + "\n---\n" + body + conversation
 
 
 # BEGIN GENERATED: usage-model
@@ -1708,6 +2098,7 @@ def _normalize_usage_model(model: object) -> str:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     aliases = {
+        "claude-fable-5.1": "claude-fable-5-1",
         "deepseek-flash": "deepseek-v4.1-flash",
         "deepseek-v4-1-flash": "deepseek-v4.1-flash",
         "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",
@@ -1730,8 +2121,8 @@ LONG_CONTEXT_INPUT_TOKENS = 272_000
 
 def reference_price_model(model: object) -> str:
     name = _normalize_usage_model(model)
-    if (name not in STANDARD_USAGE_RATES and name.endswith("-free")
-            and name[:-len("-free")] in STANDARD_USAGE_RATES):
+    if (name not in active_usage_rates() and name.endswith("-free")
+            and name[:-len("-free")] in active_usage_rates()):
         name = name[:-len("-free")]
     return name
 
@@ -1742,7 +2133,7 @@ def is_long_context_usage(model: object, usage: dict) -> bool:
     tokens = usage.get("input_tokens", 0)
     return (APPLY_LONG_CONTEXT_PRICING
             and isinstance(tokens, int) and not isinstance(tokens, bool)
-            and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
+            and name.startswith("gpt-") and name in active_usage_rates()
             and tokens > LONG_CONTEXT_INPUT_TOKENS)
 
 
@@ -1756,7 +2147,7 @@ def haiku_prompt_price_multiplier(model: object, usage: dict) -> int:
 
 def _usage_cost(model: object, usage: dict) -> Decimal | None:
     """raw recordを正規化したtoken内訳から標準API参考換算を行う。"""
-    rates = STANDARD_USAGE_RATES.get(reference_price_model(model))
+    rates = active_usage_rates().get(reference_price_model(model))
     if rates is None or usage.get("pricing_unknown"):
         return None
     long_context = is_long_context_usage(model, usage)
@@ -1791,7 +2182,7 @@ def _claude_usage_record(message: dict) -> dict | None:
             or raw.get("inference_geo") not in (None, "", "global")):
         return usage
     model = _normalize_usage_model(message.get("model"))
-    reference_rates = STANDARD_USAGE_RATES.get(reference_price_model(model))
+    reference_rates = active_usage_rates().get(reference_price_model(model))
     # 1時間単価のないモデルはTTLを分けず、共通の書き込み単価を使う。
     if reference_rates is not None and "cache_write_input_1h" not in reference_rates:
         usage.pop("pricing_unknown")
@@ -1803,7 +2194,7 @@ def _claude_usage_record(message: dict) -> dict | None:
         return usage
     # OpenRouter形式とAnthropic形式を同じ単価表に対応させる。
     model = model.replace(".", "-")
-    for prefix, rates in STANDARD_USAGE_RATES.items():
+    for prefix, rates in active_usage_rates().items():
         if "cache_write_input_1h" in rates and (model == prefix or model.startswith(prefix + "-")):
             break
     else:
@@ -1825,99 +2216,150 @@ def _claude_usage_record(message: dict) -> dict | None:
     return usage
 
 
+def claude_usage_records(snapshot: dict, *, include_sidechain=False, session_id="") -> list[dict]:
+    records = {}
+    turn = -1
+    for number, data in snapshot["rows"]:
+        if session_id and data.get("sessionId") not in (None, session_id):
+            continue
+        if data.get("isSidechain") and not include_sidechain:
+            continue
+        message = data.get("message")
+        if not isinstance(message, dict):
+            continue
+        if data.get("type") == "user" and not data.get("isMeta"):
+            text = extract_user_text(message)
+            if text.strip().startswith(("<local-command-", "<command-name>")):
+                continue
+            turn += 1
+        if data.get("type") != "assistant":
+            continue
+        usage = _claude_usage_record(message)
+        if usage is None:
+            continue
+        message_id = str(message.get("id") or data.get("uuid") or number)
+        records[message_id] = {"id": message_id, "type": "assistant", "model": str(message.get("model") or "unknown"),
+            "usage": usage, "turn_index": turn, "sequence": number}
+    return list(records.values())
+
+
 def retrieve_usage(jsonl_path: Path, transcript_text: str | None = None) -> dict | None:
-    """同じmessage IDの更新行は最後のusageだけを数える。"""
-    records = {}
     try:
-        with (io.StringIO(transcript_text) if transcript_text is not None
-              else jsonl_path.open(encoding="utf-8")) as stream:
-            for line_number, line in enumerate(stream):
-                try:
-                    data = json.loads(line)
-                except ValueError:
-                    continue
-                if data.get("type") != "assistant" or data.get("isSidechain"):
-                    continue
-                message = data.get("message")
-                if not isinstance(message, dict):
-                    continue
-                usage = _claude_usage_record(message)
-                if usage is None:
-                    continue
-                message_id = str(message.get("id") or data.get("uuid") or line_number)
-                records[message_id] = (str(message.get("model") or "unknown"), usage)
+        snapshot = read_jsonl_snapshot(jsonl_path, transcript_text)
     except (OSError, UnicodeError) as error:
-        logger.warning("Usage情報の読み込みに失敗: %s", error)
+        logger.warning("Usage情報の読み込みに失敗: %s", type(error).__name__)
         return None
-    return summarize_usage(
-        ({"type": "assistant", "model": model, "usage": usage} for model, usage in records.values()),
-        estimate_missing=False,
-    )
+    return summarize_usage(claude_usage_records(snapshot), estimate_missing=False)
 
 
-def load_jsonl_messages(jsonl_path: Path, start_line: int, transcript_text: str | None = None) -> tuple[list[dict], int]:
+def claude_subagent_records(path: Path, session_id: str, snapshot: dict, child_snapshots=None) -> list[dict]:
+    """この親のsubagentsディレクトリだけを対象に、子の最終Usageを集める。"""
+    base = path.with_suffix("") / "subagents"
+    if not base.is_dir() or base.is_symlink():
+        return []
+    # 親の既知UUIDへの直接リンクのみで回答へ帰属させる。時刻や現在ターンからは推測しない。
+    parent_turns = {}
+    turn = -1
+    for _, row in snapshot["rows"]:
+        if row.get("isSidechain") or row.get("sessionId") not in (None, session_id):
+            continue
+        msg = row.get("message")
+        if row.get("type") == "user" and isinstance(msg, dict) and not row.get("isMeta"):
+            text = extract_user_text(msg)
+            if not text.strip().startswith(("<local-command-", "<command-name>")):
+                turn += 1
+        if row.get("uuid"):
+            parent_turns[str(row["uuid"])] = turn
+    result = []
+    for child in sorted(base.rglob("agent-*.jsonl")):
+        relative = child.relative_to(base)
+        if child.is_symlink() or any(base.joinpath(*relative.parts[:index]).is_symlink()
+                                     for index in range(1, len(relative.parts))):
+            continue
+        try:
+            child.resolve().relative_to(base.resolve())
+            child_snapshot = (child_snapshots or {}).get(str(child.resolve()))
+            if child_snapshot is None:
+                child_snapshot = read_jsonl_snapshot(child)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        rows = [row for _, row in child_snapshot["rows"] if row.get("sessionId") in (None, session_id)]
+        # 別sessionのレコードを除外し、ファイル名が一致していても混入させない。
+        turns = {parent_turns[row["parentUuid"]] for row in rows
+                 if isinstance(row.get("parentUuid"), str) and row["parentUuid"] in parent_turns}
+        parent_turn = next(iter(turns)) if len(turns) == 1 else None
+        for record in claude_usage_records(child_snapshot, include_sidechain=True, session_id=session_id):
+            result.append(dict(record, id=str(child.relative_to(base)) + ":" + record["id"],
+                               parent_turn_index=parent_turn))
+    return result
+
+
+def attach_claude_subagent_usage(messages: list[dict], records: list[dict]) -> None:
+    by_turn = {}
+    for record in records:
+        if record.get("parent_turn_index") is not None:
+            by_turn.setdefault(record["parent_turn_index"], []).append(record)
+    for turn, children in by_turn.items():
+        answers = [message for message in messages if message.get("turn_index") == turn
+                   and message.get("type") == "agent_message" and message.get("message", "").strip()]
+        if answers:
+            usage = summarize_usage(children, estimate_missing=False)
+            answers[-1]["subagent_usage"] = usage
+            answers[-1]["usage"] = _merge_usage_summaries(answers[-1].get("usage"), usage)
+            for record in children:
+                record["answer_attributed"] = True
+
+
+def load_jsonl_messages(jsonl_path: Path, start_line: int, transcript_text: str | None = None, *, snapshot=None, child_records=()) -> tuple[list[dict], int]:
     messages = []
-    records = {}
-    current_line = 0
     turn = -1
     try:
-        with (io.StringIO(transcript_text) if transcript_text is not None else jsonl_path.open(encoding="utf-8")) as stream:
-            for current_line, raw_line in enumerate(stream, 1):
-                if not raw_line.strip():
-                    continue
-                try:
-                    data = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    if not raw_line.endswith(("\n", "\r")):
-                        current_line -= 1
+        snapshot = snapshot if snapshot is not None else read_jsonl_snapshot(jsonl_path, transcript_text)
+        records = claude_usage_records(snapshot)
+        current_line = snapshot["last_line"]
+        for line_number, data in snapshot["rows"]:
+            if data.get("isSidechain"):
+                continue
+            kind = data.get("type")
+            if kind == "system" and data.get("subtype") == "turn_duration":
+                for answer in reversed(messages):
+                    if answer["type"] == "user_message":
                         break
+                    if answer["type"] == "agent_message":
+                        answer["completed_at"] = data.get("timestamp")
+                        break
+            msg = data.get("message") or {}
+            if not isinstance(msg, dict):
+                continue
+            if kind == "user":
+                if data.get("isMeta"):
                     continue
-                if not isinstance(data, dict) or data.get("isSidechain"):
+                text = extract_user_text(msg)
+                if text.strip().startswith(("<local-command-", "<command-name>")):
                     continue
-                kind = data.get("type")
-                if kind == "system" and data.get("subtype") == "turn_duration":
-                    for answer in reversed(messages):
-                        if answer["type"] == "user_message":
-                            break
-                        if answer["type"] == "agent_message":
-                            answer["completed_at"] = data.get("timestamp")
-                            break
-                msg = data.get("message") or {}
-                if not isinstance(msg, dict):
+                turn += 1
+                model = ""
+            elif kind == "assistant":
+                text, model = extract_assistant_text_and_model(data)
+                if not text.strip():
                     continue
-                if kind == "user":
-                    if data.get("isMeta"):
-                        continue
-                    text = extract_user_text(msg)
-                    if text.strip().startswith(("<local-command-", "<command-name>")):
-                        continue
-                    turn += 1
-                    model = ""
-                elif kind == "assistant":
-                    text, model = extract_assistant_text_and_model(data)
-                    usage = _claude_usage_record(msg)
-                    message_id = str(msg.get("id") or data.get("uuid") or current_line)
-                    if usage is not None:
-                        records[message_id] = {"id": message_id, "type": "assistant", "model": model or "unknown",
-                            "turn_index": turn, "sequence": current_line, "usage": usage}
-                    if not text.strip():
-                        continue
-                else:
-                    continue
-                messages.append({"line_number": current_line, "sequence": current_line, "turn_index": turn,
-                    "id": str(msg.get("id") or data.get("uuid") or current_line),
-                    "type": "user_message" if kind == "user" else "agent_message",
-                    "message": text, "timestamp": data.get("timestamp", ""), "model": model})
+            else:
+                continue
+            messages.append({"line_number": line_number, "sequence": line_number, "turn_index": turn,
+                "id": str(msg.get("id") or data.get("uuid") or line_number),
+                "type": "user_message" if kind == "user" else "agent_message",
+                "message": text, "timestamp": data.get("timestamp", ""), "model": model})
     except (OSError, UnicodeError) as error:
         logger.warning("JSONL読み込み失敗: %s", type(error).__name__)
         return [], start_line
     display = incremental_display_messages(messages)
     # Single-message groups attach each deduplicated usage only once. The renderer later merges replies.
-    assigned = _usage_records_by_display_group([[message] for message in display], records.values())
+    assigned = _usage_records_by_display_group([[message] for message in display], records)
     for message, usage_records in zip(messages, assigned):
         usage = summarize_usage(usage_records, estimate_missing=False)
         if usage is not None:
             message["usage"] = usage
+    attach_claude_subagent_usage(messages, child_records)
     messages = annotate_answer_timings(messages)
     return [message for message in messages if message["line_number"] > start_line], current_line
 
@@ -2205,14 +2647,22 @@ def update_markdown_metadata(
     final_quota: dict | None = None,
 ) -> str:
     """本文のfrontmatterとcursorを更新し、書き込み前の全文を返す。"""
-    removed = {"usage"} if usage is not None else set()
+    preserved_usage = []
+    if usage is None:
+        frontmatter = re.match(r"\A---\s*\n(.*?)\n---", content, re.S)
+        for key in ("usage", "reported_cost"):
+            block = re.search(r"(?m)^" + key + r":\n(?:[ \t].*\n)*",
+                              frontmatter.group(1) + "\n") if frontmatter else None
+            if block:
+                preserved_usage.extend(block.group(0).rstrip("\n").splitlines())
+    removed = {"usage", "reported_cost"} if usage is not None or preserved_usage else set()
     if initial_quota or final_quota:
         removed.add("quota")
     source = _without_frontmatter_keys(content, removed) if removed else content
     updated = update_frontmatter_fields(
         source, modified_dt, appended,
         extra_fields=tuple(build_quota_frontmatter_fields(initial_quota, final_quota)
-                           + build_usage_frontmatter_fields(usage)),
+                           + (build_usage_frontmatter_fields(usage) if usage is not None else preserved_usage)),
     )
     if updated is None:
         return content
@@ -2223,8 +2673,11 @@ def update_markdown_metadata(
         body_text = section + "\n" + body_text.lstrip("\n")
     if usage is not None:
         section = build_usage_section(usage)
+        body_text, conversation = split_cost_preamble(body_text)
+        body_text = re.sub(r"(?m)^💵 \*\*取得コスト \(CLI報告値\)\*\*:.*\n", "", body_text, count=1)
+        body_text = re.sub(r"(?m)^📊 \*\*Usage集計範囲\*\*:.*\n(?:\n)?", "", body_text, count=1)
         body_text = re.sub(r"(?m)^(?:📈 \*\*Usage\*\*|💰 \*\*Usage \((?:API|USD)換算\)\*\*):.*\n(?:\n)?", "", body_text, count=1)
-        body_text = section + "\n" + body_text.lstrip("\n")
+        body_text = section + "\n" + body_text.lstrip("\n") + conversation
     body_text = re.sub(
         r"<!--\s*last_line:.*?-->",
         f"<!-- last_line: {last_line} -->",
@@ -2257,7 +2710,7 @@ def append_messages(
 # ============================================================
 # イベントハンドラ
 # ============================================================
-def read_stop_transcript(jsonl_path: Path, expected_answer: str = "") -> str:
+def read_stop_transcript(jsonl_path: Path, expected_answer: str = "", *, include_sidechain=False) -> str:
     """Stop時の遅延書き込みを最大2秒待ち、本文とUsage共通のsnapshotを返す。"""
     deadline = time.monotonic() + 2.0
     previous = None
@@ -2272,7 +2725,7 @@ def read_stop_transcript(jsonl_path: Path, expected_answer: str = "") -> str:
         last_answer = ""
         last_usage_ready = False
         complete = True
-        for line in text.splitlines(keepends=True):
+        for line in io.StringIO(text, newline=None):
             try:
                 data = json.loads(line)
             except ValueError:
@@ -2281,7 +2734,7 @@ def read_stop_transcript(jsonl_path: Path, expected_answer: str = "") -> str:
                 continue
             if not isinstance(data, dict):
                 continue
-            if data.get("type") == "assistant":
+            if data.get("type") == "assistant" and (include_sidechain or not data.get("isSidechain")):
                 answer, _ = extract_assistant_text_and_model(data)
                 if answer.strip():
                     last_answer = answer.strip()
@@ -2296,8 +2749,7 @@ def read_stop_transcript(jsonl_path: Path, expected_answer: str = "") -> str:
         time.sleep(0.05)
 
 
-@session_locked("session_id")
-def handle_stop_event(hook_input: dict) -> None:
+def _save_claude_parent(hook_input: dict, child_snapshots=None) -> None:
     session_id = hook_input.get("session_id", "")
     transcript_path = hook_input.get("transcript_path", "")
     cwd = hook_input.get("cwd", "") or os.getcwd()
@@ -2306,21 +2758,27 @@ def handle_stop_event(hook_input: dict) -> None:
         logger.warning("session_id が取得できませんでした")
         return
     if not transcript_path:
+        mark_save_skipped("missing_transcript_path")
         logger.warning("transcript_path が未提供です")
         return
 
     jsonl_path = Path(transcript_path)
     if not jsonl_path.exists():
+        mark_save_skipped("transcript_missing")
         logger.warning(f"JSONLファイルが存在しません: {jsonl_path}")
         return
     try:
-        transcript_text = read_stop_transcript(
-            jsonl_path, hook_input.get("last_assistant_message") or "",
-        )
+        transcript_text = (jsonl_path.read_text(encoding="utf-8")
+            if hook_input.get("hook_event_name") in {"StopFailure", "SubagentStop"}
+            else read_stop_transcript(jsonl_path, hook_input.get("last_assistant_message") or ""))
     except (OSError, UnicodeError) as error:
+        mark_save_skipped("transcript_unreadable")
         logger.warning("JSONL読み込み失敗: %s", error)
         return
-    current_usage = retrieve_usage(jsonl_path, transcript_text)
+    snapshot = read_jsonl_snapshot(jsonl_path, transcript_text)
+    children = claude_subagent_records(jsonl_path, session_id, snapshot, child_snapshots)
+    parent_records = claude_usage_records(snapshot)
+    current_usage = summarize_usage(parent_records + children, estimate_missing=False)
 
     state = load_state(session_id)
     try:
@@ -2328,18 +2786,43 @@ def handle_stop_event(hook_input: dict) -> None:
     except ExistingMarkdownSearchError as error:
         logger.error("既存Markdownの探索中にエラーが発生したため保存を見送ります: %s", type(error).__name__)
         return
-    preview, _ = load_jsonl_messages(jsonl_path, 0, transcript_text)
+    report = state.get("reported_cost")
+    if not report and state.get("output_path") and Path(state["output_path"]).is_file():
+        report = recover_reported_cost(Path(state["output_path"]).read_text(encoding="utf-8"))
+    report = report or {"source": "claude.statusLine.cost.total_cost_usd", "scope": "session"}
+    state["reported_cost"] = report
+    if current_usage is not None:
+        current_usage["reported_cost"] = report
+    all_messages, new_last_line = load_jsonl_messages(jsonl_path, 0, snapshot=snapshot, child_records=children)
+    if current_usage is not None:
+        current_usage["scope"] = {
+            "parent_tokens": sum(record["usage"]["total_tokens"] for record in parent_records),
+            "subagent_tokens": sum(record["usage"]["total_tokens"] for record in children),
+            "unattributed_subagent_tokens": sum(record["usage"]["total_tokens"] for record in children
+                                               if not record.get("answer_attributed")),
+        }
+    if hook_input.get("hook_event_name") == "StopFailure":
+        category = str(hook_input.get("error") or "unknown")
+        if not re.fullmatch(r"[a-z_]{1,64}", category):
+            category = "unknown"
+        failure = {"type": category, "last_line": new_last_line}
+        previous = state.get("last_cli_failure") or {}
+        if any(previous.get(key) != value for key, value in failure.items()):
+            failure["observed_at"] = format_iso(now_jst())
+            state["last_cli_failure"] = failure
+        save_state(session_id, state)
     prepared = ensure_incremental_note(session_id, cwd, state, "last_line", read_last_line_from_md,
-        any(str(message.get("message", "")).strip() for message in preview),
+        any(str(message.get("message", "")).strip() for message in all_messages),
         lambda start, saved: create_md_file(session_id, saved.get("cwd", cwd), start,
             usage=current_usage, initial_quota=saved.get("initial_quota"), final_quota=saved.get("final_quota"),
             source=saved.get("source"), tags=saved.get("tags")))
     if prepared is None:
+        mark_save_skipped("no_content")
         return
     path, last_line = prepared
 
     # メッセージのロードと追記
-    new_messages, new_last_line = load_jsonl_messages(jsonl_path, last_line, transcript_text)
+    new_messages = [message for message in all_messages if message["line_number"] > last_line]
 
     if new_messages:
         appended, updated = append_messages(
@@ -2363,19 +2846,56 @@ def handle_stop_event(hook_input: dict) -> None:
     # All answer Usage, including late or updated records, comes from the same Stop snapshot.
     if current_usage is not None or state.get("final_quota"):
         content = path.read_text(encoding="utf-8")
-        all_messages, _ = load_jsonl_messages(jsonl_path, 0, transcript_text)
         refreshed = update_markdown_metadata(content, now_jst(), 0, new_last_line, current_usage,
             state.get("initial_quota"), state.get("final_quota"))
         refreshed = refresh_answer_usage_metadata(refreshed, all_messages)
         refreshed = preserve_modified_if_unchanged(content, refreshed)
         if refreshed != content:
             atomic_write_md(path, refreshed)
+    original = path.read_text(encoding="utf-8")
+    refreshed = preserve_modified_if_unchanged(original, refresh_reported_cost_metadata(original, report))
+    if refreshed != original:
+        atomic_write_md(path, refreshed)
+    if state.get("last_cli_failure"):
+        failure = state["last_cli_failure"]
+        category = failure["type"]
+        original = path.read_text(encoding="utf-8")
+        content = _without_frontmatter_keys(original, {"cli_failure"})
+        fields = ["cli_failure:", "  type: " + yaml_quote(category),
+                  "  observed_at: " + yaml_quote(failure.get("observed_at", ""))]
+        updated = update_frontmatter_fields(content, now_jst(), 0, extra_fields=fields)
+        if updated is not None:
+            refreshed = preserve_modified_if_unchanged(original, compose_markdown(*updated))
+            if refreshed != original:
+                atomic_write_md(path, refreshed)
     content = path.read_text(encoding="utf-8")
-    all_messages, _ = load_jsonl_messages(jsonl_path, 0, transcript_text)
     refreshed = refresh_answer_timing_metadata(content, all_messages)
     if refreshed != content:
         atomic_write_md(path, refreshed)
     save_state(session_id, state)
+
+@session_locked("session_id")
+def handle_stop_event(hook_input: dict) -> None:
+    child_snapshots = None
+    if hook_input.get("hook_event_name") == "SubagentStop":
+        parent = Path(str(hook_input.get("transcript_path") or ""))
+        child_value = hook_input.get("agent_transcript_path")
+        if not isinstance(child_value, str) or not child_value:
+            raise ValueError("SubagentStopに子transcriptがありません")
+        child = Path(child_value).expanduser()
+        base = parent.with_suffix("") / "subagents"
+        try:
+            child.resolve().relative_to(base.resolve())
+        except ValueError:
+            raise ValueError("子transcriptが親セッションのsubagents外です")
+        if child.is_symlink() or not child.is_file():
+            raise ValueError("子transcriptを安全に読み取れません")
+        child_text = read_stop_transcript(child, hook_input.get("last_assistant_message") or "",
+                                          include_sidechain=True)
+        child_snapshots = {str(child.resolve()): read_jsonl_snapshot(child, child_text)}
+        # 本文は親transcriptだけから保存。子の最後の回答とは一致待ちしない。
+    _save_claude_parent(hook_input, child_snapshots)
+
 
 # ============================================================
 # メイン

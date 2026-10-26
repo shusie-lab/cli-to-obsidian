@@ -39,6 +39,77 @@ def calculate_usage_cost(rates: dict, usage: dict, *, input_multiplier=1, output
         return None
 
 
+def sum_reported_costs(reports) -> dict | None:
+    """CLIの回答単位の報告値を合計する。セッション累計は加算しない。"""
+    reports = [report for report in reports if report and report.get("scope") == "message_sum"]
+    if not reports:
+        return None
+    total = {"source": ", ".join(sorted({report["source"] for report in reports})),
+             "scope": "message_sum", "available_records": 0, "total_records": 0}
+    for report in reports:
+        total["total_records"] += report.get("total_records", 1)
+        total["available_records"] += report.get("available_records", 0)
+        amount = _decimal_cost(report.get("usd"))
+        if amount is not None:
+            total["usd"] = total.get("usd", Decimal(0)) + amount
+    if "usd" in total and total["available_records"] < total["total_records"]:
+        total["incomplete"] = True
+    return total
+
+
+def reported_cost_fields(report: dict | None) -> list[str]:
+    if not report:
+        return []
+    lines = ["reported_cost:", "  source: " + yaml_quote(report["source"]),
+             "  scope: " + yaml_quote(report["scope"])]
+    amount = _decimal_cost(report.get("usd"))
+    lines.append("  usd: " + (format(amount, "f") if amount is not None else "null"))
+    if report.get("incomplete"):
+        lines.append("  incomplete: true")
+    for key in ("available_records", "total_records"):
+        if key in report:
+            lines.append("  " + key + ": " + str(report[key]))
+    if report.get("observed_at"):
+        lines.append("  observed_at: " + yaml_quote(report["observed_at"]))
+    return lines
+
+
+def recover_reported_cost(content: str) -> dict | None:
+    """state喪失・再構成時にノートの最後のCLI報告値を復旧する。"""
+    fm = re.match(r"\A---\s*\n(.*?)\n---", content, re.S)
+    block = re.search(r"(?m)^reported_cost:\n((?:  .*\n)*)", fm.group(1) + "\n") if fm else None
+    if not block:
+        return None
+    fields = {}
+    for key, raw in re.findall(r"(?m)^  ([a-z_]+): (.*)$", block.group(1)):
+        try:
+            fields[key] = json.loads(raw, parse_float=Decimal)
+        except ValueError:
+            fields[key] = raw
+    if not isinstance(fields.get("source"), str) or fields.get("scope") not in {"session", "message_sum"}:
+        return None
+    amount = _decimal_cost(fields.get("usd"))
+    if amount is not None:
+        fields["usd"] = str(amount)
+    else:
+        fields.pop("usd", None)
+    return fields
+
+
+def reported_cost_label(report: dict) -> str:
+    amount = _format_usd(report.get("usd"))
+    if amount is None:
+        return "未取得"
+    return amount + ("（部分取得）" if report.get("incomplete") else "")
+
+
+def build_reported_cost_section(report: dict | None) -> str:
+    if not report:
+        return ""
+    scope = "セッション累計" if report.get("scope") == "session" else "回答の合計"
+    return "💵 **取得コスト (CLI報告値)**: " + reported_cost_label(report) + "（" + scope + "）\n"
+
+
 def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
     """provider側で重複排除・正規化したrecordを、各recordの金額を維持して合計する。"""
     total = _empty_usage_totals()
@@ -46,6 +117,8 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
     count = priced = 0
     total_cost = Decimal(0)
     long_context = False
+    reports = []
+    model_reports = {}
     for message in messages:
         usage = message.get("usage") if message.get("type") == "assistant" else None
         if not isinstance(usage, dict):
@@ -53,6 +126,14 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
         count += 1
         model = str(message.get("model") or "unknown")
         entry = by_model.setdefault(model, _empty_usage_totals())
+        if usage.get("reported_cost_source"):
+            amount = _decimal_cost(usage.get("reported_cost_usd"))
+            report = {"source": usage["reported_cost_source"], "scope": "message_sum",
+                      "available_records": int(amount is not None), "total_records": 1}
+            if amount is not None:
+                report["usd"] = amount
+            reports.append(report)
+            model_reports.setdefault(model, []).append(report)
         for field in USAGE_FIELDS:
             value = int(usage.get(field, 0))
             total[field] += value
@@ -73,6 +154,10 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
         if "cost_usd" in entry and entry.pop("cost_unavailable", False):
             entry["cost_incomplete"] = True
     total["by_model"] = by_model
+    if reports:
+        total["reported_cost"] = sum_reported_costs(reports)
+        for model, items in model_reports.items():
+            by_model[model]["reported_cost"] = sum_reported_costs(items)
     if priced:
         total["total_cost_usd"] = total_cost
         if priced < count:
@@ -87,7 +172,7 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
 def usage_frontmatter_fields(usage: dict | None) -> list[str]:
     if not usage:
         return []
-    lines = ["usage:"]
+    lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields()]
     lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
     if "total_cost_usd" in usage:
         lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
@@ -95,6 +180,11 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
             lines.append("  cost_incomplete: true")
     else:
         lines.append("  cost_unavailable: true")
+    scope = usage.get("scope")
+    if scope:
+        lines.append("  scope:")
+        for key in ("parent_tokens", "subagent_tokens", "unattributed_subagent_tokens"):
+            lines.append(f"    {key}: {int(scope.get(key, 0))}")
     lines.append("  by_model:")
     for model, entry in usage.get("by_model", {}).items():
         lines.append(f"    {yaml_quote(model)}:")
@@ -105,6 +195,13 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
                 lines.append("      cost_incomplete: true")
         else:
             lines.append("      cost_unavailable: true")
+        report = entry.get("reported_cost")
+        if report:
+            amount = _decimal_cost(report.get("usd"))
+            lines.append("      reported_cost_usd: " + (format(amount, "f") if amount is not None else "null"))
+            if report.get("incomplete"):
+                lines.append("      reported_cost_incomplete: true")
+    lines.extend(reported_cost_fields(usage.get("reported_cost")))
     return lines
 
 
@@ -131,7 +228,14 @@ def build_usage_section(usage: dict | None) -> str:
         return "💰 **Usage (USD換算)**: N/A\n"
     parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')}" for model, entry in usage.get("by_model", {}).items()]
     details = f" ({'、'.join(parts)})" if parts else ""
-    return f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+    scope = usage.get("scope")
+    scope_line = ""
+    if scope:
+        scope_line = ("📊 **Usage集計範囲**: 親 " + f"{int(scope.get('parent_tokens', 0)):,} tok"
+            + "・子 " + f"{int(scope.get('subagent_tokens', 0)):,} tok"
+            + "（回答に紐付かない子 " + f"{int(scope.get('unattributed_subagent_tokens', 0)):,} tok）\n")
+    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+            + scope_line + build_reported_cost_section(usage.get("reported_cost")))
 
 
 def format_message_usage(usage: dict | None, subagent_usage: dict | None = None) -> str:
@@ -139,6 +243,8 @@ def format_message_usage(usage: dict | None, subagent_usage: dict | None = None)
         return ""
     warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
     label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    if usage.get("reported_cost"):
+        label += " · 取得コスト: " + reported_cost_label(usage["reported_cost"])
     if subagent_usage:
         parts = [f"{model} {int(entry.get('total_tokens', 0)):,} tok・{_usage_cost_label(entry, 'cost_usd')}"
                  for model, entry in sorted(subagent_usage.get("by_model", {}).items())]
@@ -170,6 +276,14 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
         if "cost_usd" in entry and entry.pop("cost_unavailable", False):
             entry["cost_incomplete"] = True
     merged["by_model"] = by_model
+    reported = sum_reported_costs(source.get("reported_cost") for source in (first, second))
+    if reported:
+        merged["reported_cost"] = reported
+    for model, entry in by_model.items():
+        reported = sum_reported_costs(source.get("by_model", {}).get(model, {}).get("reported_cost")
+                                     for source in (first, second))
+        if reported:
+            entry["reported_cost"] = reported
     if "total_cost_usd" in first or "total_cost_usd" in second:
         merged["total_cost_usd"] = sum((Decimal(str(source.get("total_cost_usd", 0))) for source in (first, second)), Decimal(0))
         if any(source.get("cost_unavailable") or source.get("cost_incomplete") for source in (first, second)):

@@ -195,7 +195,10 @@ cp "$HOME/Downloads/claude_save.py" ~/.claude/claude-obsidian/scripts/claude_sav
 }
 ```
 
-quotaも記録する場合は、`~/.claude/settings.json`の同じトップレベルに次を追加します。既存のstatusLine設定がある場合は、そのコマンドに`OBSIDIAN_VAULT="$HOME/obsidian" /usr/bin/python3 ~/.claude/claude-obsidian/scripts/claude_save.py --capture-quota`を組み込んでください。入力はClaude Codeが渡すJSONです。statusLineには短いquota表示が出ます。
+子Usageを完了直後に反映する場合は`SubagentStop`、APIエラー時も途中の会話を保存する場合は`StopFailure`へ、同じコマンドを登録します。設定例と集計範囲は[保存基盤の改善](docs/saver-improvements.md#3-claudeの子usageapi失敗)を参照してください。
+Claudeノートには親・子・回答に紐付かない子のtoken数を別々に表示します。回答に紐付かない子Usageもセッション合計には含まれます。
+
+quotaも記録する場合は、`~/.claude/settings.json`の同じトップレベルに次を追加します。既存のstatusLine設定がある場合は、そのコマンドに`OBSIDIAN_VAULT="$HOME/obsidian" /usr/bin/python3 ~/.claude/claude-obsidian/scripts/claude_save.py --capture-quota`を組み込んでください。入力はClaude Codeが渡すJSONです。statusLineにはquotaと、提供される場合はCLIのUSD概算が表示されます。
 
 ```json
 {
@@ -266,7 +269,7 @@ Piを再起動するか`/reload`を実行します。既定の保存先は`生�
 
 自動リトライ・圧縮・キュー処理まで終了した`agent_settled`を保存の境界にします。本文は現在の分岐のユーザー発話・回答のみを表示し、ツール結果・推論本文は表示しません。分岐切替時は同じノートを現在の分岐で再構成します。ノートは自動生成されるため、本文への手動追記は次回保存で置き換わります。Usageはentry IDごとに一度だけ集計し、別分岐・本文のないassistant・圧縮・分岐要約・追加usageレコード・usage付きツール結果も含めたセッション全体です。同じユーザー発話に対する連続する同一モデルの途中経過と最終回答は1つのcalloutにまとめ、Usageも合算します。本文のないUsageは、同じユーザー発話内の同一モデルを優先して最も近い回答calloutへ加算します。回答calloutは現在の分岐のUsageだけを表示します。本文のない分岐へ切り替えた場合も以前の本文を残さず再構成します。`message_count`は表示するcallout数です。モデルを特定できないツール内のUsageは`unknown`としてtokenのみ集計します。
 
-USD換算にはCodex・Claude Code・OpenCodeと共通の参考単価表を使います。単価表の正本は`shared/usage_prices.py.inc`で、各スクリプトへ埋め込みます。登録済みモデルをすべて対象にし、Piが返す`usage.cost`よりこの参考単価表を優先します。Piの`input`・`cacheRead`・`cacheWrite`を足して共通の入力総数にし、`reasoning`は`output`の内数として扱います。GPT系ではリクエスト単位の入力が272Kを超える場合の倍率も適用し、対象回答に`⚠︎ 272K+`を付けます。未登録モデルや1時間cache writeなど単価条件を確定できないUsageはtokenのみ保存し、一部だけ換算できた総計には`cost_incomplete: true`を付けます。サブスクの請求額・quota消費額ではありません。
+USD換算にはCodex・Claude Code・OpenCodeと共通の参考単価表を使います。単価表の正本は`shared/usage_prices.py.inc`で、各スクリプトへ埋め込みます。登録済みモデルをすべて対象にし、Piが返す`usage.cost.total`は別の取得コストとして保存し、参考換算と併記します。Piの`input`・`cacheRead`・`cacheWrite`を足して共通の入力総数にし、`reasoning`は`output`の内数として扱います。GPT系ではリクエスト単位の入力が272Kを超える場合の倍率も適用し、対象回答に`⚠︎ 272K+`を付けます。未登録モデルや1時間cache writeなど単価条件を確定できないUsageは参考換算額を省略し、一部だけ換算できた総計には`cost_incomplete: true`を付けます。サブスクの請求額・quota消費額ではありません。
 
 一時保存先で試す場合は、次のようにextensionを直接指定できます。
 
@@ -355,7 +358,7 @@ cp "$HOME/Downloads/ChatLogリンク表示名更新.md" ~/obsidian/Templates/
 
 Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_limits`から取得します。frontmatterの`quota`にはweekly・5hなど取得できた枠ごとに`first_observed`と`last_observed`を階層化し、残量・観測時刻・リセット時刻を保存します。「最初」は会話開始時ではなく最初に取得できた観測値です。quotaはアカウント全体の状態なので、差分を会話の消費量として扱わず、回答ごとのquotaも表示しません。quota情報を取得できない場合も、会話保存は継続します。Antigravityも同じ形式で保存します。
 
-Codex・Claude Code・OpenCode・Piの参考換算は、共通表`shared/usage_prices.py.inc`の`STANDARD_USAGE_RATES`に照合できるモデルをすべて対象にします。現在の登録モデルはGPT-6 Astra、GPT-6.1 Sol、GPT-6 Luna、Gemini 3.8 Flash、Claude Opus 5.5、Claude Sonnet 5.5、Claude Haiku 5.5、Muse Spark 1.3 Contributor、Nemotron 3 Ultraです。プロバイダ接頭辞と対応する別名を正規化して照合します。単価を削除したGPT-6 Sol・GPT-5.6系列も会話本文とtoken数は保存し、参考金額は換算不可とします。OpenCodeが返す正の`cost`は、単価登録の有無によらず優先します。
+Codex・Claude Code・OpenCode・Piの参考換算は、共通表`shared/usage_prices.py.inc`の`STANDARD_USAGE_RATES`に照合できるモデルをすべて対象にします。現在の登録モデルはGPT-6 Astra、GPT-6.1 Sol、GPT-6 Luna、Gemini 3.8 Flash、Claude Fable 5.1、Claude Opus 5.5、Claude Sonnet 5.5、Claude Haiku 5.5、Muse Spark 1.3 Contributor、Nemotron 3 Ultraです。プロバイダ接頭辞と対応する別名を正規化して照合します。単価を削除したGPT-6 Sol・GPT-5.6系列も会話本文とtoken数は保存し、参考金額は換算不可とします。OpenCodeが返す正の`cost`は、単価登録の有無によらず優先します。
 
 Gemini 3.8 Flashは`google/gemini-3.8-flash`・`gemini-3.8-flash`・`gemini3.8-flash`を照合できます。2026-10-06時点のStandard参考単価は100万tokenあたり入力$0.75、キャッシュ読込$0.075、出力（推論を含む）$3.75です。[Googleの価格表](https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash)に記載された2026年末までの割引価格を登録しています。cache writeは[OpenRouterのStandard endpoint掲載値](https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints)を100万token単位へ換算した$0.0416666666666667を使います。Googleの時間単位のキャッシュ保管料は別途計算しません。Batch・Flex・Priority・ツール料金は参考換算に含めず、OpenCodeの正の`cost`は引き続き優先します。登録単価は固定値のため、2027年の価格変更時に表を更新してください。
 
@@ -367,9 +370,13 @@ CodexのUsageは、親セッションと`parent_thread_id`で紐付くサブエ�
 
 Claude CodeのUsageはtranscriptの`message.usage`をmessage IDごとに最後の値だけ集計します。通常入力、キャッシュ読み込み、キャッシュ書き込み、出力を合わせてtoken総数を出します。換算対象は他のUsage対応saverと共通です。`shared/usage_prices.py.inc`から埋め込むtoken種別ごとの単価表からUSD概算を計算します。Opus 5.5のキャッシュ読込は100万tokenあたり$0.20です。Opus 5.5・Sonnet 5.5は入力20万token超でも標準単価で換算します。キャッシュ書込は5分・1時間の内訳に応じて換算し、価格に影響する条件を確定できない場合や未登録モデルはtokenのみを保存します。`anthropic/claude-sonnet-5.5`にも対応し、`nvidia/nemotron-3-ultra-550b-a55b:free`は対応する有料版の単価を参考値として換算します。これはClaude Codeのサブスクリプション請求額ではありません。quotaは任意のstatusLine設定から5h・weeklyの残量を観測し、Codexと同じ`first_observed`・`last_observed`形式で保存します。statusLineがquotaを返さない場合は省略します。
 
+2026-10-25確認の公式価格に合わせ、Sonnet 5.5のキャッシュ読込は$0.10/100万tokenです。Fable 5.1にも対応し、通常入力$10・出力$50・キャッシュ読込$0.25・5分書込$12.50・1時間書込$20/100万tokenで参考換算します。
+
+既存の`--capture-quota`は、statusLine入力に`cost.total_cost_usd`があれば`CLI概算: $...`も表示します。quota未提供でも金額は表示できます。この値は`reported_cost`へセッション累計として保存し、ノートに参考換算と併記します。同じ通知を繰り返し受け取っても加算しません。quota・金額とも未提供なら空表示です。設定方法は従来と同じです。
+
 Claude Codeの本文冒頭にも共通形式のUSD換算サマリを表示し、回答calloutには同じユーザー発話内の連続する同一モデルの回答に対応するtoken数・USD参考換算を表示します。遅れて書き込まれたUsageは既存calloutへ反映します。Codex・Claude Code・OpenCode・Piで、換算できない金額は`換算不可`、既知モデル分だけの金額は`部分換算`と表示します。金額は小数桁を丸めず、固定小数で出力します。
 
-OpenCodeのUsageはSQLiteのassistantレコードにある`tokens`をmessage IDごとに集計します。本文のないツール専用レコードもfrontmatterの合計に含めます。OpenCodeが正の`cost`を返した回答はその値を記録し、返さない回答は対応モデルの標準API単価でUSD概算します。モデルごとの単価は他のUsage対応saverと共通です。GPT系の参考換算ではPiと同じく、1リクエストの入力総数が272Kを超えた場合に入力・キャッシュ系2倍、出力1.5倍を適用します。長文料金で参考換算した回答には`⚠︎ 272K+`を付けます。記録済みの正の`cost`にはこの倍率を掛けません。無料モデルも無料利用の請求額ではなく、対応する有料モデルの単価を参考値として換算します。`cost: 0`は無料利用と断定せず、単価が未登録のモデルに限り換算不可として扱います。本文先頭にはCodexと同じ形式で合計・モデル別のUSD換算サマリを表示します。OpenRouter残高APIには接続しません。
+OpenCodeのUsageはSQLiteのassistantレコードにある`tokens`をmessage IDごとに集計します。本文のないツール専用レコードもfrontmatterの合計に含めます。OpenCodeのUSD参考換算はすべて共通単価表で計算し、`cost`は別の取得コストとして併記します。明示的な0も取得値として保存します。モデルごとの単価は他のUsage対応saverと共通です。GPT系の参考換算ではPiと同じく、1リクエストの入力総数が272Kを超えた場合に入力・キャッシュ系2倍、出力1.5倍を適用します。長文料金で参考換算した回答には`⚠︎ 272K+`を付けます。CLIから取得した`cost`にはこの倍率を掛けません。無料モデルも無料利用の請求額ではなく、対応する有料モデルの単価を参考値として換算します。`cost: 0`もCLI報告値であり、請求額の保証ではありません。単価未登録モデルは参考換算を省略し、取得値があればその金額を表示します。本文先頭にはCodexと同じ形式で合計・モデル別のUSD換算サマリを表示します。OpenRouter残高APIには接続しません。
 
 OpenCodeの連続する同一モデルの回答は、途中経過と最終回答を1つのcalloutにまとめます。本文のないassistantのツール専用レコードは、同じユーザー発話内で最も近い回答calloutのUsageへ加算します。frontmatterのUsageにはすべてのassistantレコードを含みます。
 
@@ -453,9 +460,21 @@ Claude CodeのquotaはstatusLine設定があり、入力に`rate_limits`が含�
 
 このプロジェクトは各CLI、ChatGPT、Antigravity、Claude CodeおよびObsidianの非公式ツールです。各サービスの開発元とは関係ありません。
 
+### USD参考換算と取得コストの併記（4.0.0）
+
+OpenCode・Pi・Claudeは共通単価表による`usage.total_cost_usd`と、CLIが返した`reported_cost.usd`を別々に保存・表示します。0、未取得、部分取得を区別します。ClaudeはstatusLineのセッション累計の最新観測値を保存し、回答ごとの金額へ推測配分しません。OpenCodeの3.xからは`usage.total_cost_usd`の意味が変わるため4.0.0としました。過去ノートの一括更新は行いません。
+
+Codex用の読取専用`compare_codex_telemetry.py`も追加しました。既存Claude照合ツールに加え、Codexの完了イベントとtranscriptを比較できます。使い方、金額の保存形式、OTelの負荷・送信内容・運用上の注意は[金額併記とCodex telemetry](./docs/costs-and-codex-telemetry.md)を参照してください。
+
 ## セッション全履歴の再構成
 
 `rebuild_session.py` はセッションIDから元の履歴を探し、現在の保存スクリプトで会話本文・Usage・USD換算を全件再生成します。Codex・Claude Code・Antigravity・OpenCodeの4つの `*_save.py` と同じディレクトリに置いて実行してください。通常hookの配置変更は不要です。Piはこの再構成ツールの対象外です。
+
+置換前の確認には`--dry-run`を追加します。隔離領域で再生成し、現在のノートと予定内容の件数・token・金額・本文差分をJSONで表示します。ノート・state・バックアップは変更しません。実際の置換時には元履歴やCLI報告値が変わる場合があるため、直前に確認してください。
+
+```bash
+/usr/bin/python3 rebuild_session.py claude SESSION_ID --obsidian --dry-run --pricing preserve
+```
 
 動作テスト用の出力先を指定する例です。指定先へMarkdownを直接保存し、通常のObsidianノート・stateは更新しません。
 
@@ -526,8 +545,12 @@ Markdownの出力形式では、[Obsidian AI Exporter](https://github.com/sho765
 
 ## バージョン管理
 
-このソースのバージョンは3.11.1です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`、ルートの[VERSION](./VERSION)、Gitタグは同じ値です。
+このソースのバージョンは4.2.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`、ルートの[VERSION](./VERSION)、Gitタグは同じ値です。
 
 ## ライセンス
 
 このプロジェクトは[MIT License](./LICENSE)の下で公開されています。
+
+構造・堅牢性・Claude対応の検証結果と今後の改善案は、[2026-10-25の検証報告](docs/saver-audit-2026-10-25.md)を参照してください。
+
+3.13.0ではCodexの単一snapshot解析、価格版を選んだ再構成、Claudeの子Usage・API失敗保存、読取専用doctor、任意の公式telemetry照合を追加しました。[使い方・検証結果](docs/saver-improvements.md)を参照してください。

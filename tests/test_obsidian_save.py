@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import subprocess
 import sys
@@ -38,6 +39,86 @@ class TestSaveScripts(unittest.TestCase):
         ).strip()
         for save_module in (codex_save, claude_save, agy_save, opencode_save):
             self.assertEqual(save_module.__version__, version)
+
+    def test_incremental_stdin_requires_an_object(self):
+        for module in (codex_save, claude_save, agy_save):
+            for raw in ('null', '[]', '1', '"text"', '{broken'):
+                with self.subTest(provider=module.__name__, raw=raw), mock.patch.object(
+                        module.sys, 'stdin', io.StringIO(raw)):
+                    self.assertEqual(module.read_stdin(), {})
+
+    def test_claude_statusline_cost_without_subscription_quota(self):
+        data = {'session_id': 'api-only', 'cost': {'total_cost_usd': 0.01234}}
+        self.assertEqual(claude_save.capture_statusline_quota(data), 'CLI概算: $0.01234')
+        self.assertEqual(claude_save.load_state('api-only')['reported_cost']['usd'], '0.01234')
+        data['rate_limits'] = {'five_hour': {'used_percentage': 20}}
+        label = claude_save.capture_statusline_quota(data)
+        self.assertIn('80.0%', label)
+        self.assertIn('CLI概算: $0.01234', label)
+        for bad in (True, -1, 'NaN', 'Infinity', {}, None):
+            with self.subTest(cost=bad):
+                self.assertEqual(claude_save.capture_statusline_quota(
+                    {'cost': {'total_cost_usd': bad}}), '')
+        self.assertEqual(claude_save.capture_statusline_quota(
+            {'cost': {'total_cost_usd': 0}}), 'CLI概算: $0')
+
+    def test_claude_fable_ttl_cost_and_unknown_conditions(self):
+        raw = {'input_tokens': 100, 'output_tokens': 10,
+               'cache_read_input_tokens': 50, 'cache_creation_input_tokens': 30,
+               'cache_creation': {'ephemeral_5m_input_tokens': 20, 'ephemeral_1h_input_tokens': 10}}
+        for model in ('claude-fable-5-1', 'anthropic/claude-fable-5.1', 'claude-fable-5-1-20261022'):
+            with self.subTest(model=model):
+                record = claude_save._claude_usage_record({'model': model, 'usage': raw})
+                self.assertEqual(record['cost_usd'], claude_save.Decimal('0.0019625'))
+                self.assertEqual(record['total_tokens'], 190)
+        for override in ({'speed': 'fast'}, {'inference_geo': 'us'}, {'cache_creation': {}}):
+            record = claude_save._claude_usage_record(
+                {'model': 'claude-fable-5-1', 'usage': dict(raw, **override)})
+            self.assertNotIn('cost_usd', record)
+
+    def test_claude_stop_wait_ignores_sidechain_answers(self):
+        transcript = self.test_dir / 'sidechain.jsonl'
+        message = {'model': 'claude-fable-5-1', 'content': '親回答',
+                   'usage': {'input_tokens': 10, 'output_tokens': 5}}
+        rows = [{'type': 'assistant', 'message': message},
+                {'type': 'assistant', 'isSidechain': True,
+                 'message': dict(message, content='子回答')}]
+        text = ''.join(json.dumps(row) + '\n' for row in rows)
+        transcript.write_text(text)
+        with mock.patch.object(claude_save.logger, 'warning') as warning:
+            self.assertEqual(claude_save.read_stop_transcript(transcript, '親回答'), text)
+        warning.assert_not_called()
+
+    def test_malformed_json_rows_do_not_lose_valid_codex_and_claude_messages(self):
+        noise = [None, [], 42, 'text', {'type': 'event_msg', 'payload': None},
+                 {'type': 'assistant', 'message': None}]
+        cases = (
+            (codex_save, [
+                {'type': 'turn_context', 'payload': {'model': 'gpt-6-luna'}},
+                {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': '質問'}},
+                {'type': 'event_msg', 'payload': {'type': 'agent_message', 'message': '正常回答'}},
+                {'type': 'token_usage_record', 'payload': {'usage': {'input_tokens': 10,
+                    'output_tokens': 5, 'total_tokens': 15}}}]),
+            (claude_save, [
+                {'type': 'user', 'message': {'content': [{'type': 'text', 'text': None},
+                    {'type': 'text', 'text': '質問'}]}},
+                {'type': 'assistant', 'message': {'id': 'answer', 'model': 'claude-fable-5-1',
+                    'content': [{'type': 'text', 'text': {}}, {'type': 'text', 'text': '正常回答'}],
+                    'usage': {'input_tokens': 10, 'output_tokens': 5}}}]),
+        )
+        for module, rows in cases:
+            with self.subTest(provider=module.__name__):
+                transcript = self.test_dir / (module.__name__ + '.jsonl')
+                transcript.write_text(''.join(json.dumps(row) + '\n' for row in noise + rows))
+                hook = {'session_id': 'malformed', 'transcript_path': str(transcript), 'cwd': str(self.test_dir)}
+                module.handle_stop_event(hook)
+                path = Path(module.load_state('malformed')['output_path'])
+                content = path.read_text()
+                self.assertIn('正常回答', content)
+                self.assertIn('total_tokens: 15', content)
+                self.assertIn('total_cost_usd:', content)
+                module.handle_stop_event(hook)
+                self.assertEqual(path.read_text(), content)
 
     def test_codex_first_hook_preserves_first_and_last_quota_in_batch(self):
         transcript = self.test_dir / "quota-batch.jsonl"
@@ -952,7 +1033,7 @@ Response text
         usage = claude_save.retrieve_usage(transcript)
         self.assertEqual(usage["total_tokens"], 187)
         self.assertEqual(usage["input_tokens"], 175)
-        self.assertEqual(usage["by_model"]["claude-sonnet-5-5"]["cost_usd"], claude_save.Decimal("0.00036"))
+        self.assertEqual(usage["by_model"]["claude-sonnet-5-5"]["cost_usd"], claude_save.Decimal("0.000355"))
         self.assertTrue(usage["cost_incomplete"])
         self.assertIn("cost_unavailable: true", "\n".join(claude_save.build_usage_frontmatter_fields(usage)))
 
@@ -988,8 +1069,8 @@ Response text
                       "claude-sonnet-5-5-20260928"):
             with self.subTest(model=model):
                 usage = claude_save._claude_usage_record({"model": model, "usage": raw})
-                # 100*2 + 50*0.2 + 20*2.5 + 10*4 + 10*10
-                self.assertEqual(usage["cost_usd"], claude_save.Decimal("0.0004"))
+                # 100*2 + 50*0.1 + 20*2.5 + 10*4 + 10*10
+                self.assertEqual(usage["cost_usd"], claude_save.Decimal("0.000395"))
                 self.assertEqual(usage["total_tokens"], 190)
         model = "nvidia/nemotron-3-ultra-550b-a55b:free"
         usage = claude_save._claude_usage_record({"model": model, "usage": raw})
@@ -1013,10 +1094,10 @@ Response text
                 for i, m in enumerate(("anthropic/claude-sonnet-5.5", model))]
         transcript.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
         summary = claude_save.retrieve_usage(transcript)
-        self.assertEqual(summary["total_cost_usd"], claude_save.Decimal("0.000492"))
-        self.assertIn("total_cost_usd: 0.000492", "\n".join(
+        self.assertEqual(summary["total_cost_usd"], claude_save.Decimal("0.000487"))
+        self.assertIn("total_cost_usd: 0.000487", "\n".join(
             claude_save.build_usage_frontmatter_fields(summary)))
-        self.assertIn("$0.000492", claude_save.build_usage_section(summary))
+        self.assertIn("$0.000487", claude_save.build_usage_section(summary))
         self.assertNotIn("cost_incomplete", summary)
 
     def test_claude_stop_waits_for_delayed_answer_and_usage(self):

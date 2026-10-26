@@ -3,8 +3,8 @@ LONG_CONTEXT_INPUT_TOKENS = 272_000
 
 def reference_price_model(model: object) -> str:
     name = _normalize_usage_model(model)
-    if (name not in STANDARD_USAGE_RATES and name.endswith("-free")
-            and name[:-len("-free")] in STANDARD_USAGE_RATES):
+    if (name not in active_usage_rates() and name.endswith("-free")
+            and name[:-len("-free")] in active_usage_rates()):
         name = name[:-len("-free")]
     return name
 
@@ -15,7 +15,7 @@ def is_long_context_usage(model: object, usage: dict) -> bool:
     tokens = usage.get("input_tokens", 0)
     return (APPLY_LONG_CONTEXT_PRICING
             and isinstance(tokens, int) and not isinstance(tokens, bool)
-            and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
+            and name.startswith("gpt-") and name in active_usage_rates()
             and tokens > LONG_CONTEXT_INPUT_TOKENS)
 
 
@@ -29,7 +29,7 @@ def haiku_prompt_price_multiplier(model: object, usage: dict) -> int:
 
 def _usage_cost(model: object, usage: dict) -> Decimal | None:
     """raw recordを正規化したtoken内訳から標準API参考換算を行う。"""
-    rates = STANDARD_USAGE_RATES.get(reference_price_model(model))
+    rates = active_usage_rates().get(reference_price_model(model))
     if rates is None or usage.get("pricing_unknown"):
         return None
     long_context = is_long_context_usage(model, usage)

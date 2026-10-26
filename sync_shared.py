@@ -11,6 +11,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 BLOCK_TARGETS = {
+    "usage-price-history": ("codex_save.py", "claude_save.py", "opencode_save.py", "pi_save.py"),
+    "jsonl-snapshot": ("codex_save.py", "claude_save.py"),
     "full-session-display": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "full-session-storage": ("opencode_save.py", "pi_save.py"),
     "usage-summary": ("claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),

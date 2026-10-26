@@ -11,6 +11,14 @@
 # DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
 # https://api-docs.deepseek.com/quick_start/pricing/
 STANDARD_USAGE_RATES = {
+    # 2026-10-25: https://platform.claude.com/docs/en/models/fable-5-1/overview
+    "claude-fable-5-1": {
+        "input": Decimal("10.00"),
+        "cached_input": Decimal("0.25"),
+        "cache_write_input": Decimal("12.50"),
+        "output": Decimal("50.00"),
+        "cache_write_input_1h": Decimal("20.00"),
+    },
     "deepseek-v4.1-flash": {
         "input": Decimal("0.30"),
         "cached_input": Decimal("0.006"),
@@ -29,6 +37,14 @@ STANDARD_USAGE_RATES = {
         "cached_input": Decimal("0.10"),
         "cache_write_input": Decimal("2.50"),
         "output": Decimal("10.00"),
+    },
+    # GPT-6.1 Terra: 2026-10-27確認。cache writeは30分保持の標準単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.1-terra
+    "gpt-6.1-terra": {
+        "input": Decimal("1.00"),
+        "cached_input": Decimal("0.05"),
+        "cache_write_input": Decimal("1.25"),
+        "output": Decimal("5.00"),
     },
     "gpt-6-luna": {
         "input": Decimal("0.10"),
@@ -72,7 +88,8 @@ STANDARD_USAGE_RATES = {
     },
     "claude-sonnet-5-5": {
         "input": Decimal("2.00"),
-        "cached_input": Decimal("0.20"),
+        # 2026-10-25: https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+        "cached_input": Decimal("0.10"),
         "cache_write_input": Decimal("2.50"),
         "output": Decimal("10.00"),
         "cache_write_input_1h": Decimal("4.00"),

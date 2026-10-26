@@ -4,6 +4,7 @@ def _normalize_usage_model(model: object) -> str:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     aliases = {
+        "claude-fable-5.1": "claude-fable-5-1",
         "deepseek-flash": "deepseek-v4.1-flash",
         "deepseek-v4-1-flash": "deepseek-v4.1-flash",
         "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",

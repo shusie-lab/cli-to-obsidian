@@ -45,6 +45,18 @@ class SaverContracts(unittest.TestCase):
             context.start()
             self.addCleanup(context.stop)
 
+    def test_failed_sync_preserves_original_and_removes_temporary_file(self):
+        for provider, module in self.modules.items():
+            with self.subTest(provider=provider):
+                path = self.root / provider / 'note.md'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('original')
+                with patch.object(module.os, 'fsync', side_effect=OSError('disk sync failed')):
+                    with self.assertRaises(OSError):
+                        module.atomic_write_text(path, 'replacement')
+                self.assertEqual(path.read_text(), 'original')
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
     def rows(self, provider, turn=1, user="質問", answer="回答", usage=True):
         if provider == "codex":
             rows = [
@@ -274,10 +286,11 @@ class SaverContracts(unittest.TestCase):
                 if provider != "codex":
                     self.assertTrue(large["long_context"])
         native = normalized("opencode", 300_000, cost=7.5)
-        self.assertEqual(Decimal(native["cost_usd"]), Decimal("7.5"))
-        self.assertNotIn("long_context", native)
+        self.assertEqual(Decimal(native["cost_usd"]), Decimal("1.35"))
+        self.assertEqual(Decimal(native["reported_cost_usd"]), Decimal("7.5"))
+        self.assertTrue(native["long_context"])
         self.assertEqual(opencode.summarize_usage([
-            {"type": "assistant", "model": "gpt-6.1-sol", "usage": native}])["total_cost_usd"], Decimal("7.5"))
+            {"type": "assistant", "model": "gpt-6.1-sol", "usage": native}])["total_cost_usd"], Decimal("1.35"))
         for provider in ("opencode", "pi"):
             with self.subTest(saved_provider=provider):
                 rows = self.rows(provider)
@@ -292,8 +305,8 @@ class SaverContracts(unittest.TestCase):
                 if provider == "opencode":
                     rows[1]["info"]["cost"] = 7.5
                     self.save(provider, rows)
-                    self.assertIn("total_cost_usd: 7.5", path.read_text())
-                    self.assertIn("Usage: 310,000 tok · $7.5</small>", path.read_text())
+                    self.assertIn("total_cost_usd: 1.35", path.read_text())
+                    self.assertIn("Usage: 310,000 tok · $1.35 ⚠︎ 272K+ · 取得コスト: $7.5</small>", path.read_text())
 
     def test_codex_long_context_toggle_refreshes_existing_note(self):
         module = self.modules["codex"]
@@ -345,9 +358,10 @@ class SaverContracts(unittest.TestCase):
     def test_all_registered_prices_are_used_by_each_usage_saver(self):
         # 入力10/出力5の期待額を別途計算し、raw入力から保存まで検証する。
         prices = {"deepseek-v4.1-flash": "0.000009", "gpt-6-astra": "0.00035", "gpt-6.1-sol": "0.00007",
-                  "gpt-6-luna": "0.0000035", "muse-spark-1.3-contributor-free": "0.000002",
+                  "gpt-6.1-terra": "0.000035", "gpt-6-luna": "0.0000035", "muse-spark-1.3-contributor-free": "0.000002",
                   "nemotron-3-ultra-free": "0.000016", "claude-opus-5-5": "0.00014",
-                  "claude-sonnet-5-5": "0.00007", "claude-haiku-5-5": "0.0000035", "gemini-3.8-flash": "0.00002625"}
+                  "claude-sonnet-5-5": "0.00007", "claude-haiku-5-5": "0.0000035", "gemini-3.8-flash": "0.00002625",
+                  "claude-fable-5-1": "0.00035"}
         for provider in ("codex", "claude", "opencode", "pi"):
             self.assertEqual(set(self.modules[provider].STANDARD_USAGE_RATES), set(prices))
             for model, price in prices.items():
@@ -355,7 +369,8 @@ class SaverContracts(unittest.TestCase):
                     path = self.save(provider, self.price_rows(provider, model), model)
                     content = path.read_text()
                     self.assertIn("total_cost_usd: " + price, content)
-                    self.assertIn("Usage: 15 tok · $" + price + "</small>", content)
+                    suffix = " · 取得コスト: 未取得" if provider in {"opencode", "pi"} else ""
+                    self.assertIn("Usage: 15 tok · $" + price + suffix + "</small>", content)
 
         claude = self.modules["claude"]
         usage = claude._claude_usage_record({"model": "gpt-6.1-sol", "usage": {
@@ -363,6 +378,29 @@ class SaverContracts(unittest.TestCase):
             "cache_creation_input_tokens": 50_000, "output_tokens": 10}})
         self.assertTrue(usage["long_context"])
         self.assertEqual(usage["cost_usd"], Decimal("0.870154"))
+
+    def test_terra_token_rates_long_context_and_price_history(self):
+        for provider in ("codex", "claude", "opencode", "pi"):
+            module = self.modules[provider]
+            for model in ("gpt-6.1-terra", "openai/gpt-6.1-terra"):
+                with self.subTest(provider=provider, model=model):
+                    with patch.object(module, "APPLY_LONG_CONTEXT_PRICING", False):
+                        for usage, expected in (
+                            ({"input_tokens": 1_000_000}, "1"),
+                            ({"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000}, "0.05"),
+                            ({"input_tokens": 1_000_000, "cache_write_input_tokens": 1_000_000}, "1.25"),
+                            ({"output_tokens": 1_000_000}, "5"),
+                        ):
+                            self.assertEqual(module._usage_cost(model, usage), Decimal(expected))
+                    with patch.object(module, "APPLY_LONG_CONTEXT_PRICING", True):
+                        for tokens, expected in ((272_000, "0.18955"), (272_001, "0.379077")):
+                            usage = {"input_tokens": tokens, "cached_input_tokens": 100_000,
+                                     "cache_write_input_tokens": 50_000, "output_tokens": 10}
+                            self.assertEqual(module._usage_cost(model, usage), Decimal(expected))
+                    for version in ("3.11.1", "3.12.0"):
+                        with module.usage_price_version(version):
+                            self.assertIsNone(module._usage_cost(model, {"input_tokens": 10}))
+                    self.assertEqual(module.PRICE_CHECKED_AT["gpt-6.1-terra"], "2026-10-27")
 
     def test_gemini_openrouter_alias_cache_reasoning_and_large_input(self):
         aliases = ("google/gemini-3.8-flash", "gemini-3.8-flash", "gemini3.8-flash")
@@ -413,7 +451,8 @@ class SaverContracts(unittest.TestCase):
                     if provider == "opencode":
                         rows[1]["info"]["cost"] = 7.5
                         self.save(provider, rows, model)
-                        self.assertIn("total_cost_usd: 7.5", path.read_text())
+                        self.assertNotIn("total_cost_usd:", path.read_text())
+                        self.assertIn("  usd: 7.5", path.read_text())
 
     def test_claude_late_usage_updates_existing_answer_once(self):
         module = self.modules["claude"]

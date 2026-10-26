@@ -1,5 +1,7 @@
 import json
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta
+import io
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -156,6 +158,39 @@ class TestRebuildSession(unittest.TestCase):
         self.assertIn('total_cost_usd: 0.0005', new)
         self.assertIn('$0.0005', new)
         self.assertEqual(new.count('回答本文'), 1)
+
+    def test_dry_run_previews_price_change_without_writing_note_state_or_backup(self):
+        module = self.module('codex')
+        transcript = self.transcript('codex')
+        target, _ = rebuild.rebuild('codex', self.session, transcript=transcript, module=module)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in (target, module.state_path(self.session))}
+        module.USAGE_COST_USD_PER_1M_TOKEN_TYPE['gpt-6.1-sol']['input'] *= 2
+        preview = rebuild.rebuild('codex', self.session, transcript=transcript, module=module,
+                                  dry_run=True)
+        self.assertEqual(preview['target'], str(target))
+        self.assertTrue(preview['changed'])
+        self.assertEqual(preview['before']['usage']['total_cost_usd'], '0.0003')
+        self.assertEqual(preview['after']['usage']['total_cost_usd'], '0.0005')
+        self.assertIn('Usage: 110 tok', preview['diff'])
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before}, before)
+        self.assertFalse((target.parent / '.rebuild-backups').exists())
+        rebuilt, _ = rebuild.rebuild('codex', self.session, transcript=transcript, module=module)
+        self.assertEqual(preview['after']['usage']['total_cost_usd'],
+                         rebuild.rebuild_preview(target, '', rebuilt.read_text(), 'codex', None)['after']['usage']['total_cost_usd'])
+
+    def test_dry_run_cli_returns_json_and_keeps_normal_output_untouched(self):
+        module = self.module('claude')
+        transcript = self.transcript('claude')
+        target, _ = rebuild.rebuild('claude', self.session, transcript=transcript, module=module)
+        before = (target.read_bytes(), module.state_path(self.session).read_bytes())
+        stream = io.StringIO()
+        with mock.patch.object(rebuild, 'load_saver', return_value=module), redirect_stdout(stream):
+            code = rebuild.main(['claude', self.session, '--obsidian', '--dry-run',
+                                 '--transcript', str(transcript)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stream.getvalue())['target'], str(target))
+        self.assertEqual((target.read_bytes(), module.state_path(self.session).read_bytes()), before)
 
     def test_empty_transcript_keeps_old_note_and_state(self):
         module = self.module('codex')

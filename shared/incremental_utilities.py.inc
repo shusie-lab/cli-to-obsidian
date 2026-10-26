@@ -1,4 +1,4 @@
-def session_locked(input_key: str):
+def session_locked(input_key: str, *, observe: bool = True):
     """hook input内のsession idを使って関数を排他実行する。"""
     def decorator(func):
         @wraps(func)
@@ -7,7 +7,10 @@ def session_locked(input_key: str):
             if not session_id:
                 return func(hook_input)
             with session_lock(str(session_id)):
-                return func(hook_input)
+                if not observe:
+                    return func(hook_input)
+                with observe_save(str(session_id), hook_input):
+                    return func(hook_input)
         return wrapper
     return decorator
 
@@ -17,7 +20,8 @@ def read_stdin() -> dict:
     try:
         data = sys.stdin.read()
         if data.strip():
-            return json.loads(data)
+            parsed = json.loads(data)
+            return parsed if isinstance(parsed, dict) else {}
     except Exception as error:
         logger.info("stdinの読み込みまたはJSONパースに失敗しました: %s", error)
     return {}

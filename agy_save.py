@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "3.11.1"
+__version__ = "4.2.0"
 
 import json
 import math
@@ -194,6 +194,85 @@ def safe_session_key(session_id: str) -> str:
     return f"{safe or 'session'}-{digest}"
 
 
+from contextvars import ContextVar
+
+_SAVE_SKIP_REASON = ContextVar("obsidian_save_skip_reason", default=None)
+
+
+def mark_save_skipped(reason: str) -> None:
+    """入力本文やパスを記録せず、保存を見送った理由だけを残す。"""
+    if _SAVE_SKIP_REASON.get() is None:
+        _SAVE_SKIP_REASON.set(reason)
+
+
+def diagnostic_path(session_id: str) -> Path:
+    return STATE_DIR / ".diagnostics" / (safe_session_key(session_id) + ".status")
+
+
+def record_save_observation(session_id: str, details: dict) -> None:
+    """本文・例外メッセージを含めず、診断情報を保存する。診断失敗は保存を妨げない。"""
+    try:
+        path = diagnostic_path(session_id)
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        if details.get("last_outcome") != "skipped":
+            previous.pop("skip_reason", None)
+        previous.update(details, session_id=str(session_id), saver_version=__version__)
+        atomic_write_text(path, json.dumps(previous, ensure_ascii=False, indent=2))
+    except (OSError, ValueError):
+        logger.warning("診断情報を保存できませんでした")
+
+
+@contextmanager
+def observe_save(session_id: str, payload: dict):
+    """hook/bridgeの完了・例外を記録する。通常の終了コード契約は呼出元へ任せる。"""
+    details = {"last_attempt_at": format_iso(now_jst()), "last_outcome": "skipped"}
+    transcript = payload.get("transcript_path") or payload.get("transcriptPath")
+    if isinstance(transcript, str) and transcript:
+        details["transcript_path"] = transcript
+    state_file = state_path(session_id)
+    try:
+        before = state_file.stat().st_mtime_ns
+    except OSError:
+        before = None
+    class ErrorObserver(logging.Handler):
+        def emit(self, record):
+            details.update(last_outcome="failed", last_failure_at=format_iso(now_jst()),
+                           last_failure_type="logged_error")
+    observer = ErrorObserver(level=logging.ERROR)
+    logger.addHandler(observer)
+    skip_token = _SAVE_SKIP_REASON.set(None)
+    try:
+        yield
+    except Exception as error:
+        details.update(last_outcome="failed", last_failure_at=format_iso(now_jst()),
+                       last_failure_type=type(error).__name__)
+        raise
+    else:
+        state = load_state(session_id)
+        output = state.get("output_path")
+        try:
+            after = state_file.stat().st_mtime_ns
+        except OSError:
+            after = None
+        if details["last_outcome"] == "skipped" and _SAVE_SKIP_REASON.get() is not None:
+            details["skip_reason"] = _SAVE_SKIP_REASON.get()
+        elif (details["last_outcome"] != "failed" and isinstance(output, str)
+                and Path(output).is_file() and after != before):
+            details.update(last_outcome="saved", last_success_at=format_iso(now_jst()),
+                           output_path=str(output))
+        elif details["last_outcome"] == "skipped":
+            details["skip_reason"] = _SAVE_SKIP_REASON.get() or "unchanged"
+    finally:
+        _SAVE_SKIP_REASON.reset(skip_token)
+        logger.removeHandler(observer)
+        record_save_observation(session_id, details)
+
+
 def state_path(session_id: str) -> Path:
     return STATE_DIR / f"{safe_session_key(session_id)}.json"
 
@@ -211,10 +290,10 @@ def atomic_write_text(path: Path, content: str) -> None:
             suffix=".tmp",
             delete=False,
         ) as tmp:
+            tmp_path = Path(tmp.name)
             tmp.write(content)
             tmp.flush()
             os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
         if path.exists():
             os.chmod(tmp_path, path.stat().st_mode & 0o7777)
         os.replace(tmp_path, path)
@@ -320,6 +399,8 @@ def cleanup_old_states() -> None:
                     last_used = datetime.fromtimestamp(path.stat().st_mtime, tz=JST)
                 if last_used < cutoff:
                     path.unlink()
+                    diagnostic = STATE_DIR / ".diagnostics" / (path.stem + ".status")
+                    diagnostic.unlink(missing_ok=True)
                     removed += 1
             except Exception as error:
                 logger.info("stateファイルのクリーンアップ中にスキップ: %s: %s", path.name, error)
@@ -332,7 +413,7 @@ def cleanup_old_states() -> None:
 # ユーティリティ
 # ============================================================
 # BEGIN GENERATED: incremental-utilities
-def session_locked(input_key: str):
+def session_locked(input_key: str, *, observe: bool = True):
     """hook input内のsession idを使って関数を排他実行する。"""
     def decorator(func):
         @wraps(func)
@@ -341,7 +422,10 @@ def session_locked(input_key: str):
             if not session_id:
                 return func(hook_input)
             with session_lock(str(session_id)):
-                return func(hook_input)
+                if not observe:
+                    return func(hook_input)
+                with observe_save(str(session_id), hook_input):
+                    return func(hook_input)
         return wrapper
     return decorator
 
@@ -351,7 +435,8 @@ def read_stdin() -> dict:
     try:
         data = sys.stdin.read()
         if data.strip():
-            return json.loads(data)
+            parsed = json.loads(data)
+            return parsed if isinstance(parsed, dict) else {}
     except Exception as error:
         logger.info("stdinの読み込みまたはJSONパースに失敗しました: %s", error)
     return {}
@@ -1277,6 +1362,7 @@ def load_jsonl_messages(jsonl_path: Path) -> list:
                 logger.info(f"JSONLの1行をスキップ（不正なJSON）: {e}")
                 continue
     except Exception as e:
+        mark_save_skipped("transcript_unreadable")
         logger.warning(f"JSONL読み込み失敗: {jsonl_path}: {e}")
         return []
 
@@ -1984,6 +2070,7 @@ def _handle_stop_event(hook_input: dict) -> None:
 
     jsonl_path = find_jsonl_path(session_id, transcript_path)
     if not jsonl_path:
+        mark_save_skipped("transcript_missing")
         return
     all_messages = load_jsonl_messages(jsonl_path)
 
@@ -1998,6 +2085,7 @@ def _handle_stop_event(hook_input: dict) -> None:
         lambda start, saved: create_md_file(session_id, saved.get("cwd", cwd), start,
                                            source=saved.get("source"), tags=saved.get("tags")))
     if prepared is None:
+        mark_save_skipped("no_content")
         return
     path, last_id = prepared
 

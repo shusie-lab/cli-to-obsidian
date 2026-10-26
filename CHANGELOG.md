@@ -11,6 +11,69 @@
 
 - セッションIDから全履歴を再構成する `rebuild_session.py` を追加。テスト用出力と、バックアップ付きの既存Obsidianノート置換に対応
 
+## [4.2.0] - 2026-10-27
+
+### Added
+
+- GPT-6.1 Terraの標準API単価によるUSD参考換算に対応
+
+## [4.1.0] - 2026-10-25
+
+### Added
+
+- 再構成前に、ノートとstateを変更せず、変更予定の件数・token・金額・本文差分を確認できる`--dry-run`を追加
+- Claudeノートに親・子・回答へ紐付かない子のtoken内訳を表示
+- 保存を見送った理由をdoctorで確認可能に
+
+### Fixed
+
+- doctorのPi既定配置先をREADMEの導入先へ修正
+
+## [4.0.0] - 2026-10-25
+
+### Changed
+
+- OpenCode・Pi・ClaudeのノートにUSD参考換算とCLI報告コストを併記。OpenCodeの`usage.total_cost_usd`も共通単価表による参考換算額に統一し、取得した金額は別の`reported_cost`へ保存する変更を実施
+- 取得コストの0・未取得・部分取得を区別し、ClaudeのstatusLineのセッション累計は加算せず最新観測値として保存
+- 既存OpenCodeノートの一括移行は行わず、通常保存・明示的な再構成から新方式を適用
+
+### Added
+
+- CodexのOTLP JSONとtranscriptをresponse・turn・model単位で照合する読取専用ツールを追加
+
+## [3.13.0] - 2026-10-25
+
+### Added
+
+- USD換算の価格版・記録日・出典をノートへ記録し、再構成で現在価格と過去価格を選択可能に
+- ClaudeのSubagentStopで子Usageを親セッションへ合算し、StopFailureで途中の会話と失敗種別を保存
+- 保存結果・配置版・cursor等を読取専用で確認するdoctorと、任意の公式telemetry照合ツールを追加
+
+### Changed
+
+- Codexは一度読み取った履歴から本文・Usage・quotaを計算し、追記中の観測時点のずれと繰り返し解析を削減
+
+### Fixed
+
+- Codexの不正なイベント型で後続の会話保存が妨げられる問題を修正
+- Claudeの子Usageの回答への帰属から別セッションの行を除外
+- telemetry照合でモデルの不一致も検出し、不正なOTLP構造をエラーとして報告
+- doctorがOpenCodeのbridge取得位置ファイルを保存セッションとして誤診断する問題を修正
+
+## [3.12.0] - 2026-10-25
+
+### Added
+
+- Claude Fable 5.1のUSD参考換算に対応。5分・1時間キャッシュ書込を区別し、共通単価表を使う4つのsaverへ反映
+- ClaudeのstatusLineで、quota未提供でもCLIから受け取ったセッションUSD概算を表示
+
+### Fixed
+
+- Sonnet 5.5のキャッシュ読込単価を最新の公式資料に合わせ、100万tokenあたり$0.10へ修正
+- Codex・Claudeで想定外のJSON行が混ざっても正常な会話とUsageを保存できるよう補強。増分hookの非オブジェクト入力も安全に無視
+- ClaudeのStop処理で解析済みの会話を再利用し、同じ履歴の繰り返し解析を削減
+- 保存途中に書き込み・同期が失敗した場合にも、一時ファイルを残さないよう修正
+
 ## [3.11.1] - 2026-10-21
 
 ### Fixed

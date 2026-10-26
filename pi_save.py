@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """Pi extensionから渡された会話を Obsidian に保存する。"""
 
-__version__ = "3.11.1"
+__version__ = "4.2.0"
 
 import argparse
 import sys
@@ -53,6 +53,14 @@ APPLY_LONG_CONTEXT_PRICING = True
 # DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
 # https://api-docs.deepseek.com/quick_start/pricing/
 STANDARD_USAGE_RATES = {
+    # 2026-10-25: https://platform.claude.com/docs/en/models/fable-5-1/overview
+    "claude-fable-5-1": {
+        "input": Decimal("10.00"),
+        "cached_input": Decimal("0.25"),
+        "cache_write_input": Decimal("12.50"),
+        "output": Decimal("50.00"),
+        "cache_write_input_1h": Decimal("20.00"),
+    },
     "deepseek-v4.1-flash": {
         "input": Decimal("0.30"),
         "cached_input": Decimal("0.006"),
@@ -71,6 +79,14 @@ STANDARD_USAGE_RATES = {
         "cached_input": Decimal("0.10"),
         "cache_write_input": Decimal("2.50"),
         "output": Decimal("10.00"),
+    },
+    # GPT-6.1 Terra: 2026-10-27確認。cache writeは30分保持の標準単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.1-terra
+    "gpt-6.1-terra": {
+        "input": Decimal("1.00"),
+        "cached_input": Decimal("0.05"),
+        "cache_write_input": Decimal("1.25"),
+        "output": Decimal("5.00"),
     },
     "gpt-6-luna": {
         "input": Decimal("0.10"),
@@ -114,7 +130,8 @@ STANDARD_USAGE_RATES = {
     },
     "claude-sonnet-5-5": {
         "input": Decimal("2.00"),
-        "cached_input": Decimal("0.20"),
+        # 2026-10-25: https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+        "cached_input": Decimal("0.10"),
         "cache_write_input": Decimal("2.50"),
         "output": Decimal("10.00"),
         "cache_write_input_1h": Decimal("4.00"),
@@ -124,6 +141,104 @@ STANDARD_USAGE_RATES = {
 # 従来の呼び出し名との互換alias。単価の正本は上の辞書1つだけ。
 USAGE_COST_USD_PER_1M_TOKEN_TYPE = STANDARD_USAGE_RATES
 # END GENERATED: usage-prices
+
+# BEGIN GENERATED: usage-price-history
+from contextvars import ContextVar
+
+PRICE_VERSION = "4.2.0"
+PRICE_RECORDED_AT = "2026-10-27"
+PRICE_CHECKED_AT = {
+    "gpt-6.1-terra": "2026-10-27",
+    "claude-fable-5-1": "2026-10-25", "claude-sonnet-5-5": "2026-10-25",
+    "claude-opus-5-5": "2026-10-25", "claude-haiku-5-5": "2026-10-25",
+    "gemini-3.8-flash": "2026-10-06", "deepseek-v4.1-flash": "2026-10-16",
+}
+PRICE_SOURCES = {
+    "claude": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "gpt": "https://developers.openai.com/api/docs/pricing",
+    "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "muse": "https://dev.meta.ai/docs/pricing-rate-limits/",
+    "nemotron": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b",
+}
+# 過去表を現在表への差分として生成せず、独立した値で保持する。
+PRICE_HISTORY = {
+    "3.12.0": {"recorded_at": "2026-10-25", "rates": {
+        'claude-fable-5-1': {'input': Decimal('10.00'), 'cached_input': Decimal('0.25'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00'), 'cache_write_input_1h': Decimal('20.00')},
+        'deepseek-v4.1-flash': {'input': Decimal('0.30'), 'cached_input': Decimal('0.006'), 'cache_write_input': Decimal('0.30'), 'output': Decimal('1.20')},
+        'gpt-6-astra': {'input': Decimal('10.00'), 'cached_input': Decimal('1.00'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00')},
+        'gpt-6.1-sol': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00')},
+        'gpt-6-luna': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50')},
+        'gemini-3.8-flash': {'input': Decimal('0.75'), 'cached_input': Decimal('0.075'), 'cache_write_input': Decimal('0.0416666666666667'), 'output': Decimal('3.75')},
+        'muse-spark-1.3-contributor-free': {'input': Decimal('0.10'), 'cached_input': Decimal('0.002'), 'cache_write_input': Decimal('0.10'), 'output': Decimal('0.20')},
+        'nemotron-3-ultra-free': {'input': Decimal('0.50'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('0.50'), 'output': Decimal('2.20')},
+        'claude-opus-5-5': {'input': Decimal('4.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('5.00'), 'output': Decimal('20.00'), 'cache_write_input_1h': Decimal('8.00')},
+        'claude-haiku-5-5': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50'), 'cache_write_input_1h': Decimal('0.20')},
+        'claude-sonnet-5-5': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00'), 'cache_write_input_1h': Decimal('4.00')},
+    }},
+    "3.11.1": {"recorded_at": "2026-10-21", "rates": {
+        'deepseek-v4.1-flash': {'input': Decimal('0.30'), 'cached_input': Decimal('0.006'), 'cache_write_input': Decimal('0.30'), 'output': Decimal('1.20')},
+        'gpt-6-astra': {'input': Decimal('10.00'), 'cached_input': Decimal('1.00'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00')},
+        'gpt-6.1-sol': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00')},
+        'gpt-6-luna': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50')},
+        'gemini-3.8-flash': {'input': Decimal('0.75'), 'cached_input': Decimal('0.075'), 'cache_write_input': Decimal('0.0416666666666667'), 'output': Decimal('3.75')},
+        'muse-spark-1.3-contributor-free': {'input': Decimal('0.10'), 'cached_input': Decimal('0.002'), 'cache_write_input': Decimal('0.10'), 'output': Decimal('0.20')},
+        'nemotron-3-ultra-free': {'input': Decimal('0.50'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('0.50'), 'output': Decimal('2.20')},
+        'claude-opus-5-5': {'input': Decimal('4.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('5.00'), 'output': Decimal('20.00'), 'cache_write_input_1h': Decimal('8.00')},
+        'claude-haiku-5-5': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50'), 'cache_write_input_1h': Decimal('0.20')},
+        'claude-sonnet-5-5': {'input': Decimal('2.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00'), 'cache_write_input_1h': Decimal('4.00')},
+    }},
+}
+_PRICE_CONTEXT = ContextVar("obsidian_usage_price_version", default=PRICE_VERSION)
+
+
+def active_price_version() -> str:
+    return _PRICE_CONTEXT.get()
+
+
+def active_usage_rates() -> dict:
+    version = active_price_version()
+    return STANDARD_USAGE_RATES if version == PRICE_VERSION else PRICE_HISTORY[version]["rates"]
+
+
+@contextmanager
+def usage_price_version(version: str):
+    if version != PRICE_VERSION and version not in PRICE_HISTORY:
+        raise ValueError("未登録の価格版: " + str(version))
+    token = _PRICE_CONTEXT.set(version)
+    try:
+        yield
+    finally:
+        _PRICE_CONTEXT.reset(token)
+
+
+def note_price_version(content: str) -> str | None:
+    frontmatter = re.match(r"\A---\s*\n(.*?)\n---", content, re.DOTALL)
+    if not frontmatter:
+        return None
+    usage = re.search(r"(?m)^usage:\n((?:[ \t].*\n|\n)*)", frontmatter.group(1) + "\n")
+    match = re.search(r'^  price_version: (.+)$', usage.group(1), re.M) if usage else None
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except ValueError:
+        value = match.group(1).strip()
+    return value if isinstance(value, str) else None
+
+
+def usage_price_fields() -> list[str]:
+    version = active_price_version()
+    recorded = PRICE_RECORDED_AT if version == PRICE_VERSION else PRICE_HISTORY[version]["recorded_at"]
+    # 過去料金の正確な適用開始日は確認できないため推定しない。
+    return ["  price_version: " + yaml_quote(version),
+            "  price_recorded_at: " + yaml_quote(recorded),
+            "  price_effective_from: null", "  price_checked_at:",
+            *("    " + yaml_quote(model) + ": " + (yaml_quote(PRICE_CHECKED_AT[model])
+              if version == PRICE_VERSION and model in PRICE_CHECKED_AT else "null")
+              for model in active_usage_rates()), "  price_sources:",
+            *("    " + yaml_quote(key) + ": " + yaml_quote(value) for key, value in PRICE_SOURCES.items())]
+# END GENERATED: usage-price-history
 
 # BEGIN GENERATED: output-directory
 def resolve_output_dir(value: str | None = None) -> Path:
@@ -261,6 +376,85 @@ def safe_session_key(session_id: str) -> str:
     return f"{safe or 'session'}-{digest}"
 
 
+from contextvars import ContextVar
+
+_SAVE_SKIP_REASON = ContextVar("obsidian_save_skip_reason", default=None)
+
+
+def mark_save_skipped(reason: str) -> None:
+    """入力本文やパスを記録せず、保存を見送った理由だけを残す。"""
+    if _SAVE_SKIP_REASON.get() is None:
+        _SAVE_SKIP_REASON.set(reason)
+
+
+def diagnostic_path(session_id: str) -> Path:
+    return STATE_DIR / ".diagnostics" / (safe_session_key(session_id) + ".status")
+
+
+def record_save_observation(session_id: str, details: dict) -> None:
+    """本文・例外メッセージを含めず、診断情報を保存する。診断失敗は保存を妨げない。"""
+    try:
+        path = diagnostic_path(session_id)
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        if details.get("last_outcome") != "skipped":
+            previous.pop("skip_reason", None)
+        previous.update(details, session_id=str(session_id), saver_version=__version__)
+        atomic_write_text(path, json.dumps(previous, ensure_ascii=False, indent=2))
+    except (OSError, ValueError):
+        logger.warning("診断情報を保存できませんでした")
+
+
+@contextmanager
+def observe_save(session_id: str, payload: dict):
+    """hook/bridgeの完了・例外を記録する。通常の終了コード契約は呼出元へ任せる。"""
+    details = {"last_attempt_at": format_iso(now_jst()), "last_outcome": "skipped"}
+    transcript = payload.get("transcript_path") or payload.get("transcriptPath")
+    if isinstance(transcript, str) and transcript:
+        details["transcript_path"] = transcript
+    state_file = state_path(session_id)
+    try:
+        before = state_file.stat().st_mtime_ns
+    except OSError:
+        before = None
+    class ErrorObserver(logging.Handler):
+        def emit(self, record):
+            details.update(last_outcome="failed", last_failure_at=format_iso(now_jst()),
+                           last_failure_type="logged_error")
+    observer = ErrorObserver(level=logging.ERROR)
+    logger.addHandler(observer)
+    skip_token = _SAVE_SKIP_REASON.set(None)
+    try:
+        yield
+    except Exception as error:
+        details.update(last_outcome="failed", last_failure_at=format_iso(now_jst()),
+                       last_failure_type=type(error).__name__)
+        raise
+    else:
+        state = load_state(session_id)
+        output = state.get("output_path")
+        try:
+            after = state_file.stat().st_mtime_ns
+        except OSError:
+            after = None
+        if details["last_outcome"] == "skipped" and _SAVE_SKIP_REASON.get() is not None:
+            details["skip_reason"] = _SAVE_SKIP_REASON.get()
+        elif (details["last_outcome"] != "failed" and isinstance(output, str)
+                and Path(output).is_file() and after != before):
+            details.update(last_outcome="saved", last_success_at=format_iso(now_jst()),
+                           output_path=str(output))
+        elif details["last_outcome"] == "skipped":
+            details["skip_reason"] = _SAVE_SKIP_REASON.get() or "unchanged"
+    finally:
+        _SAVE_SKIP_REASON.reset(skip_token)
+        logger.removeHandler(observer)
+        record_save_observation(session_id, details)
+
+
 def state_path(session_id: str) -> Path:
     return STATE_DIR / f"{safe_session_key(session_id)}.json"
 
@@ -278,10 +472,10 @@ def atomic_write_text(path: Path, content: str) -> None:
             suffix=".tmp",
             delete=False,
         ) as tmp:
+            tmp_path = Path(tmp.name)
             tmp.write(content)
             tmp.flush()
             os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
         if path.exists():
             os.chmod(tmp_path, path.stat().st_mode & 0o7777)
         os.replace(tmp_path, path)
@@ -387,6 +581,8 @@ def cleanup_old_states() -> None:
                     last_used = datetime.fromtimestamp(path.stat().st_mtime, tz=JST)
                 if last_used < cutoff:
                     path.unlink()
+                    diagnostic = STATE_DIR / ".diagnostics" / (path.stem + ".status")
+                    diagnostic.unlink(missing_ok=True)
                     removed += 1
             except Exception as error:
                 logger.info("stateファイルのクリーンアップ中にスキップ: %s: %s", path.name, error)
@@ -894,6 +1090,7 @@ def _normalize_usage_model(model: object) -> str:
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     aliases = {
+        "claude-fable-5.1": "claude-fable-5-1",
         "deepseek-flash": "deepseek-v4.1-flash",
         "deepseek-v4-1-flash": "deepseek-v4.1-flash",
         "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",
@@ -952,6 +1149,77 @@ def calculate_usage_cost(rates: dict, usage: dict, *, input_multiplier=1, output
         return None
 
 
+def sum_reported_costs(reports) -> dict | None:
+    """CLIの回答単位の報告値を合計する。セッション累計は加算しない。"""
+    reports = [report for report in reports if report and report.get("scope") == "message_sum"]
+    if not reports:
+        return None
+    total = {"source": ", ".join(sorted({report["source"] for report in reports})),
+             "scope": "message_sum", "available_records": 0, "total_records": 0}
+    for report in reports:
+        total["total_records"] += report.get("total_records", 1)
+        total["available_records"] += report.get("available_records", 0)
+        amount = _decimal_cost(report.get("usd"))
+        if amount is not None:
+            total["usd"] = total.get("usd", Decimal(0)) + amount
+    if "usd" in total and total["available_records"] < total["total_records"]:
+        total["incomplete"] = True
+    return total
+
+
+def reported_cost_fields(report: dict | None) -> list[str]:
+    if not report:
+        return []
+    lines = ["reported_cost:", "  source: " + yaml_quote(report["source"]),
+             "  scope: " + yaml_quote(report["scope"])]
+    amount = _decimal_cost(report.get("usd"))
+    lines.append("  usd: " + (format(amount, "f") if amount is not None else "null"))
+    if report.get("incomplete"):
+        lines.append("  incomplete: true")
+    for key in ("available_records", "total_records"):
+        if key in report:
+            lines.append("  " + key + ": " + str(report[key]))
+    if report.get("observed_at"):
+        lines.append("  observed_at: " + yaml_quote(report["observed_at"]))
+    return lines
+
+
+def recover_reported_cost(content: str) -> dict | None:
+    """state喪失・再構成時にノートの最後のCLI報告値を復旧する。"""
+    fm = re.match(r"\A---\s*\n(.*?)\n---", content, re.S)
+    block = re.search(r"(?m)^reported_cost:\n((?:  .*\n)*)", fm.group(1) + "\n") if fm else None
+    if not block:
+        return None
+    fields = {}
+    for key, raw in re.findall(r"(?m)^  ([a-z_]+): (.*)$", block.group(1)):
+        try:
+            fields[key] = json.loads(raw, parse_float=Decimal)
+        except ValueError:
+            fields[key] = raw
+    if not isinstance(fields.get("source"), str) or fields.get("scope") not in {"session", "message_sum"}:
+        return None
+    amount = _decimal_cost(fields.get("usd"))
+    if amount is not None:
+        fields["usd"] = str(amount)
+    else:
+        fields.pop("usd", None)
+    return fields
+
+
+def reported_cost_label(report: dict) -> str:
+    amount = _format_usd(report.get("usd"))
+    if amount is None:
+        return "未取得"
+    return amount + ("（部分取得）" if report.get("incomplete") else "")
+
+
+def build_reported_cost_section(report: dict | None) -> str:
+    if not report:
+        return ""
+    scope = "セッション累計" if report.get("scope") == "session" else "回答の合計"
+    return "💵 **取得コスト (CLI報告値)**: " + reported_cost_label(report) + "（" + scope + "）\n"
+
+
 def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
     """provider側で重複排除・正規化したrecordを、各recordの金額を維持して合計する。"""
     total = _empty_usage_totals()
@@ -959,6 +1227,8 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
     count = priced = 0
     total_cost = Decimal(0)
     long_context = False
+    reports = []
+    model_reports = {}
     for message in messages:
         usage = message.get("usage") if message.get("type") == "assistant" else None
         if not isinstance(usage, dict):
@@ -966,6 +1236,14 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
         count += 1
         model = str(message.get("model") or "unknown")
         entry = by_model.setdefault(model, _empty_usage_totals())
+        if usage.get("reported_cost_source"):
+            amount = _decimal_cost(usage.get("reported_cost_usd"))
+            report = {"source": usage["reported_cost_source"], "scope": "message_sum",
+                      "available_records": int(amount is not None), "total_records": 1}
+            if amount is not None:
+                report["usd"] = amount
+            reports.append(report)
+            model_reports.setdefault(model, []).append(report)
         for field in USAGE_FIELDS:
             value = int(usage.get(field, 0))
             total[field] += value
@@ -986,6 +1264,10 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
         if "cost_usd" in entry and entry.pop("cost_unavailable", False):
             entry["cost_incomplete"] = True
     total["by_model"] = by_model
+    if reports:
+        total["reported_cost"] = sum_reported_costs(reports)
+        for model, items in model_reports.items():
+            by_model[model]["reported_cost"] = sum_reported_costs(items)
     if priced:
         total["total_cost_usd"] = total_cost
         if priced < count:
@@ -1000,7 +1282,7 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
 def usage_frontmatter_fields(usage: dict | None) -> list[str]:
     if not usage:
         return []
-    lines = ["usage:"]
+    lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields()]
     lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
     if "total_cost_usd" in usage:
         lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
@@ -1008,6 +1290,11 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
             lines.append("  cost_incomplete: true")
     else:
         lines.append("  cost_unavailable: true")
+    scope = usage.get("scope")
+    if scope:
+        lines.append("  scope:")
+        for key in ("parent_tokens", "subagent_tokens", "unattributed_subagent_tokens"):
+            lines.append(f"    {key}: {int(scope.get(key, 0))}")
     lines.append("  by_model:")
     for model, entry in usage.get("by_model", {}).items():
         lines.append(f"    {yaml_quote(model)}:")
@@ -1018,6 +1305,13 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
                 lines.append("      cost_incomplete: true")
         else:
             lines.append("      cost_unavailable: true")
+        report = entry.get("reported_cost")
+        if report:
+            amount = _decimal_cost(report.get("usd"))
+            lines.append("      reported_cost_usd: " + (format(amount, "f") if amount is not None else "null"))
+            if report.get("incomplete"):
+                lines.append("      reported_cost_incomplete: true")
+    lines.extend(reported_cost_fields(usage.get("reported_cost")))
     return lines
 
 
@@ -1044,7 +1338,14 @@ def build_usage_section(usage: dict | None) -> str:
         return "💰 **Usage (USD換算)**: N/A\n"
     parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')}" for model, entry in usage.get("by_model", {}).items()]
     details = f" ({'、'.join(parts)})" if parts else ""
-    return f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+    scope = usage.get("scope")
+    scope_line = ""
+    if scope:
+        scope_line = ("📊 **Usage集計範囲**: 親 " + f"{int(scope.get('parent_tokens', 0)):,} tok"
+            + "・子 " + f"{int(scope.get('subagent_tokens', 0)):,} tok"
+            + "（回答に紐付かない子 " + f"{int(scope.get('unattributed_subagent_tokens', 0)):,} tok）\n")
+    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+            + scope_line + build_reported_cost_section(usage.get("reported_cost")))
 
 
 def format_message_usage(usage: dict | None, subagent_usage: dict | None = None) -> str:
@@ -1052,6 +1353,8 @@ def format_message_usage(usage: dict | None, subagent_usage: dict | None = None)
         return ""
     warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
     label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    if usage.get("reported_cost"):
+        label += " · 取得コスト: " + reported_cost_label(usage["reported_cost"])
     if subagent_usage:
         parts = [f"{model} {int(entry.get('total_tokens', 0)):,} tok・{_usage_cost_label(entry, 'cost_usd')}"
                  for model, entry in sorted(subagent_usage.get("by_model", {}).items())]
@@ -1083,6 +1386,14 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
         if "cost_usd" in entry and entry.pop("cost_unavailable", False):
             entry["cost_incomplete"] = True
     merged["by_model"] = by_model
+    reported = sum_reported_costs(source.get("reported_cost") for source in (first, second))
+    if reported:
+        merged["reported_cost"] = reported
+    for model, entry in by_model.items():
+        reported = sum_reported_costs(source.get("by_model", {}).get(model, {}).get("reported_cost")
+                                     for source in (first, second))
+        if reported:
+            entry["reported_cost"] = reported
     if "total_cost_usd" in first or "total_cost_usd" in second:
         merged["total_cost_usd"] = sum((Decimal(str(source.get("total_cost_usd", 0))) for source in (first, second)), Decimal(0))
         if any(source.get("cost_unavailable") or source.get("cost_incomplete") for source in (first, second)):
@@ -1176,8 +1487,8 @@ LONG_CONTEXT_INPUT_TOKENS = 272_000
 
 def reference_price_model(model: object) -> str:
     name = _normalize_usage_model(model)
-    if (name not in STANDARD_USAGE_RATES and name.endswith("-free")
-            and name[:-len("-free")] in STANDARD_USAGE_RATES):
+    if (name not in active_usage_rates() and name.endswith("-free")
+            and name[:-len("-free")] in active_usage_rates()):
         name = name[:-len("-free")]
     return name
 
@@ -1188,7 +1499,7 @@ def is_long_context_usage(model: object, usage: dict) -> bool:
     tokens = usage.get("input_tokens", 0)
     return (APPLY_LONG_CONTEXT_PRICING
             and isinstance(tokens, int) and not isinstance(tokens, bool)
-            and name.startswith("gpt-") and name in STANDARD_USAGE_RATES
+            and name.startswith("gpt-") and name in active_usage_rates()
             and tokens > LONG_CONTEXT_INPUT_TOKENS)
 
 
@@ -1202,7 +1513,7 @@ def haiku_prompt_price_multiplier(model: object, usage: dict) -> int:
 
 def _usage_cost(model: object, usage: dict) -> Decimal | None:
     """raw recordを正規化したtoken内訳から標準API参考換算を行う。"""
-    rates = STANDARD_USAGE_RATES.get(reference_price_model(model))
+    rates = active_usage_rates().get(reference_price_model(model))
     if rates is None or usage.get("pricing_unknown"):
         return None
     long_context = is_long_context_usage(model, usage)
@@ -1225,6 +1536,11 @@ def normalize_pi_usage(raw: object, model: str) -> Optional[Dict[str, Any]]:
         return None
     usage = dict(zip(USAGE_FIELDS, (fresh + read + write, read, write, output, reasoning,
                                    fresh + read + write + output)))
+    usage["reported_cost_source"] = "pi.usage.cost.total"
+    raw_cost = raw.get("cost")
+    reported = _decimal_cost(raw_cost.get("total")) if isinstance(raw_cost, dict) else None
+    if reported is not None:
+        usage["reported_cost_usd"] = str(reported)
     # 単価表は5分cache write。1時間保持を含む場合は推定しない。
     if raw.get("cacheWrite1h"):
         usage["pricing_unknown"] = True
@@ -1405,19 +1721,21 @@ def handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
     messages, branch_records = entry_records(branch)
     _, all_records = entry_records(entries)
     cwd = str(payload.get("cwd") or "")
-    with session_lock(session_id):
+    with session_lock(session_id), observe_save(session_id, payload):
         state = load_state(session_id)
         path = Path(state["output_path"]) if state.get("output_path") else find_existing_md(session_id)
         # 新規の空セッションは作らず、既存ノートは本文のない分岐でも再構成する。
         if path is None and not messages:
+            mark_save_skipped("no_content")
             return None
         metadata = recover_snapshot_metadata(path, state, payload.get("created"))
         created = metadata["created"]
-        fingerprint = hashlib.sha256(json.dumps({"version": __version__, "cwd": cwd,
+        fingerprint = hashlib.sha256(json.dumps({"version": __version__, "price_version": active_price_version(), "cwd": cwd,
             "messages": messages, "all_records": all_records, "branch_records": branch_records,
             "source": metadata["source"], "tags": metadata["tags"]},
             sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         if path is not None and path.exists() and state.get("payload_hash") == fingerprint:
+            mark_save_skipped("unchanged")
             save_state(session_id, state)
             return path
         if path is None:
