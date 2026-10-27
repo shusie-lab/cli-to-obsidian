@@ -26,29 +26,9 @@ cli-to-obsidianは、対応するAIツールの会話をMarkdownとしてObsidia
 
 上は表示を簡略化した例です。使用量の詳細はノートのプロパティ（YAML frontmatter）にも保存するため、ObsidianのDataviewで会話別・モデル別に集計できます。
 
-USD参考換算は、実際のサブスクリプション請求額やquota消費量を示すものではありません。また、token数や参考金額の比重は作業時間の比重とは異なります。取得できる情報は、次の対応表を確認してください。
+USD参考換算は、実際のサブスクリプション請求額やquota消費量を示すものではありません。また、token数や参考金額の比重は作業時間の比重とは異なります。
 
-### 回答所要時間
-
-各ツールの最後の回答には、`⏱ 回答所要時間: 2分15秒` の形式で時間を表示します。
-ユーザーの発話から回答完了までの経過時間で、途中経過・ツール実行・通信・回答生成を含みます。
-AI内部の推論だけに費やした時間ではありません。同じ依頼でモデルが変わって複数の回答calloutに
-分かれる場合も、その依頼の最後のcalloutに総時間を表示します。秒未満は切り捨てます。
-
-- Codex: ターン完了イベントの完了時刻を使用します。まだ記録されていない場合は、明示的に
-  最終回答と識別できる回答完了イベントの時刻を使用します。
-- Claude Code: `turn_duration` 終了記録の時刻を使用します。Stopフックより後に記録される場合は
-  一旦「取得不可」となり、次の保存で読み取れた終了記録を反映します。
-- OpenCode: 回答の `time.completed` を使用します。
-- Pi: 回答終了時に履歴へ保存されるentryの時刻を使用します。モデル側の開始時刻とは区別します。
-- Antigravity: `terminationReason: model_stop`・`fullyIdle: true`・エラーなしのStopフックを
-  受信した時刻を、今回の回答の終了観測時刻として使用します。フック起動までの遅れを含みますが、
-  ロック待ち・quota取得など保存処理の時間は含みません。同じ回答の再実行では時刻を上書きしません。
-  観測時刻はstateとノート内の非表示コメントに保持し、state復旧・既存ノートの再構成でも引き継ぎます。
-  終了状態の情報が不足するStopや、終了を観測していない過去履歴だけからの再構成では「取得不可」と表示します。
-
-依頼時刻・完了時刻の欠落、不正な日時、完了が依頼より前になる記録でも「取得不可」と表示し、
-作成時刻やフック再実行時の現在時刻から推測しません。過去ノートを一括で再生成する処理は行いません。
+導入するツールは下の対応表から選べます。導入済みの場合は、[保存確認](#動作確認とトラブルシューティング)、[記録内容](#usage-spec)、[全履歴の再構成](#セッション全履歴の再構成)、[telemetry照合](#telemetry)へ進んでください。
 
 ## 対応ツール
 
@@ -63,8 +43,6 @@ OpenCodeは補助として利用し、Piは使い始めた段階です。両ツ�
 | [Pi](#pi) | 今後拡充 | CLI（extension） | 対応 | なし | 2個 |
 | [Claude Code](#claude-code) | 参考実装 | CLI | 対応 | statusLine設定時に対応 | 1個 |
 | [Antigravity](#antigravity-cliとアプリ) | 参考実装 | CLI・Antigravityアプリ | なし | 対応 | 1個 |
-
-DeepSeek V4.1 Flashは`deepseek-flash`、`deepseek-v4.1-flash`（プロバイダ接頭辞付き・無料版の表記を含む）に対応します。[公式料金](https://api-docs.deepseek.com/quick_start/pricing/)のピーク単価（100万tokenあたり入力$0.30、キャッシュ読込$0.006、出力$1.20）で固定の参考換算を行います。キャッシュ書込は通常入力と同単価です。オフピークの半額料金への時刻別切り替えは行いません。無料版も有料API単価での参考値です。
 
 USD参考換算は登録済みモデルが対象です。単価が未登録の場合も、会話と取得できたtoken数は保存します。
 
@@ -83,6 +61,8 @@ ChatGPTの一般的な会話は対象外です。対応するのは、ChatGPTデ
 各設定例の`$HOME/obsidian`は、実際のObsidian保管庫のパスへ置き換えてください。hookを使う3ツールはコマンド内に保存先を指定するため、デスクトップアプリでもシェルの環境変数設定に依存しません。
 
 既存の設定ファイルは上書きせず、必要な項目だけ追加してください。利用したいツールの設定だけで構いません。
+
+以降のコマンドはmacOS向けです。補助ツールも、ダウンロードしたファイルを置いたディレクトリで実行します。
 
 ## Codex CLIとChatGPTデスクトップアプリ
 
@@ -117,14 +97,9 @@ Codexのhook定義は `~/.codex/hooks.json` または `~/.codex/config.toml` に
 }
 ```
 
-すでに `hooks.json` を使っている場合は、上記全体で置き換えず、既存の `hooks.Stop` 配列の末尾へ内側のオブジェクト（`{"hooks": [...]}`）を追加してください。
-
 `hooks.json`を使わず、`config.toml`でhookを管理する場合は、代わりに以下を追加します。
 
 ```toml
-[features]
-hooks = true
-
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
@@ -132,37 +107,69 @@ command = 'OBSIDIAN_VAULT="$HOME/obsidian" /usr/bin/python3 ~/.codex/codex-obsid
 timeout = 10
 ```
 
-設定後はCodexの `/hooks` でhookの登録と信頼状態を確認してください。
+設定後はCodexを再起動し、`/hooks`で保存hookを確認・信頼してください。新規または変更したhookは、信頼するまで実行されません。`[features]`で`hooks = false`にしている場合は`true`へ変更します。設定形式と信頼の扱いは[公式Hooks仕様](https://learn.chatgpt.com/docs/hooks)に基づきます。
 
 CodexのCLIとアプリは会話を共有できるため、transcriptの起動元にかかわらず、既定では`codex-cli/`に保存し、frontmatterの`source: codex-cli`とタグ`codex-cli`を記録します。端末別に区別する場合は[共通設定](#共通設定)の`OBSIDIAN_SOURCE`を指定してください。
 
-## Antigravity CLIとアプリ
+## OpenCode
 
-Antigravity CLIおよびAntigravityアプリのStop hookから会話履歴を保存します。
-quotaは、公式の読み取り専用コマンド `agy --output-format json --print='/quota'`
-から取得します。このコマンドは会話ターンを作らず、quotaを消費しません。`agy` が
-見つからない、または quota を返さない場合でも、会話保存は継続します。
+OpenCode v2は会話完了プラグインから保存スクリプトへ渡します。プラグインはOpenCodeのSQLiteデータベース（`~/.local/share/opencode/opencode.db`）に記録された`session_message`の`idle`を監視し、完了したセッションの履歴全体を保存します。グローバルプラグインとして設置すると、OpenCodeの全プロジェクトで有効になります。
 
-[agy_save.py](./agy_save.py)をダウンロードし、配置します。
+[opencode_save.py](./opencode_save.py)と[opencode_obsidian.js](./opencode_obsidian.js)をダウンロードし、配置します。
 
 ```bash
-mkdir -p ~/.gemini/agy-obsidian/scripts
-cp "$HOME/Downloads/agy_save.py" ~/.gemini/agy-obsidian/scripts/agy_save.py
+mkdir -p ~/.config/opencode/scripts ~/.config/opencode/plugins
+cp "$HOME/Downloads/opencode_save.py" ~/.config/opencode/scripts/opencode_save.py
+cp "$HOME/Downloads/opencode_obsidian.js" ~/.config/opencode/plugins/opencode_obsidian.js
 ```
 
-`~/.gemini/config/hooks.json`に以下を追加します。
+保管庫を指定して、同じターミナルからOpenCodeを起動します。
 
-```json
-{
-  "obsidian-save": {
-    "Stop": [
-      {
-        "type": "command",
-        "command": "OBSIDIAN_VAULT=\"$HOME/obsidian\" /usr/bin/python3 ~/.gemini/agy-obsidian/scripts/agy_save.py"
-      }
-    ]
-  }
-}
+```bash
+export OBSIDIAN_VAULT="$HOME/obsidian"
+opencode
+```
+
+アプリで利用する場合も、OpenCodeの起動環境に`OBSIDIAN_VAULT`を設定してください。省略した場合は`~/obsidian`を使います。
+
+OpenCodeを再起動するとプラグインが読み込まれます。`OBSIDIAN_VAULT`、`OBSIDIAN_OUTPUT_DIR`、`OPENCODE_DATABASE`はOpenCode起動時の環境変数を引き継ぎます。保存先は`生成AI/ChatLog/opencode/`です。macOS標準の`/usr/bin/sqlite3`が必要です。監視カーソルは`~/.local/state/opencode-obsidian/opencode_v2_cursor.json`に保存され、初回起動時は直近10分を再走査します。
+
+上の`~/.config/opencode/plugins/`への配置では設定ファイルへの追記は不要です。単一の`.js`ファイルを`opencode.jsonc`の`plugins`へ直接指定すると読み飛ばされるため、自動読み込みの配置を使ってください。[OpenCode v2公式プラグイン仕様](https://opencode.ai/v2/docs/plugins/)
+
+OpenCodeが回答レコードに記録したtoken使用量を保存します。OpenRouter残高の取得は行いません。
+
+保存スクリプトを別の場所へ置く場合は、プラグイン起動前に `OPENCODE_OBSIDIAN_SAVE_SCRIPT` へ絶対パスを指定してください。既定値は `~/.config/opencode/scripts/opencode_save.py` です。
+
+## Pi
+
+Pi 1.0以降では、TypeScript extensionからmacOS標準Pythonの単独スクリプトへ保存を依頼します。グローバルextensionとして設置すると全プロジェクトで有効になります。既存のextensionは残してください。
+
+[pi_save.py](./pi_save.py)と[pi_obsidian.ts](./pi_obsidian.ts)をダウンロードし、配置します。
+
+```bash
+mkdir -p ~/.pi/agent/scripts ~/.pi/agent/extensions
+cp "$HOME/Downloads/pi_save.py" ~/.pi/agent/scripts/pi_save.py
+cp "$HOME/Downloads/pi_obsidian.ts" ~/.pi/agent/extensions/pi_obsidian.ts
+```
+
+保管庫を指定して、同じターミナルからPiを起動します。
+
+```bash
+export OBSIDIAN_VAULT="$HOME/obsidian"
+pi
+```
+
+Piを再起動するか`/reload`を実行します。既定の保存先は`生成AI/ChatLog/pi/`です。`OBSIDIAN_VAULT`、`OBSIDIAN_OUTPUT_DIR`、`OBSIDIAN_SOURCE`はPi起動時の環境を引き継ぎます。saverのパスは`PI_OBSIDIAN_SCRIPT`、state・ログのディレクトリは`PI_OBSIDIAN_STATE_DIR`で変更できます。
+
+自動リトライ・圧縮・キュー処理まで終了した`agent_settled`、分岐切替、セッション終了時に保存します。本文は現在の分岐、Usageのセッション合計は全分岐が対象です。分岐切替時は同じノートを再構成するため、本文への手動追記は次回保存で置き換わります。
+
+2ファイルを置いたディレクトリから、一時保存先で試す例です。指定モデルを利用できる認証設定が必要で、1ターンの利用が発生します。グローバルextensionとして設置している場合は、同じextensionを重ねて読み込まないでください。
+
+```bash
+OBSIDIAN_VAULT=/private/tmp/pi-obsidian-test/vault \
+PI_OBSIDIAN_STATE_DIR=/private/tmp/pi-obsidian-test/state \
+PI_OBSIDIAN_SCRIPT="$PWD/pi_save.py" \
+pi --extension "$PWD/pi_obsidian.ts" --provider openai --model gpt-6-luna -p "OKとだけ回答してください。"
 ```
 
 ## Claude Code
@@ -195,8 +202,20 @@ cp "$HOME/Downloads/claude_save.py" ~/.claude/claude-obsidian/scripts/claude_sav
 }
 ```
 
-子Usageを完了直後に反映する場合は`SubagentStop`、APIエラー時も途中の会話を保存する場合は`StopFailure`へ、同じコマンドを登録します。設定例と集計範囲は[保存基盤の改善](docs/saver-improvements.md#3-claudeの子usageapi失敗)を参照してください。
-Claudeノートには親・子・回答に紐付かない子のtoken数を別々に表示します。回答に紐付かない子Usageもセッション合計には含まれます。
+子Usageを完了直後に反映する場合は`SubagentStop`、APIエラー時も途中の会話を保存する場合は`StopFailure`へ、同じコマンドを登録します。
+
+```json
+{
+  "hooks": {
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "OBSIDIAN_VAULT=\"$HOME/obsidian\" /usr/bin/python3 ~/.claude/claude-obsidian/scripts/claude_save.py"}]}],
+    "StopFailure": [{"hooks": [{"type": "command", "command": "OBSIDIAN_VAULT=\"$HOME/obsidian\" /usr/bin/python3 ~/.claude/claude-obsidian/scripts/claude_save.py"}]}]
+  }
+}
+```
+
+既存の`hooks`内へ上のイベント項目を追加します。保管庫の指定は既存Stopと同じ値にしてください。`SubagentStop`は子の最終回答・Usageの遅延書き込みを最大2秒待って保存します。子Usageは通常Stopでも集計します。イベント入力は[Claude公式hook仕様](https://code.claude.com/docs/en/hooks)に基づきます。
+
+`StopFailure`では途中の会話・Usageと失敗種別を保存します。ノートには`cli_failure.type`・`observed_at`を記録し、本文がまだない場合はstateに残します。エラー文そのものは保存せず、最後の失敗種別は成功後も履歴として保持します。
 
 quotaも記録する場合は、`~/.claude/settings.json`の同じトップレベルに次を追加します。既存のstatusLine設定がある場合は、そのコマンドに`OBSIDIAN_VAULT="$HOME/obsidian" /usr/bin/python3 ~/.claude/claude-obsidian/scripts/claude_save.py --capture-quota`を組み込んでください。入力はClaude Codeが渡すJSONです。statusLineにはquotaと、提供される場合はCLIのUSD概算が表示されます。
 
@@ -209,89 +228,85 @@ quotaも記録する場合は、`~/.claude/settings.json`の同じトップレ�
 }
 ```
 
-## OpenCode
+## Antigravity CLIとアプリ
 
-OpenCode v2は会話完了プラグインから保存スクリプトへ渡します。プラグインはOpenCodeのSQLiteデータベース（`~/.local/share/opencode/opencode.db`）に記録された`session_message`の`idle`を監視し、完了したセッションの履歴全体を保存します。グローバルプラグインとして設置すると、OpenCodeの全プロジェクトで有効になります。
+Antigravity CLIおよびAntigravityアプリのStop hookから会話履歴を保存します。
+quotaは、公式の読み取り専用コマンド `agy --output-format json --print='/quota'`
+から取得します。このコマンドは会話ターンを作らず、quotaを消費しません。`agy` が
+見つからない、または quota を返さない場合でも、会話保存は継続します。
 
-[opencode_save.py](./opencode_save.py)と[opencode_obsidian.js](./opencode_obsidian.js)をダウンロードし、配置します。
-
-```bash
-mkdir -p ~/.config/opencode/scripts ~/.config/opencode/plugins
-cp "$HOME/Downloads/opencode_save.py" ~/.config/opencode/scripts/opencode_save.py
-cp "$HOME/Downloads/opencode_obsidian.js" ~/.config/opencode/plugins/opencode_obsidian.js
-```
-
-保管庫を指定して、同じターミナルからOpenCodeを起動します。
+[agy_save.py](./agy_save.py)をダウンロードし、配置します。
 
 ```bash
-export OBSIDIAN_VAULT="$HOME/obsidian"
-opencode
+mkdir -p ~/.gemini/agy-obsidian/scripts
+cp "$HOME/Downloads/agy_save.py" ~/.gemini/agy-obsidian/scripts/agy_save.py
 ```
 
-アプリで利用する場合も、OpenCodeの起動環境に`OBSIDIAN_VAULT`を設定してください。省略した場合は`~/obsidian`を使います。
-
-OpenCodeを再起動するとプラグインが読み込まれます。`OBSIDIAN_VAULT`、`OBSIDIAN_OUTPUT_DIR`、`OPENCODE_DATABASE`はOpenCode起動時の環境変数を引き継ぎます。保存先は`生成AI/ChatLog/opencode/`です。macOS標準の`/usr/bin/sqlite3`が必要です。監視カーソルは`~/.local/state/opencode-obsidian/opencode_v2_cursor.json`に保存され、初回起動時は直近10分を再走査します。
-
-OpenCode v2で設定ファイルから明示的に読み込む場合は、`opencode.jsonc`の`plugins`へファイルURIを指定します。以下の`/absolute/path/to/opencode_obsidian.js`は、配置したプラグインの実際の絶対パスへ置き換えてください。JSON内では`~`や`$HOME`の展開を前提にしません。
+`~/.gemini/config/hooks.json`に以下を追加します。
 
 ```json
 {
-  "plugins": [
-    "file:///absolute/path/to/opencode_obsidian.js"
-  ]
+  "obsidian-save": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "OBSIDIAN_VAULT=\"$HOME/obsidian\" /usr/bin/python3 ~/.gemini/agy-obsidian/scripts/agy_save.py"
+      }
+    ]
+  }
 }
-```
-
-OpenCodeが回答レコードに記録したtoken使用量を保存します。OpenRouter残高の取得は行いません。
-
-保存スクリプトを別の場所へ置く場合は、プラグイン起動前に `OPENCODE_OBSIDIAN_SAVE_SCRIPT` へ絶対パスを指定してください。既定値は `~/.config/opencode/scripts/opencode_save.py` です。
-
-## Pi
-
-Pi 1.0以降では、TypeScript extensionからmacOS標準Pythonの単独スクリプトへ保存を依頼します。グローバルextensionとして設置すると全プロジェクトで有効になります。既存のextensionは残してください。
-
-[pi_save.py](./pi_save.py)と[pi_obsidian.ts](./pi_obsidian.ts)をダウンロードし、配置します。
-
-```bash
-mkdir -p ~/.pi/agent/scripts ~/.pi/agent/extensions
-cp "$HOME/Downloads/pi_save.py" ~/.pi/agent/scripts/pi_save.py
-cp "$HOME/Downloads/pi_obsidian.ts" ~/.pi/agent/extensions/pi_obsidian.ts
-```
-
-保管庫を指定して、同じターミナルからPiを起動します。
-
-```bash
-export OBSIDIAN_VAULT="$HOME/obsidian"
-pi
-```
-
-Piを再起動するか`/reload`を実行します。既定の保存先は`生成AI/ChatLog/pi/`です。`OBSIDIAN_VAULT`、`OBSIDIAN_OUTPUT_DIR`、`OBSIDIAN_SOURCE`はPi起動時の環境を引き継ぎます。saverのパスは`PI_OBSIDIAN_SCRIPT`、state・ログのディレクトリは`PI_OBSIDIAN_STATE_DIR`で変更できます。
-
-自動リトライ・圧縮・キュー処理まで終了した`agent_settled`を保存の境界にします。本文は現在の分岐のユーザー発話・回答のみを表示し、ツール結果・推論本文は表示しません。分岐切替時は同じノートを現在の分岐で再構成します。ノートは自動生成されるため、本文への手動追記は次回保存で置き換わります。Usageはentry IDごとに一度だけ集計し、別分岐・本文のないassistant・圧縮・分岐要約・追加usageレコード・usage付きツール結果も含めたセッション全体です。同じユーザー発話に対する連続する同一モデルの途中経過と最終回答は1つのcalloutにまとめ、Usageも合算します。本文のないUsageは、同じユーザー発話内の同一モデルを優先して最も近い回答calloutへ加算します。回答calloutは現在の分岐のUsageだけを表示します。本文のない分岐へ切り替えた場合も以前の本文を残さず再構成します。`message_count`は表示するcallout数です。モデルを特定できないツール内のUsageは`unknown`としてtokenのみ集計します。
-
-USD換算にはCodex・Claude Code・OpenCodeと共通の参考単価表を使います。単価表の正本は`shared/usage_prices.py.inc`で、各スクリプトへ埋め込みます。登録済みモデルをすべて対象にし、Piが返す`usage.cost.total`は別の取得コストとして保存し、参考換算と併記します。Piの`input`・`cacheRead`・`cacheWrite`を足して共通の入力総数にし、`reasoning`は`output`の内数として扱います。GPT系ではリクエスト単位の入力が272Kを超える場合の倍率も適用し、対象回答に`⚠︎ 272K+`を付けます。未登録モデルや1時間cache writeなど単価条件を確定できないUsageは参考換算額を省略し、一部だけ換算できた総計には`cost_incomplete: true`を付けます。サブスクの請求額・quota消費額ではありません。
-
-一時保存先で試す場合は、次のようにextensionを直接指定できます。
-
-```bash
-OBSIDIAN_VAULT=/private/tmp/pi-obsidian-test/vault \
-PI_OBSIDIAN_STATE_DIR=/private/tmp/pi-obsidian-test/state \
-PI_OBSIDIAN_SCRIPT="$PWD/pi_save.py" \
-pi --extension "$PWD/pi_obsidian.ts" --provider openai --model gpt-6-luna -p "OKとだけ回答してください。"
 ```
 
 ## 動作確認とトラブルシューティング
 
-各CLIまたはアプリで会話を1ターン実行し、対応する保存先にMarkdownが作成されることを確認してください。保存されない場合は、次のログを確認します。
+設定後にCLIまたはアプリを再起動し、1ターン会話して、保管庫の`生成AI/ChatLog/<ツール名>/`にMarkdownが作られることを確認します。
 
-- Codex: `~/.codex/codex-obsidian/log/codex_obsidian_save.log`
-- Antigravity: `~/.gemini/agy-obsidian/log/obsidian_save.log`
-- Claude Code: `~/.claude/claude-obsidian/log/claude_obsidian_save.log`
-- OpenCode: `~/.local/state/opencode-obsidian/opencode_obsidian_save.log`
-- Pi: `~/.local/state/pi-obsidian/pi_obsidian_save.log`
+| 症状 | 確認すること |
+| --- | --- |
+| ノートが作られない | hookの登録・信頼、プラグインの読み込み、スクリプトの配置先を確認します。本文がない新規セッションでは空ノートを作りません。 |
+| 別の保管庫に保存される | hookコマンドまたはCLIの起動環境の`OBSIDIAN_VAULT`を確認します。省略時は`~/obsidian`です。 |
+| 金額・quota・所要時間がない | 元の履歴やstatusLineに必要な値があるか確認します。未取得の値を0とは扱いません。 |
+| 更新時刻が変わらない | 同じ内容の再通知ではノートを更新しません。新しい発言も反映されない場合はログとdoctorを確認します。 |
+| 過去の会話を保存し直したい | 下の「セッション全履歴の再構成」で、差分確認後に再生成できます。OpenCodeのプラグイン初回走査は直近10分のみです。 |
 
-詳細ログが必要な場合は、hookを起動する環境で`DEBUG=1`を設定します。`OBSIDIAN_VAULT`が存在しない場合は自動作成されますが、親ディレクトリへの書き込み権限が必要です。
+ログの既定位置は次のとおりです。`DEBUG=1`をhookの起動環境に設定すると詳細ログを出力します。
 
+| ツール | 保存ログ |
+| --- | --- |
+| Codex | `~/.codex/codex-obsidian/log/codex_obsidian_save.log` |
+| Claude Code | `~/.claude/claude-obsidian/log/claude_obsidian_save.log` |
+| Antigravity | `~/.gemini/agy-obsidian/log/obsidian_save.log` |
+| OpenCode | `~/.local/state/opencode-obsidian/opencode_obsidian_save.log` |
+| Pi | `~/.local/state/pi-obsidian/pi_obsidian_save.log`（`PI_OBSIDIAN_STATE_DIR`で変更可能） |
+
+### 保存状態の診断（doctor）
+
+[saver_doctor.py](./saver_doctor.py)と比較元の最新`*_save.py`を同じディレクトリに置き、そこで実行します。診断対象は`codex`・`claude`・`agy`・`opencode`・`pi`です。
+
+```bash
+/usr/bin/python3 saver_doctor.py codex --json
+/usr/bin/python3 saver_doctor.py claude --session-id SESSION_ID
+```
+
+配置版と比較元のversion・SHA、出力先権限、stateとノートの保存位置、最終保存成功時刻、最後の失敗・見送り理由を確認できます。`SESSION_ID`はノートのfrontmatterの`session_id`です。ログ・state・ノートを変更する処理や、自動修復は行いません。
+
+標準外の配置先は`--installed /path/to/codex_save.py`、stateは`--state-dir /path/to/state`、比較元は`--source-dir /path/to/source`で指定します。元履歴を明示する場合は`--session-id SESSION_ID --transcript /path/to/rollout.jsonl`を併用します。
+
+| 主な結果 | 意味・次の確認 |
+| --- | --- |
+| `installed_differs` | 配置版と比較元が異なります。自分で変更した設定も差分になるため、更新前に内容を確認します。 |
+| `last_save_failed` | 最後の保存に失敗しています。保存ログと`last_failure_type`を確認します。 |
+| `last_save_skipped` | `skip_reason`を確認します。`transcript_missing`は元履歴なし、`no_content`は保存本文なしです。 |
+| `cursor_mismatch` | stateとノートの保存位置が異なります。ログと元履歴を確認し、必要なら再構成します。 |
+| `transcript_ahead` | 保存後に元履歴が追記された場合も出ます。次の通常保存後に再確認します。 |
+
+`unchanged`は正常な再通知のため問題件数に含めません。診断情報は各saverがstate配下の`.diagnostics/`へ記録した観測値です。古い版で未記録の成功・失敗は復元できません。終了コードは問題なし0、差異・問題あり1、引数・診断実行エラー2です。
+
+### 更新・停止
+
+更新時は配置済みファイルをバックアップし、新しいファイルで置き換えてCLIを再起動します。OpenCode・PiはPythonとプラグイン／extensionの両方を同じ版に揃えてください。Codexのhook定義も変更した場合は`/hooks`で再度信頼します。
+
+保存を止める場合は、このツールのhook項目・プラグイン／extension登録を外して再起動します。ClaudeのstatusLineへ設定した保存コマンドも対象です。既存の会話ノートは残ります。
 
 ## 共通設定
 
@@ -318,10 +333,10 @@ $OBSIDIAN_VAULT/AI/Conversations/opencode/
 $OBSIDIAN_VAULT/AI/Conversations/pi/
 ```
 
-`OBSIDIAN_SOURCE`を設定すると、各スクリプトの保存先末尾とfrontmatterの`source`・タグを同じ名前に変更できます。MacとRaspberry Piで保存先を分ける場合は、それぞれのhookを起動する環境で異なる値を指定します。
+`OBSIDIAN_SOURCE`を設定すると、各スクリプトの保存先末尾とfrontmatterの`source`・タグを同じ名前に変更できます。複数のMacや用途で保存先を分ける場合は、それぞれのhookを起動する環境で異なる値を指定します。
 
 ```bash
-export OBSIDIAN_SOURCE="codex-pi4"
+export OBSIDIAN_SOURCE="codex-work"
 ```
 
 指定できるのは英数字で始まり、以降は英数字・`.`・`_`・`-`からなる64文字以内の名前です。不正な値は各スクリプトの既定名へフォールバックします。既にstateに保存先が記録されている会話は従来のファイルを更新し、新しい会話から指定した保存先を使います。既存ノートの`created`・`source`・タグを引き継ぐため、設定変更後やstate復旧時も会話の識別情報を保持します。AntigravityもCLI・アプリ共通の`source`・タグを記録します。
@@ -338,49 +353,105 @@ export OBSIDIAN_SOURCE="codex-pi4"
 
 ### Templaterテンプレート（任意）
 
-[templates/templater](./templates/templater)から使いたいテンプレートをダウンロードするか、[リポジトリのZIP](https://github.com/shusie-lab/cli-to-obsidian/archive/refs/heads/main.zip)を展開して利用できます。通常の会話保存には不要です。
-
-会話記録のファイル名を変えずに、Obsidian上ではfrontmatterの`title`を使って会話を探したり表示したりするための、任意のTemplaterテンプレートを`templates/templater/`に収録しています。ObsidianのTemplaterプラグインを有効にし、設定したテンプレートフォルダへファイルをコピーしてください。たとえば両方を`~/Downloads`へダウンロードし、テンプレートフォルダが`~/obsidian/Templates`の場合は次のようにします。
+会話記録のファイル名を変えずに、Obsidian上ではfrontmatterの`title`を使って会話を探したり表示したりするための、[ChatLogLink.md](./templates/templater/ChatLogLink.md)と[ChatLogリンク表示名更新.md](./templates/templater/ChatLogリンク表示名更新.md)を使えます。ObsidianのTemplaterプラグインを有効にし、設定したテンプレートフォルダへファイルをコピーしてください。たとえば両方を`~/Downloads`へダウンロードし、テンプレートフォルダが`~/obsidian/Templates`の場合は次のようにします。
 
 ```bash
 cp "$HOME/Downloads/ChatLogLink.md" ~/obsidian/Templates/
 cp "$HOME/Downloads/ChatLogリンク表示名更新.md" ~/obsidian/Templates/
 ```
 
-- **`ChatLogLink.md`**: テンプレートを挿入すると、`生成AI/ChatLog/`内の最近更新されたノート（最大10件）が候補に表示されます。選択したノートへの内部リンクを、frontmatterの`title`（なければファイル名）で表示します。Usageの`total_cost_usd`があれば、タイトルの後ろに金額も表示します。候補一覧ではフォルダ内の相対パスも確認できます。
+- **`ChatLogLink.md`**: テンプレートを挿入すると、`生成AI/ChatLog/`内の最近更新されたノート（最大10件）が候補に表示されます。選択したノートへの内部リンクを、frontmatterの`title`（なければファイル名）で表示します。Usageの`total_cost_usd`があれば、タイトルの後ろに参考金額を小数2桁で表示します。候補一覧ではフォルダ内の相対パスも確認できます。
 - **`ChatLogリンク表示名更新.md`**: 開いているノート内のWikiリンクから、`生成AI/ChatLog/`へ解決されるリンクの表示名をリンク先の最新の`title`に更新します。titleがない場合はファイル名を使い、金額があれば付記します。YAML frontmatter、コードブロック、インラインコード内は処理しません。ファイル名や会話記録そのものは変更しません。
 
 使うときは、リンクを挿入する位置または更新したいノートを開き、コマンドパレットから **Templater: Open insert template modal** を実行してテンプレートを選びます。頻繁に使う場合は、Obsidianの設定にある「ホットキー」で同じコマンドにショートカットを割り当てられます。
 
 両テンプレートの`DEFAULT_OUTPUT_DIR`は各`*_save.py`の`DEFAULT_OUTPUT_DIR`（既定値`生成AI/ChatLog`）と同じ名前・値にしています。各保存スクリプトはこのフォルダの下にsource名のサブフォルダを作ります。`OBSIDIAN_OUTPUT_DIR`で保存先を変更した場合は、両テンプレートの`DEFAULT_OUTPUT_DIR`も同じ保存先に変更してください。
 
-## 使用量・quotaの記録仕様
+<a id="usage-spec"></a>
 
-Codexのquotaは、Stop hookに渡されるtranscript内の`token_count.rate_limits`から取得します。frontmatterの`quota`にはweekly・5hなど取得できた枠ごとに`first_observed`と`last_observed`を階層化し、残量・観測時刻・リセット時刻を保存します。「最初」は会話開始時ではなく最初に取得できた観測値です。quotaはアカウント全体の状態なので、差分を会話の消費量として扱わず、回答ごとのquotaも表示しません。quota情報を取得できない場合も、会話保存は継続します。Antigravityも同じ形式で保存します。
+## 使用量・金額・quotaの記録仕様
 
-Codex・Claude Code・OpenCode・Piの参考換算は、共通表`shared/usage_prices.py.inc`の`STANDARD_USAGE_RATES`に照合できるモデルをすべて対象にします。現在の登録モデルはGPT-6 Astra、GPT-6.1 Sol、GPT-6 Luna、Gemini 3.8 Flash、Claude Fable 5.1、Claude Opus 5.5、Claude Sonnet 5.5、Claude Haiku 5.5、Muse Spark 1.3 Contributor、Nemotron 3 Ultraです。プロバイダ接頭辞と対応する別名を正規化して照合します。単価を削除したGPT-6 Sol・GPT-5.6系列も会話本文とtoken数は保存し、参考金額は換算不可とします。OpenCodeが返す正の`cost`は、単価登録の有無によらず優先します。
+### セッション全体と回答ごとの集計
 
-Gemini 3.8 Flashは`google/gemini-3.8-flash`・`gemini-3.8-flash`・`gemini3.8-flash`を照合できます。2026-10-06時点のStandard参考単価は100万tokenあたり入力$0.75、キャッシュ読込$0.075、出力（推論を含む）$3.75です。[Googleの価格表](https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash)に記載された2026年末までの割引価格を登録しています。cache writeは[OpenRouterのStandard endpoint掲載値](https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints)を100万token単位へ換算した$0.0416666666666667を使います。Googleの時間単位のキャッシュ保管料は別途計算しません。Batch・Flex・Priority・ツール料金は参考換算に含めず、OpenCodeの正の`cost`は引き続き優先します。登録単価は固定値のため、2027年の価格変更時に表を更新してください。
+本文冒頭とfrontmatterの`usage`はセッション全体、各回答calloutは対応する回答の使用量です。本文のないUsageや回答へ紐付けられない子Usageがあるため、回答の合計とセッション合計が一致しない場合があります。
 
-Haiku 5.5は`claude-haiku-5-5`・`anthropic/claude-haiku-5.5`に対応します。100万tokenあたり入力$0.10、キャッシュ読込$0.01、5分書込$0.125、1時間書込$0.20、出力$0.50です。1リクエストの入力総数（キャッシュ読込・書込を含む）が10万tokenを超える場合は、すべての単価を5倍にします。[公式料金表](https://platform.claude.com/docs/en/about-claude/pricing)を2026-10-09に確認しました。
+| ツール | セッション全体の集計 | 回答への割当 |
+| --- | --- | --- |
+| Codex | 親と`parent_thread_id`で紐付く子の`token_usage_record`を集計。`thread_token_usage`の累計は加算しません。 | 子の`root_turn_id`で親ターンを特定し、最後の回答へ加算。紐付かない子はセッション計のみです。 |
+| Claude Code | 親・子それぞれのmessage IDごとの最後の`message.usage`を集計。 | 子の`parentUuid`が一つの親ターンに結び付く場合のみ回答へ加算。親・子・回答に紐付かない子のtoken内訳も表示します。 |
+| OpenCode | SQLiteのassistantレコードをmessage IDごとに集計。本文のないツール専用レコードも含めます。 | 同じユーザー発話内の連続する同一モデルの回答をまとめ、本文のないUsageも近い回答へ加算します。 |
+| Pi | 全分岐のentryをIDごとに集計。圧縮・分岐要約・追加Usage・Usage付きツール結果も含めます。 | 現在の分岐のUsageのみ表示。同一ターン・同一モデルを優先して近い回答へ加算します。 |
 
-CodexのUsageは、親セッションと`parent_thread_id`で紐付くサブエージェントのtranscriptにある`token_usage_record.payload.usage`を各レコード一度ずつ加算して集計します。子のusageは同じ`session_id`を持つレコードだけを対象にします。`thread_token_usage`の累計値は二重計上を避けるため使用しません。frontmatterの`usage`にはtoken総計・モデル別内訳・`total_cost_usd`・モデル別`cost_usd`を保存します。USD概算は、`shared/usage_prices.py.inc`から各スクリプトへ埋め込むモデル別標準API単価を用い、通常入力（`input_tokens`からキャッシュ入力・cache writeを除いた値）、キャッシュ入力、cache write、出力を別々に計算します。推論トークンは出力の内数のため二重計上しません。Codexでは、スクリプト先頭の`APPLY_LONG_CONTEXT_PRICING = False`により、272K input tokensを超えても通常単価で換算します。`True`にすると、従来どおりリクエスト単位で入力・キャッシュ系を2倍、出力を1.5倍にします。これはCodexの契約上の請求額やquota消費額ではなく、ツール料金・割引モードなどを含まない参考単価による概算です。係数が未登録のモデルはtokenだけを保存し、金額を換算しません。既知モデルが一部でもある場合はその分の`total_cost_usd`を保存し、`cost_incomplete: true`で総計が部分換算であることを示します。USD表示・frontmatterの金額は小数桁を丸めません。
+Codexの子Usageは対象の`session_id`と一致するレコードに限定します。Claudeの子は`親transcript拡張子なし/subagents/agent-*.jsonl`から読み、別sessionId・symlinkを除外します。子の本文は親ノートへ混ぜません。Piでモデルを特定できないUsageは`unknown`としてtokenのみ集計します。
 
-本文中のCodex回答calloutには、親transcriptの回答と、同じ親ターンに紐付くサブエージェントのUsage（`total_tokens`とUSD概算）を表示します。子の`root_turn_id`で親ターンを特定し、そのターンの最後に表示される回答calloutへ加えます。サブエージェント分がある回答では、合計のtoken数とUSD概算に加え、括弧内にサブエージェントのモデル別token数・USD概算を表示します。換算できないモデルは`換算不可`と表示します。親ターンを特定できない子のusageや、表示できる親回答がないターンのusageはセッション累計だけに含めます。本文冒頭のUsageセクションとfrontmatterの`usage`はセッション累計です。`APPLY_LONG_CONTEXT_PRICING = True`で272K input tokensを超えるusage recordが回答に含まれる場合は、回答のUSD表示に`⚠︎ 272K+`を付けます。無効時はこの印を表示しません。設定変更後にhookが動くと、そのセッションの累計と既存の回答Usageも再計算します。他の過去ノートを一括更新することはありません。
+共通形式の`input_tokens`はキャッシュ読込・書込を含む入力総数、`reasoning_output_tokens`は出力の内数です。これらを二重加算しません。遅れて書き込まれたUsageは次の保存で反映します。
 
-Claude CodeのUsageはtranscriptの`message.usage`をmessage IDごとに最後の値だけ集計します。通常入力、キャッシュ読み込み、キャッシュ書き込み、出力を合わせてtoken総数を出します。換算対象は他のUsage対応saverと共通です。`shared/usage_prices.py.inc`から埋め込むtoken種別ごとの単価表からUSD概算を計算します。Opus 5.5のキャッシュ読込は100万tokenあたり$0.20です。Opus 5.5・Sonnet 5.5は入力20万token超でも標準単価で換算します。キャッシュ書込は5分・1時間の内訳に応じて換算し、価格に影響する条件を確定できない場合や未登録モデルはtokenのみを保存します。`anthropic/claude-sonnet-5.5`にも対応し、`nvidia/nemotron-3-ultra-550b-a55b:free`は対応する有料版の単価を参考値として換算します。これはClaude Codeのサブスクリプション請求額ではありません。quotaは任意のstatusLine設定から5h・weeklyの残量を観測し、Codexと同じ`first_observed`・`last_observed`形式で保存します。statusLineがquotaを返さない場合は省略します。
+### USD参考換算とCLI報告コスト
 
-2026-10-25確認の公式価格に合わせ、Sonnet 5.5のキャッシュ読込は$0.10/100万tokenです。Fable 5.1にも対応し、通常入力$10・出力$50・キャッシュ読込$0.25・5分書込$12.50・1時間書込$20/100万tokenで参考換算します。
+**参考換算と取得コストは別々に表示し、合算しません。** 参考換算は共通単価表から計算した比較用の金額です。サブスクリプション請求額やquota消費額ではありません。
 
-既存の`--capture-quota`は、statusLine入力に`cost.total_cost_usd`があれば`CLI概算: $...`も表示します。quota未提供でも金額は表示できます。この値は`reported_cost`へセッション累計として保存し、ノートに参考換算と併記します。同じ通知を繰り返し受け取っても加算しません。quota・金額とも未提供なら空表示です。設定方法は従来と同じです。
+| 値 | 記録先 | 対象・扱い |
+| --- | --- | --- |
+| USD参考換算 | `usage.total_cost_usd`、`usage.by_model.*.cost_usd` | Codex・Claude・OpenCode・Pi。`usage.cost_basis: reference`で意味を示します。 |
+| CLI報告コスト | `reported_cost.usd` | OpenCode・Piは回答の取得値の合計（`scope: message_sum`）、ClaudeはstatusLineのセッション累計の最新観測値（`scope: session`）です。 |
 
-Claude Codeの本文冒頭にも共通形式のUSD換算サマリを表示し、回答calloutには同じユーザー発話内の連続する同一モデルの回答に対応するtoken数・USD参考換算を表示します。遅れて書き込まれたUsageは既存calloutへ反映します。Codex・Claude Code・OpenCode・Piで、換算できない金額は`換算不可`、既知モデル分だけの金額は`部分換算`と表示します。金額は小数桁を丸めず、固定小数で出力します。
+OpenCodeはassistantの`cost`、Piは`usage.cost.total`、ClaudeはstatusLineの`cost.total_cost_usd`を取得します。Claudeは再通知ごとに加算せず、回答へ推測配分しません。OpenCode・Piは回答calloutにも取得コストを表示します。
 
-OpenCodeのUsageはSQLiteのassistantレコードにある`tokens`をmessage IDごとに集計します。本文のないツール専用レコードもfrontmatterの合計に含めます。OpenCodeのUSD参考換算はすべて共通単価表で計算し、`cost`は別の取得コストとして併記します。明示的な0も取得値として保存します。モデルごとの単価は他のUsage対応saverと共通です。GPT系の参考換算ではPiと同じく、1リクエストの入力総数が272Kを超えた場合に入力・キャッシュ系2倍、出力1.5倍を適用します。長文料金で参考換算した回答には`⚠︎ 272K+`を付けます。CLIから取得した`cost`にはこの倍率を掛けません。無料モデルも無料利用の請求額ではなく、対応する有料モデルの単価を参考値として換算します。`cost: 0`もCLI報告値であり、請求額の保証ではありません。単価未登録モデルは参考換算を省略し、取得値があればその金額を表示します。本文先頭にはCodexと同じ形式で合計・モデル別のUSD換算サマリを表示します。OpenRouter残高APIには接続しません。
+参考換算できない金額は`換算不可`、一部の既知モデルだけ換算した総計は`部分換算`（`cost_incomplete: true`）です。CLI報告値は0を`$0`、未提供・負数・非有限等を`未取得`、一部だけ取得できた場合を`部分取得`として区別します。無料モデルも対応する有料版の参考単価で換算するため、参考換算が正でもCLI報告値が0になることがあります。
 
-OpenCodeの連続する同一モデルの回答は、途中経過と最終回答を1つのcalloutにまとめます。本文のないassistantのツール専用レコードは、同じユーザー発話内で最も近い回答calloutのUsageへ加算します。frontmatterのUsageにはすべてのassistantレコードを含みます。
+金額はノートでは小数桁を丸めず固定小数で保存します。CLI報告値も実請求額の保証ではありません。Claudeの値は定価または`modelPricing`を基にしたクライアント側概算です。[Claude公式statusLine仕様](https://code.claude.com/docs/en/statusline#available-data)Claudeの取得値はstate・ノートから復旧し、再構成時も現在の単価で再計算しません。
+
+**OpenCode 3.xからの移行:** 4.0.0以降の`usage.total_cost_usd`は参考換算に統一しました。以前の正の`cost`を優先する方式とは意味が異なります。通常保存・明示的な再構成から新方式になり、過去ノートは一括変更しません。3.xのstateしかない部分同期で取得金額を判別できない場合は未取得とし、完全なsnapshotで復元します。
+
+### 対応モデルと価格条件
+
+単価表に登録しているモデルは以下です。これはこのソースに収録した参考単価の対応表で、各社の最新料金・提供状況を示す一覧ではありません。プロバイダ接頭辞と対応する別名を正規化して照合します。未登録でも本文・token数は保存します。
+
+| 系列 | 登録モデル |
+| --- | --- |
+| GPT | GPT-6 Astra、GPT-6.1 Sol、GPT-6.1 Terra、GPT-6 Luna |
+| Claude | Fable 5.1、Opus 5.5、Sonnet 5.5、Haiku 5.5 |
+| Gemini | Gemini 3.8 Flash |
+| DeepSeek | DeepSeek V4.1 Flash（`deepseek-flash`も対応） |
+| その他 | Muse Spark 1.3 Contributor、Nemotron 3 Ultra |
+
+- GPTの272K超入力: Codexは先頭の`APPLY_LONG_CONTEXT_PRICING = False`で倍率なしです。`True`にするとリクエスト単位で入力・キャッシュ系2倍、出力1.5倍となり、対象回答に`⚠︎ 272K+`を表示します。Claude・OpenCode・Piの既定は`True`です。CLI報告コストには掛けません。
+- Claude: cache writeの5分・1時間を区別します。Haiku 5.5は1リクエストの入力総数が10万token超の場合に全種別5倍、Opus 5.5・Sonnet 5.5は20万token超でも標準単価です。Fast・地域・TTL等の価格条件を確定できない場合は換算を省略します。
+- DeepSeek: 登録済みピーク単価を固定で使用し、時刻によるオフピーク切り替えは行いません。
+- Gemini: 登録表は2026年末までのStandard割引価格を基にしています。cache writeはOpenRouter掲載のtoken単価を使い、Googleの時間単位の保管料は加算しません。
+- Batch・Flex・Priority・ツール料金などは参考換算に含めません。単価は自動更新しません。
+
+収録単価・価格版・確認日・出典は、[check_usage_prices.py](./check_usage_prices.py)・[rebuild_session.py](./rebuild_session.py)・[claude_save.py](./claude_save.py)を同じディレクトリへ置き、次で確認できます。
+
+```bash
+/usr/bin/python3 check_usage_prices.py
+```
+
+ノートには`usage.price_version`・`price_recorded_at`・`price_checked_at`・`price_sources`・`price_effective_from`も保存します。価格版はsaverの機能バージョンと独立しています。確認日がないモデルや適用開始日が不明な値はnullです。価格設定を変えた後の通常保存では、そのセッションの累計・既存回答Usageを現在の設定で再計算します。
+
+### quota残量
+
+Codexはtranscript、Claudeは任意のstatusLine入力の`rate_limits`、Antigravityは`/quota`から取得します。weekly・5hなど取得できた枠だけを記録し、最初と最後の観測値を`first_observed`・`last_observed`へ保存します。「最初」は会話開始時ではなく最初に取得できた値です。
+
+quotaはアカウント全体の残量です。差分を会話の消費量とは扱わず、回答別の差分も表示しません。未提供の枠は省略し、会話保存は続けます。ClaudeのstatusLineはquotaがなくてもコストがあれば表示し、どちらもなければ空表示です。新形式の保存時に旧`quota`・`quota_claude`の数値形式を置換します。
+
+### 回答所要時間
+
+依頼から回答完了までを、最後の回答に`⏱ 回答所要時間: 2分15秒`の形式で表示します。途中経過・ツール実行・通信・生成を含み、AI内部の推論時間だけを測るものではありません。同じ依頼でモデルが変わっても最後のcalloutに総時間を表示し、秒未満は切り捨てます。
+
+| ツール | 完了時刻の取得元 |
+| --- | --- |
+| Codex | ターン完了イベント。未記録なら、最終回答と識別できる回答完了イベント。 |
+| Claude Code | `turn_duration`終了記録。Stopより後の記録は次の保存で反映。 |
+| OpenCode | 回答の`time.completed`。 |
+| Pi | 回答終了時に履歴へ保存されるentryの時刻。 |
+| Antigravity | `model_stop`・`fullyIdle: true`・エラーなしのStop受信時刻。hook起動までの遅れは含み、ロック待ち・quota取得などの保存処理は含みません。 |
+
+開始・完了時刻がない、不正、逆転している場合は`取得不可`とします。Antigravityの観測済み時刻はstate・ノート内コメントに保持し、再通知・復旧・再構成でも引き継ぎます。未観測の過去履歴に現在時刻を付けることはありません。
 
 ## 出力例
+
+主要項目を抜粋した例です。価格の出典・quota・回答別Usage等は入力に応じて追加されます。
 
 ```markdown
 ---
@@ -394,25 +465,9 @@ tags:
   - ai-conversation
   - codex-cli
 message_count: 2
-quota:
-  "codex":
-    "5h":
-      first_observed:
-        remaining_percent: 80.0
-        observed_at: "2026-07-17T09:40:45+09:00"
-      last_observed:
-        remaining_percent: 78.0
-        observed_at: "2026-07-17T09:40:55+09:00"
-    "weekly":
-      first_observed:
-        remaining_percent: 94.0
-        observed_at: "2026-07-17T09:40:45+09:00"
-        reset_at_jst: "2026-07-21 10:00"
-      last_observed:
-        remaining_percent: 91.0
-        observed_at: "2026-07-17T09:40:55+09:00"
-        reset_at_jst: "2026-07-21 10:00"
 usage:
+  cost_basis: "reference"
+  price_version: "4.2.0"
   input_tokens: 120000
   cached_input_tokens: 100000
   cache_write_input_tokens: 0
@@ -425,9 +480,6 @@ usage:
       total_tokens: 128000
       cost_usd: 0.13
 ---
-
-📊 **Quota**:
-- **Codex**: W: 94.0% ➔ 91.0%
 
 💰 **Usage (USD換算)**: Total: $0.13 (gpt-6.1-sol $0.13)
 
@@ -451,59 +503,140 @@ ChatGPTからWorkへ移行した際に生成される構造化されたユーザ
 依頼本文は通常のUser QUESTION calloutへ表示し、前置きの参照情報は内容を解釈せず、
 折りたたみ式の「参照情報（原文）」INFO calloutへ保存します。条件が曖昧な入力は従来どおり全文を保存します。
 
-Claude CodeのquotaはstatusLine設定があり、入力に`rate_limits`が含まれる場合だけ記録します。Antigravityでは公式の`/quota`出力が提供する範囲
-（アカウントによってweekly、5hなど）を記録します。5h quotaが提供されないアカウントでは
-その項目を省きます。新しい形式で更新したMarkdownでは、旧形式の数値`quota`・`quota_claude`
-を除去します。過去のファイルを一括変換する処理は行いません。
-
-## このプロジェクトについて
-
-このプロジェクトは各CLI、ChatGPT、Antigravity、Claude CodeおよびObsidianの非公式ツールです。各サービスの開発元とは関係ありません。
-
-### USD参考換算と取得コストの併記（4.0.0）
-
-OpenCode・Pi・Claudeは共通単価表による`usage.total_cost_usd`と、CLIが返した`reported_cost.usd`を別々に保存・表示します。0、未取得、部分取得を区別します。ClaudeはstatusLineのセッション累計の最新観測値を保存し、回答ごとの金額へ推測配分しません。OpenCodeの3.xからは`usage.total_cost_usd`の意味が変わるため4.0.0としました。過去ノートの一括更新は行いません。
-
-Codex用の読取専用`compare_codex_telemetry.py`も追加しました。既存Claude照合ツールに加え、Codexの完了イベントとtranscriptを比較できます。使い方、金額の保存形式、OTelの負荷・送信内容・運用上の注意は[金額併記とCodex telemetry](./docs/costs-and-codex-telemetry.md)を参照してください。
-
 ## セッション全履歴の再構成
 
-`rebuild_session.py` はセッションIDから元の履歴を探し、現在の保存スクリプトで会話本文・Usage・USD換算を全件再生成します。Codex・Claude Code・Antigravity・OpenCodeの4つの `*_save.py` と同じディレクトリに置いて実行してください。通常hookの配置変更は不要です。Piはこの再構成ツールの対象外です。
+[rebuild_session.py](./rebuild_session.py)と、対象の保存スクリプト（`codex_save.py`・`claude_save.py`・`agy_save.py`・`opencode_save.py`のうち必要なもの）を同じディレクトリに置きます。Piは対象外です。`SESSION_ID`はノートのfrontmatterの`session_id`、未保存の会話なら元履歴のIDを使います。
 
-置換前の確認には`--dry-run`を追加します。隔離領域で再生成し、現在のノートと予定内容の件数・token・金額・本文差分をJSONで表示します。ノート・state・バックアップは変更しません。実際の置換時には元履歴やCLI報告値が変わる場合があるため、直前に確認してください。
+**通常保存先を扱う場合は、hookと同じ保管庫・出力先・sourceを指定してください。** hookコマンド内の環境変数は、このターミナルには自動で引き継がれません。以下は既定の出力先・sourceを使う例です。
+
+```bash
+export OBSIDIAN_VAULT="$HOME/obsidian"
+# hookで変更している場合だけ、その値に合わせます
+# export OBSIDIAN_OUTPUT_DIR="AI/Conversations"
+# export OBSIDIAN_SOURCE="codex-work"
+
+# 1. 変更予定を確認（ノート・state・バックアップを変更しません）
+/usr/bin/python3 rebuild_session.py codex SESSION_ID --obsidian --dry-run
+
+# 2. 確認した内容で置換（既存ノートのバックアップを作成します）
+/usr/bin/python3 rebuild_session.py codex SESSION_ID --obsidian
+```
+
+`--dry-run`は現在と予定内容の件数・token・金額・本文差分をJSONで表示します。実行までに元履歴が追記されれば結果も変わるため、置換直前に確認してください。
+
+`--obsidian`は通常のノートとstateを更新します。既存stateの保存先を優先し、既存ノートのファイル名・作成日時・source・タグを引き継ぎます。**本文への手動追記は置き換わります。** 置換前のノートは同じフォルダの`.rebuild-backups/`に日時付き`.bak`で保存し、パスを表示します。
+
+通常ノートを更新せず、指定したフォルダへ直接出力する場合は次を使います。sourceのサブフォルダは追加しません。同じ出力先の既存ノートを置き換える場合もバックアップを作ります。
+
+```bash
+/usr/bin/python3 rebuild_session.py claude SESSION_ID --output-dir /private/tmp/rebuilt
+```
+
+### 価格版を選ぶ
+
+| 指定 | 換算方法 |
+| --- | --- |
+| `--pricing current`（既定） | スクリプトに収録した現在の単価表。 |
+| `--pricing preserve` | 置換対象ノートの`usage.price_version`。価格版がない・未登録なら中止。 |
+| `--price-version 3.11.1` | 指定した登録済みの過去表。価格版のないノートにも指定可能。 |
 
 ```bash
 /usr/bin/python3 rebuild_session.py claude SESSION_ID --obsidian --dry-run --pricing preserve
+/usr/bin/python3 rebuild_session.py claude SESSION_ID --obsidian --pricing preserve
+/usr/bin/python3 rebuild_session.py claude SESSION_ID --output-dir /private/tmp/rebuilt --price-version 3.11.1
 ```
 
-動作テスト用の出力先を指定する例です。指定先へMarkdownを直接保存し、通常のObsidianノート・stateは更新しません。
+`--output-dir`で`preserve`を指定した場合、その出力先にある既存ノートを参照します。日付から価格版は推測しません。過去表で再構成しても、次の通常hookでは現在表へ戻るため、価格を固定した検証結果は別の出力先へ保存してください。Antigravityは価格版指定に対応しません。
+
+### 元履歴の場所
+
+| 対象 | 自動探索先 | 変更方法 |
+| --- | --- | --- |
+| Codex | `~/.codex/sessions/`、`~/.codex/archived_sessions/` | `CODEX_HOME`または`--transcript` |
+| Claude Code | `~/.claude/projects/` | `CLAUDE_CONFIG_DIR`または`--transcript` |
+| Antigravity | `~/.gemini/antigravity-cli/brain/SESSION_ID/.system_generated/logs/transcript.jsonl` | `--transcript` |
+| OpenCode v2 | `~/.local/share/opencode/opencode.db`（読取専用） | `OPENCODE_DATABASE`または`--database` |
 
 ```bash
-/usr/bin/python3 rebuild_session.py codex SESSION_ID --output-dir /private/tmp/obsidian-save-test
+/usr/bin/python3 rebuild_session.py codex SESSION_ID --transcript /path/to/rollout.jsonl --obsidian --dry-run
+/usr/bin/python3 rebuild_session.py opencode SESSION_ID --database /path/to/opencode.db --obsidian --dry-run
 ```
 
-通常のObsidian保存先を更新する場合は `--obsidian` を指定します。
+Codex・Claudeはログ内のセッションIDの一致を確認します。履歴がない・本文がない場合は既存ノートを置換しません。元履歴に残る会話のみが対象です。Claude・Antigravityの過去quotaとClaudeの取得コストは既存記録を引き継ぎ、Antigravityの現在quotaは取得しません。Codexのquotaは元履歴から再集計します。終了コードは成功0、再構成失敗1、引数エラー2です。
+
+<a id="telemetry"></a>
+
+## telemetryとの照合（任意）
+
+取得済みのOTelログと会話履歴のtoken・金額をローカルで比較する補助ツールです。通常の会話保存にcollectorは不要です。照合ツール自身は通信せず、ノート・state・CLI設定も変更しません。
+
+### 必要なファイルと入力
+
+以下を同じディレクトリに置いて実行します。
+
+| 対象 | 必要なファイル |
+| --- | --- |
+| Codex | [compare_codex_telemetry.py](./compare_codex_telemetry.py)、[compare_claude_telemetry.py](./compare_claude_telemetry.py)、[rebuild_session.py](./rebuild_session.py)、[codex_save.py](./codex_save.py) |
+| Claude | [compare_claude_telemetry.py](./compare_claude_telemetry.py)、[rebuild_session.py](./rebuild_session.py)、[claude_save.py](./claude_save.py) |
+
+入力はOTLP JSONログ（`resourceLogs/scopeLogs/logRecords`）、その配列、または属性を展開したイベントJSONLです。collector等でJSONファイルへ書き出してから渡してください。protobufバイナリ、trace span、Python repr形式のconsole出力は使えません。
+
+### Codex
 
 ```bash
-/usr/bin/python3 rebuild_session.py codex SESSION_ID --obsidian
-/usr/bin/python3 rebuild_session.py claude SESSION_ID --obsidian
-/usr/bin/python3 rebuild_session.py agy SESSION_ID --obsidian
-/usr/bin/python3 rebuild_session.py opencode SESSION_ID --obsidian
+/usr/bin/python3 compare_codex_telemetry.py \
+  --telemetry /private/tmp/codex-otel.json \
+  --transcript /path/to/rollout-SESSION_ID.jsonl \
+  --session-id SESSION_ID
 ```
 
-通常保存先は各保存スクリプトの `OBSIDIAN_VAULT`、`OBSIDIAN_OUTPUT_DIR`、`OBSIDIAN_SOURCE` に従います。stateに保存先がある場合は、その既存パスを優先します。既存ノートはファイル名・作成日時・sourceを引き継いで置換し、通常hookのstateも更新します。置換前の内容はノートと同じフォルダの `.rebuild-backups/` に日時付き `.bak` として保存し、そのパスを表示します。再構成は本文への手動追記も置き換えます。
+`codex.sse_event`・`codex.websocket_event`の`response.completed`と、transcriptの`token_usage_record`を照合します。`conversation.id`で対象を限定し、`--include-subagents`を加えると親子関係を確認できる子も集計します。
 
-USD単価を変更した場合は、`shared/usage_prices.py.inc`を更新し、`/usr/bin/python3 sync_shared.py`で各保存スクリプトへ反映してから実行してください。OpenCodeで元の回答に正の `cost` がある場合は、通常保存と同様にその値を優先します。
+| `--group-by` | 比較単位 |
+| --- | --- |
+| `response`（既定） | response IDごとのリクエスト。 |
+| `turn` | turn ID・モデルごとの件数とtoken合計。 |
+| `model` | セッション内のモデル別合計。同一turn内の入れ替わりは検出できません。 |
 
-自動探索する場所は、Codexの `~/.codex/sessions/` と `~/.codex/archived_sessions/`、Claude Codeの `~/.claude/projects/`、Antigravityの `~/.gemini/antigravity-cli/brain/SESSION_ID/.system_generated/logs/transcript.jsonl` です。Codexは `CODEX_HOME`、Claude Codeは `CLAUDE_CONFIG_DIR` で探索元を変更できます。JSONLを直接指定することもできます。Codex・Claude Codeではログ内のセッションIDの完全一致を確認します。
+response IDがない入力で集計比較を選ぶ例です。
 
 ```bash
-/usr/bin/python3 rebuild_session.py codex SESSION_ID --transcript /path/to/rollout.jsonl --obsidian
+/usr/bin/python3 compare_codex_telemetry.py --telemetry /private/tmp/codex-otel.json \
+  --transcript /path/to/rollout-SESSION_ID.jsonl --session-id SESSION_ID --group-by turn
 ```
 
-OpenCode v2は `~/.local/share/opencode/opencode.db` を読み取り専用で開きます。`OPENCODE_DATABASE` または `--database /path/to/opencode.db` で変更できます。
+token属性は`input_token_count`・`cached_token_count`・`cache_write_token_count`・`output_token_count`・`reasoning_token_count`が必要です。欠落を0とは推測しません。同じresponse ID、またはOTLPのtimestamp・trace/spanから再配送を除外し、識別できないイベントは照合不足とします。重複IDの内容不一致やtoken内訳の矛盾はエラーです。失敗イベント・累積counter・ヒストグラムは加算しません。
 
-履歴が見つからない場合や保存対象の本文がない場合は、既存ノートを置換せず終了コード1を返します。元のJSONL・SQLiteに残っている会話だけが対象です。Claude Code・Antigravityの過去quotaは既存ノート・stateにある観測値を引き継ぎ、Antigravityの現在quotaは取得しません。Codexのquotaは元のJSONLから再集計します。出力先は `--output-dir` と `--obsidian` のどちらかを必ず指定してください。
+USDは両側のtokenへ同じ参考単価を適用した値を比較します。`--price-version`で登録版を指定できます。tokenが一致しても換算できないモデルがあれば`unpriced_groups`として不足を報告します。請求データとの照合ではありません。
+
+### Claude Code
+
+```bash
+/usr/bin/python3 compare_claude_telemetry.py \
+  --telemetry /private/tmp/claude-otel.json \
+  --transcript /path/to/SESSION_ID.jsonl \
+  --session-id SESSION_ID --include-subagents
+```
+
+`claude_code.api_request`の`request_id`とtranscriptの`requestId`を照合し、再配送は一回だけ集計します。`session.id`で対象を限定し、APIエラーや累積counterは加算しません。モデル・通常入力・cache read・cache creation・出力を比較し、USDの許容差は0.000001です。`--price-version`で登録版を指定できます。
+
+IDなし、片側だけのrequest、TTL不明等の換算不可、データなしは一致扱いにしません。両ツールとも終了コードは一致0、差異・照合不足1、不正入力2です。実際のCLI版による入力差はあり得ます。Codexの実OTel出力とClaudeの有料契約環境との結合検証は未実施です。
+
+### OTelログを収集する場合
+
+Codexではcollectorを別途用意し、`~/.codex/config.toml`の既存設定へ次を追加します。`protocol = "json"`で送信しても、collector側の保存形式が照合ツールで読めるJSONになるよう設定する必要があります。
+
+```toml
+[otel]
+log_user_prompt = false
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "json" } }
+```
+
+- 収集・送信にCPU・メモリ・通信が増え、collectorの起動管理・保持期間・容量管理が必要です。外部サービスには利用料金が発生する場合があります。
+- `log_user_prompt = false`でも会話ID・モデル・CLI版・ツール結果の断片等は送信され得ます。送信先と保持範囲を確認してください。
+- 終了時のflush、再配送、収集開始時点、CLI版の属性差でデータが不足する場合があります。照合不足なら両入力の範囲を確認します。
+
+必要な期間だけローカルで収集し、検証後はexporterを無効にできます。ログ・traceのexportとOpenAIへのanalytics設定は別です。設定の根拠は[Codex公式OTel仕様](https://learn.chatgpt.com/docs/config-file/config-advanced#observability-and-telemetry)、Claudeの収集設定は[公式Monitoring](https://code.claude.com/docs/en/monitoring-usage)で確認できます。
 
 ## 開発・テスト
 
@@ -528,9 +661,22 @@ Python構文を先に検証し、1本でも不正なら書き込みません。
 
 テストでは、5本の空入力・同一内容の再保存・source設定変更・state消失・非表示ユーザー発話の共通契約、生成領域内外のコード重複、単独ファイル実行を検証します。さらに、通常の追記、CodexとAntigravityのquota観測値、Claude CodeとOpenCodeのtoken集計、連続発言の集約に加えて、cursor復旧、state消失時の既存Markdown再利用、書き込み途中のJSONL最終行の再試行、YAML文字列とstateファイル名の安全化、保存先相対パスの検証を確認しています。
 
+### 単価表の差分確認
+
+単価表の正本は`shared/usage_prices.py.inc`、履歴と出典は`shared/usage_price_history.py.inc`です。公式出典を確認して候補JSONを作成し、次のコマンドで差分を確認します。候補の`rates`には全モデルを含めてください。省略したモデルは削除差分になります。
+
+```bash
+/usr/bin/python3 check_usage_prices.py > /private/tmp/current-prices.json
+# 公式出典を確認して候補JSONを作成した後
+/usr/bin/python3 check_usage_prices.py --candidate /private/tmp/candidate-prices.json
+```
+
+終了コードは差分なし0、差分あり1、入力エラー2です。候補の自動採用・Web取得は行いません。変更時は旧表を履歴として残し、価格版・確認日・出典を更新してから`/usr/bin/python3 sync_shared.py`で各saverへ反映します。
+
 ## 実装上の特徴
 
 - **ノイズの少ないログ保存**: ユーザーおよびエージェントの発言だけを抽出し、ツール呼び出しや実行結果を除外します。
+- **Codexのsnapshot解析**: Stopの最初にJSONLを一度読み、metadata・quota・Usage・本文を同じsnapshotから計算します。不完全な末尾は次回へ保留します。子transcriptはファイルごとのsnapshotです。
 - **増分管理**: CodexとClaude Codeは`last_line`、Antigravityは`last_id`で読み込み済み位置を管理します。
 - **cursorとstateの自動復旧**: Markdown内のcursorを正としてstateとの不一致を補正し、state消失時はfrontmatterの`session_id`から既存Markdownを探索します。
 - **内容変更時だけノート更新**: 保存対象の本文がない新規セッションではノートを作らず、同じ内容の再保存で`modified`だけを変更しません。
@@ -539,18 +685,16 @@ Python構文を先に検証し、1本でも不正なら書き込みません。
 - **安全なメタデータとファイル名**: YAML文字列、session ID、プロジェクト名を安全な形式に変換します。
 - **古いstateのクリーンアップ**: 30日間利用されていないstateファイルを自動的に削除します（非ブロッキングロックで実行中セッションを保護）。
 
+このプロジェクトは各AIサービス・CLI・Obsidianの非公式ツールで、各サービスの開発元とは関係ありません。
+
 ## 謝辞
 
 Markdownの出力形式では、[Obsidian AI Exporter](https://github.com/sho7650/obsidian-AI-exporter)のYAML frontmatter、ユーザー発言の見出し、Calloutを使った会話表現を参考にしました。優れたアイデアを公開されている開発者に感謝します。
 
 ## バージョン管理
 
-このソースのバージョンは4.2.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`、ルートの[VERSION](./VERSION)、Gitタグは同じ値です。
+このソースのバージョンは4.2.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`と[VERSION](./VERSION)を揃え、公開時に対応するGitタグを付けます。変更履歴は[CHANGELOG](./CHANGELOG.md)に記録しています。
 
 ## ライセンス
 
 このプロジェクトは[MIT License](./LICENSE)の下で公開されています。
-
-構造・堅牢性・Claude対応の検証結果と今後の改善案は、[2026-10-25の検証報告](docs/saver-audit-2026-10-25.md)を参照してください。
-
-3.13.0ではCodexの単一snapshot解析、価格版を選んだ再構成、Claudeの子Usage・API失敗保存、読取専用doctor、任意の公式telemetry照合を追加しました。[使い方・検証結果](docs/saver-improvements.md)を参照してください。

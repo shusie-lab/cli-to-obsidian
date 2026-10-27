@@ -5,12 +5,6 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
-## [Unreleased]
-
-### Added
-
-- セッションIDから全履歴を再構成する `rebuild_session.py` を追加。テスト用出力と、バックアップ付きの既存Obsidianノート置換に対応
-
 ## [4.2.0] - 2026-10-27
 
 ### Added
