@@ -112,6 +112,56 @@ class SaverImprovements(unittest.TestCase):
                         pass
                 self.assertEqual(module.active_price_version(), "4.2.0")
 
+    def test_cache_display_uses_token_weighted_input_and_preserves_cost(self):
+        for module in (codex_save, claude_save, opencode_save, pi_save):
+            with self.subTest(module=module.__name__):
+                a = {"input_tokens": 100, "cached_input_tokens": 20,
+                     "cache_write_input_tokens": 30, "cost_usd": Decimal("1.23")}
+                b = {"input_tokens": 900, "cached_input_tokens": 900,
+                     "cost_usd": Decimal("2.34")}
+                usage = {"input_tokens": 1000, "cached_input_tokens": 920,
+                         "output_tokens": 10000, "total_tokens": 11000,
+                         "total_cost_usd": Decimal("3.57"), "by_model": {"a": a, "b": b}}
+                section = module.build_usage_section(usage)
+                self.assertIn("a $1.23 · Cache: 20.0%", section)
+                self.assertIn("b $2.34 · Cache: 100.0%", section)
+                self.assertTrue(section.endswith(" · Cache: 92.0%\n"))
+                answer = module.format_message_usage(usage)
+                self.assertIn("11,000 tok · $3.57", answer)
+                self.assertTrue(answer.endswith(" · Cache: 92.0%"))
+                for raw in ({}, {"input_tokens": 0, "cached_input_tokens": 0},
+                            {"input_tokens": 10, "cached_input_tokens": 11},
+                            {"input_tokens": 10, "cached_input_tokens": -1}):
+                    self.assertEqual(module.cache_hit_label(raw), "Cache: N/A")
+                self.assertEqual(module.cache_hit_label({"input_tokens": 10, "cached_input_tokens": 0}),
+                                 "Cache: 0.0%")
+
+    def test_current_price_checks_cover_every_registered_model(self):
+        for module in (codex_save, claude_save, opencode_save, pi_save):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(set(module.PRICE_CHECKED_AT), set(module.STANDARD_USAGE_RATES))
+                self.assertEqual(set(module.PRICE_CHECKED_AT.values()), {"2026-10-28"})
+
+    def test_price_frontmatter_only_lists_used_models_and_sources(self):
+        for module in (codex_save, claude_save, opencode_save, pi_save):
+            with self.subTest(module=module.__name__):
+                usage = {"by_model": {"openai/gpt-6.1-terra": {},
+                                      "anthropic/claude-sonnet-5.5": {}, "unknown": {}}}
+                fields = "\n".join(module.usage_price_fields(usage))
+                self.assertIn('"gpt-6.1-terra": "2026-10-28"', fields)
+                self.assertIn('"claude-sonnet-5-5": "2026-10-28"', fields)
+                self.assertIn('"unknown": null', fields)
+                self.assertIn('"gpt":', fields)
+                self.assertIn('"claude":', fields)
+                self.assertNotIn('"gemini', fields)
+                self.assertNotIn('"gpt-6-luna"', fields)
+                with module.usage_price_version("3.11.1"):
+                    historical = "\n".join(module.usage_price_fields(usage))
+                    self.assertIn('"claude-sonnet-5-5": null', historical)
+                empty = module.usage_price_fields({"by_model": {}})
+                self.assertIn("  price_checked_at: {}", empty)
+                self.assertIn("  price_sources: {}", empty)
+
     def test_rebuild_preserves_price_version_and_explicit_legacy_selection(self):
         path = self.write_rows(self.root / "parent.jsonl", self.claude_rows())
         output_dir = self.root / "export"

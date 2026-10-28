@@ -218,7 +218,7 @@ class TestOpenCodeSave(unittest.TestCase):
         self.assertIn("cost_usd: 0.3", content)
         self.assertIn("Usage: 2,000,000 tok", content)
         self.assertIn(
-            "💰 **Usage (USD換算)**: Total: $0.3 (muse-spark-1.3-contributor-free $0.3)", content
+            "💰 **Usage (USD換算)**: Total: $0.3 (muse-spark-1.3-contributor-free $0.3 · Cache: 0.0%)", content
         )
         self.assertLess(content.index("💰 **Usage (USD換算)**:"), content.index("# 質問"))
 
@@ -276,7 +276,7 @@ class TestOpenCodeSave(unittest.TestCase):
         }
         self.assertEqual(
             opencode_save.build_usage_section(usage),
-            "💰 **Usage (USD換算)**: Total: $0.25（部分換算） (priced-model $0.25、unknown-model 換算不可)\n",
+            "💰 **Usage (USD換算)**: Total: $0.25（部分換算） (priced-model $0.25 · Cache: N/A、unknown-model 換算不可 · Cache: N/A) · Cache: N/A\n",
         )
 
     def test_openrouter_balance_is_not_fetched_and_native_tokens_are_saved(self):

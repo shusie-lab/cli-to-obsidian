@@ -792,7 +792,7 @@ Response text
         )
         self.assertEqual(
             mixed,
-            "Usage: 50 tok · $0.000015 (gpt-6-luna 30 tok・$0.000015、unknown-model 20 tok・換算不可)",
+            "Usage: 50 tok · $0.000015 (gpt-6-luna 30 tok・$0.000015、unknown-model 20 tok・換算不可) · Cache: N/A",
         )
 
     def test_codex_tool_use_inserts_one_blank_line_before_next_answer(self):
@@ -983,7 +983,7 @@ Response text
         self.assertIn("usage:", content)
         self.assertIn("total_cost_usd: 0.00333915", content)
         self.assertIn('"gpt-6-luna":', content)
-        self.assertIn("💰 **Usage (USD換算)**: Total: $0.00333915 (gpt-6-luna $0.00001915、gpt-6-astra $0.00332)", content)
+        self.assertIn("💰 **Usage (USD換算)**: Total: $0.00333915 (gpt-6-luna $0.00001915 · Cache: 10.0%、gpt-6-astra $0.00332 · Cache: 10.0%)", content)
 
         refreshed = codex_save.update_markdown_metadata(
             content,

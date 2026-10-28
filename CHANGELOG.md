@@ -5,6 +5,17 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [4.3.0] - 2026-10-28
+
+### Added
+
+- 会話全体・モデル別・AI返答のUSD換算にキャッシュヒット率（Cache）を併記
+
+### Fixed
+
+- 登録済み全12モデルの参考単価を再確認し、価格確認日を2026-10-28へ更新
+- 会話記録の価格確認日・参照元を、その会話で使用したモデルのみに限定
+
 ## [4.2.0] - 2026-10-27
 
 ### Added

@@ -3,10 +3,18 @@ from contextvars import ContextVar
 PRICE_VERSION = "4.2.0"
 PRICE_RECORDED_AT = "2026-10-27"
 PRICE_CHECKED_AT = {
-    "gpt-6.1-terra": "2026-10-27",
-    "claude-fable-5-1": "2026-10-25", "claude-sonnet-5-5": "2026-10-25",
-    "claude-opus-5-5": "2026-10-25", "claude-haiku-5-5": "2026-10-25",
-    "gemini-3.8-flash": "2026-10-06", "deepseek-v4.1-flash": "2026-10-16",
+    'claude-fable-5-1': "2026-10-28",
+    'deepseek-v4.1-flash': "2026-10-28",
+    'gpt-6-astra': "2026-10-28",
+    'gpt-6.1-sol': "2026-10-28",
+    'gpt-6.1-terra': "2026-10-28",
+    'gpt-6-luna': "2026-10-28",
+    'gemini-3.8-flash': "2026-10-28",
+    'muse-spark-1.3-contributor-free': "2026-10-28",
+    'nemotron-3-ultra-free': "2026-10-28",
+    'claude-opus-5-5': "2026-10-28",
+    'claude-haiku-5-5': "2026-10-28",
+    'claude-sonnet-5-5': "2026-10-28",
 }
 PRICE_SOURCES = {
     "claude": "https://platform.claude.com/docs/en/about-claude/pricing",
@@ -82,14 +90,17 @@ def note_price_version(content: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def usage_price_fields() -> list[str]:
+def usage_price_fields(usage: dict) -> list[str]:
     version = active_price_version()
     recorded = PRICE_RECORDED_AT if version == PRICE_VERSION else PRICE_HISTORY[version]["recorded_at"]
+    models = sorted({reference_price_model(model) for model in usage.get("by_model", {})})
+    sources = {key: value for key, value in PRICE_SOURCES.items()
+               if any(model.startswith(key + "-") for model in models)}
     # 過去料金の正確な適用開始日は確認できないため推定しない。
     return ["  price_version: " + yaml_quote(version),
             "  price_recorded_at: " + yaml_quote(recorded),
-            "  price_effective_from: null", "  price_checked_at:",
+            "  price_effective_from: null", "  price_checked_at:" + ("" if models else " {}"),
             *("    " + yaml_quote(model) + ": " + (yaml_quote(PRICE_CHECKED_AT[model])
               if version == PRICE_VERSION and model in PRICE_CHECKED_AT else "null")
-              for model in active_usage_rates()), "  price_sources:",
-            *("    " + yaml_quote(key) + ": " + yaml_quote(value) for key, value in PRICE_SOURCES.items())]
+              for model in models), "  price_sources:" + ("" if sources else " {}"),
+            *("    " + yaml_quote(key) + ": " + yaml_quote(value) for key, value in sources.items())]

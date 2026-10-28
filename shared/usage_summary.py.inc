@@ -172,7 +172,7 @@ def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
 def usage_frontmatter_fields(usage: dict | None) -> list[str]:
     if not usage:
         return []
-    lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields()]
+    lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields(usage)]
     lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
     if "total_cost_usd" in usage:
         lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
@@ -223,10 +223,21 @@ def _usage_cost_label(usage: dict, key: str) -> str:
     return amount + ("（部分換算）" if partial else "")
 
 
+def cache_hit_label(usage: dict) -> str:
+    """入力tokenに占めるcache readの割合。書込・出力は分子に含めない。"""
+    total = usage.get("input_tokens")
+    cached = usage.get("cached_input_tokens")
+    if (isinstance(total, bool) or isinstance(cached, bool)
+            or not isinstance(total, int) or not isinstance(cached, int)
+            or total <= 0 or cached < 0 or cached > total):
+        return "Cache: N/A"
+    return f"Cache: {Decimal(cached) * 100 / Decimal(total):.1f}%"
+
+
 def build_usage_section(usage: dict | None) -> str:
     if not usage:
         return "💰 **Usage (USD換算)**: N/A\n"
-    parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')}" for model, entry in usage.get("by_model", {}).items()]
+    parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')} · {cache_hit_label(entry)}" for model, entry in usage.get("by_model", {}).items()]
     details = f" ({'、'.join(parts)})" if parts else ""
     scope = usage.get("scope")
     scope_line = ""
@@ -234,7 +245,7 @@ def build_usage_section(usage: dict | None) -> str:
         scope_line = ("📊 **Usage集計範囲**: 親 " + f"{int(scope.get('parent_tokens', 0)):,} tok"
             + "・子 " + f"{int(scope.get('subagent_tokens', 0)):,} tok"
             + "（回答に紐付かない子 " + f"{int(scope.get('unattributed_subagent_tokens', 0)):,} tok）\n")
-    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details}\n"
+    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details} · {cache_hit_label(usage)}\n"
             + scope_line + build_reported_cost_section(usage.get("reported_cost")))
 
 
@@ -250,7 +261,7 @@ def format_message_usage(usage: dict | None, subagent_usage: dict | None = None)
                  for model, entry in sorted(subagent_usage.get("by_model", {}).items())]
         if parts:
             label += f" ({'、'.join(parts)})"
-    return label
+    return label + " · " + cache_hit_label(usage)
 
 
 def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | None:

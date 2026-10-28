@@ -306,7 +306,7 @@ class SaverContracts(unittest.TestCase):
                     rows[1]["info"]["cost"] = 7.5
                     self.save(provider, rows)
                     self.assertIn("total_cost_usd: 1.35", path.read_text())
-                    self.assertIn("Usage: 310,000 tok · $1.35 ⚠︎ 272K+ · 取得コスト: $7.5</small>", path.read_text())
+                    self.assertIn("Usage: 310,000 tok · $1.35 ⚠︎ 272K+ · 取得コスト: $7.5 · Cache: 0.0%</small>", path.read_text())
 
     def test_codex_long_context_toggle_refreshes_existing_note(self):
         module = self.modules["codex"]
@@ -319,7 +319,7 @@ class SaverContracts(unittest.TestCase):
                 content = path.read_text()
                 self.assertIn("total_cost_usd: " + expected + "\n", content)
                 self.assertIn("Usage: 300,010 tok · $" + expected +
-                              (" ⚠︎ 272K+" if enabled else "") + "</small>", content)
+                              (" ⚠︎ 272K+" if enabled else "") + " · Cache: 33.3%</small>", content)
                 self.assertEqual("⚠︎ 272K+" in content, enabled)
                 self.assertEqual(content.count("> [!QUESTION] User"), 1)
                 self.assertEqual(content.count("> [!NOTE] Codex"), 1)
@@ -370,7 +370,7 @@ class SaverContracts(unittest.TestCase):
                     content = path.read_text()
                     self.assertIn("total_cost_usd: " + price, content)
                     suffix = " · 取得コスト: 未取得" if provider in {"opencode", "pi"} else ""
-                    self.assertIn("Usage: 15 tok · $" + price + suffix + "</small>", content)
+                    self.assertIn("Usage: 15 tok · $" + price + suffix + " · Cache: 0.0%</small>", content)
 
         claude = self.modules["claude"]
         usage = claude._claude_usage_record({"model": "gpt-6.1-sol", "usage": {
@@ -400,7 +400,7 @@ class SaverContracts(unittest.TestCase):
                     for version in ("3.11.1", "3.12.0"):
                         with module.usage_price_version(version):
                             self.assertIsNone(module._usage_cost(model, {"input_tokens": 10}))
-                    self.assertEqual(module.PRICE_CHECKED_AT["gpt-6.1-terra"], "2026-10-27")
+                    self.assertEqual(module.PRICE_CHECKED_AT["gpt-6.1-terra"], "2026-10-28")
 
     def test_gemini_openrouter_alias_cache_reasoning_and_large_input(self):
         aliases = ("google/gemini-3.8-flash", "gemini-3.8-flash", "gemini3.8-flash")

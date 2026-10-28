@@ -427,6 +427,8 @@ OpenCodeはassistantの`cost`、Piは`usage.cost.total`、ClaudeはstatusLineの
 /usr/bin/python3 check_usage_prices.py
 ```
 
+Usageには全体・モデル別・回答別の`Cache: xx.x%`（キャッシュ入力token ÷ 全入力token）も表示します。入力が0または割合を算出できない場合は`Cache: N/A`と表示します。
+
 ノートには`usage.price_version`・`price_recorded_at`・`price_checked_at`・`price_sources`・`price_effective_from`も保存します。価格版はsaverの機能バージョンと独立しています。確認日がないモデルや適用開始日が不明な値はnullです。価格設定を変えた後の通常保存では、そのセッションの累計・既存回答Usageを現在の設定で再計算します。
 
 ### quota残量
@@ -693,7 +695,7 @@ Markdownの出力形式では、[Obsidian AI Exporter](https://github.com/sho765
 
 ## バージョン管理
 
-このソースのバージョンは4.2.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`と[VERSION](./VERSION)を揃え、公開時に対応するGitタグを付けます。変更履歴は[CHANGELOG](./CHANGELOG.md)に記録しています。
+このソースのバージョンは4.3.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`と[VERSION](./VERSION)を揃え、公開時に対応するGitタグを付けます。変更履歴は[CHANGELOG](./CHANGELOG.md)に記録しています。
 
 ## ライセンス
 
