@@ -98,6 +98,7 @@ if (targetFile) {
       const linkPattern = /\[\[([^\[\]|]+)(?:\|([^\]\n]*))?\]\]/g;
       let match;
       while ((match = linkPattern.exec(line)) !== null) {
+        if (match[2] === undefined) continue;
         if (isInsideInlineCode(line, match.index)) continue;
 
         const linkTarget = match[1].trim();
@@ -111,7 +112,11 @@ if (targetFile) {
         if (!destination?.path.startsWith(`${DEFAULT_OUTPUT_DIR}/`)) continue;
         matchedCount += 1;
 
-        const replacement = `[[${linkTarget}|${displayTitle(destination)}]]`;
+        const title = displayTitle(destination);
+        const usePlainLink = !linkTarget.includes("#") && title === destination.basename;
+        const replacement = usePlainLink
+          ? `[[${linkTarget}]]`
+          : `[[${linkTarget}|${title}]]`;
         if (replacement !== match[0]) {
           edits.push({
             start: lineStart + match.index,
