@@ -127,7 +127,7 @@ usage:
 > [!NOTE] Codex
 > <small>🤖 gpt-6.1-sol-medium</small>
 
-> 問題を確認しました。原因は...
+問題を確認しました。原因は...
 ```
 
 ChatGPTからWorkへ移行した際に生成される構造化されたユーザー入力は、先頭が
