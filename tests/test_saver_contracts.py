@@ -357,7 +357,7 @@ class SaverContracts(unittest.TestCase):
 
     def test_all_registered_prices_are_used_by_each_usage_saver(self):
         # 入力10/出力5の期待額を別途計算し、raw入力から保存まで検証する。
-        prices = {"deepseek-v4.1-flash": "0.000009", "gpt-6-astra": "0.00035", "gpt-6.1-sol": "0.00007",
+        prices = {"gpt-6.2-astra": "0.00028", "gpt-6.2-sol": "0.00007", "deepseek-v4.1-flash": "0.000009", "gpt-6-astra": "0.00035", "gpt-6.1-sol": "0.00007",
                   "gpt-6.1-terra": "0.000035", "gpt-6-luna": "0.0000035", "muse-spark-1.3-contributor-free": "0.000002",
                   "nemotron-3-ultra-free": "0.000016", "claude-opus-5-5": "0.00014",
                   "claude-sonnet-5-5": "0.00007", "claude-haiku-5-5": "0.0000035", "gemini-3.8-flash": "0.00002625",
@@ -379,6 +379,36 @@ class SaverContracts(unittest.TestCase):
         self.assertTrue(usage["long_context"])
         self.assertEqual(usage["cost_usd"], Decimal("0.870154"))
 
+    def test_gpt62_rates_long_context_and_history(self):
+        for provider in ("codex", "claude", "opencode", "pi"):
+            module = self.modules[provider]
+            for model, rates in (("gpt-6.2-astra", ("8", "0.40", "10", "40")),
+                                 ("gpt-6.2-sol", ("2", "0.10", "2.50", "10"))):
+                for alias in (model, "openai/" + model):
+                    with self.subTest(provider=provider, model=alias):
+                        with patch.object(module, "APPLY_LONG_CONTEXT_PRICING", False):
+                            for usage, expected in zip((
+                                {"input_tokens": 1_000_000},
+                                {"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000},
+                                {"input_tokens": 1_000_000, "cache_write_input_tokens": 1_000_000},
+                                {"output_tokens": 1_000_000},
+                            ), rates):
+                                self.assertEqual(module._usage_cost(alias, usage), Decimal(expected))
+                        with patch.object(module, "APPLY_LONG_CONTEXT_PRICING", True):
+                            for tokens in (272_000, 272_001):
+                                usage = {"input_tokens": tokens, "cached_input_tokens": 100_000,
+                                         "cache_write_input_tokens": 50_000, "output_tokens": 10}
+                                base = ((tokens - 150_000) * Decimal(rates[0])
+                                        + 100_000 * Decimal(rates[1]) + 50_000 * Decimal(rates[2]))
+                                expected = (base * (2 if tokens > 272_000 else 1)
+                                            + 10 * Decimal(rates[3])
+                                            * (Decimal("1.5") if tokens > 272_000 else 1)) / 1_000_000
+                                self.assertEqual(module._usage_cost(alias, usage), expected)
+                        with module.usage_price_version("4.2.0"):
+                            self.assertEqual(module._usage_cost(alias, {"input_tokens": 10}),
+                                             Decimal(rates[0]) / 100_000)
+                        self.assertEqual(module.PRICE_CHECKED_AT[model], "2026-11-18")
+
     def test_terra_token_rates_long_context_and_price_history(self):
         for provider in ("codex", "claude", "opencode", "pi"):
             module = self.modules[provider]
@@ -399,7 +429,7 @@ class SaverContracts(unittest.TestCase):
                             self.assertEqual(module._usage_cost(model, usage), Decimal(expected))
                     for version in ("3.11.1", "3.12.0"):
                         with module.usage_price_version(version):
-                            self.assertIsNone(module._usage_cost(model, {"input_tokens": 10}))
+                            self.assertEqual(module._usage_cost(model, {"input_tokens": 10}), Decimal("0.00001"))
                     self.assertEqual(module.PRICE_CHECKED_AT["gpt-6.1-terra"], "2026-10-28")
 
     def test_gemini_openrouter_alias_cache_reasoning_and_large_input(self):

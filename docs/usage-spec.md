@@ -40,7 +40,7 @@ OpenCodeはassistantの`cost`、Piは`usage.cost.total`、ClaudeはstatusLineの
 
 | 系列 | 登録モデル |
 | --- | --- |
-| GPT | GPT-6 Astra、GPT-6.1 Sol、GPT-6.1 Terra、GPT-6 Luna |
+| GPT | GPT-6.2 Astra、GPT-6.2 Sol、GPT-6 Astra、GPT-6.1 Sol、GPT-6.1 Terra、GPT-6 Luna |
 | Claude | Fable 5.1、Opus 5.5、Sonnet 5.5、Haiku 5.5 |
 | Gemini | Gemini 3.8 Flash |
 | DeepSeek | DeepSeek V4.1 Flash（`deepseek-flash`も対応） |
@@ -60,7 +60,7 @@ OpenCodeはassistantの`cost`、Piは`usage.cost.total`、ClaudeはstatusLineの
 
 Usageには全体・モデル別・回答別の`Cache: xx.x%`（キャッシュ入力token ÷ 全入力token）も表示します。入力が0または割合を算出できない場合は`Cache: N/A`と表示します。
 
-ノートには`usage.price_version`・`price_recorded_at`・`price_checked_at`・`price_sources`・`price_effective_from`も保存します。価格版はsaverの機能バージョンと独立しています。確認日がないモデルや適用開始日が不明な値はnullです。価格設定を変えた後の通常保存では、そのセッションの累計・既存回答Usageを現在の設定で再計算します。
+ノートには`usage.price_version`・`price_recorded_at`・`price_checked_at`・`price_sources`・`price_effective_from`も保存します。価格版はsaverの機能バージョンと独立しています。過去版は単価の変更点と削除モデルの単価を保持し、当時未登録だったモデルも後の版で登録された単価で換算します。確認日がないモデルや適用開始日が不明な値はnullです。価格設定を変えた後の通常保存では、そのセッションの累計・既存回答Usageを現在の設定で再計算します。
 
 ## quota残量
 

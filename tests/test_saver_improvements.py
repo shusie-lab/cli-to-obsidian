@@ -105,12 +105,53 @@ class SaverImprovements(unittest.TestCase):
                 self.assertEqual(module._usage_cost("claude-sonnet-5-5", usage), Decimal("0.1"))
                 with module.usage_price_version("3.11.1"):
                     self.assertEqual(module._usage_cost("claude-sonnet-5-5", usage), Decimal("0.2"))
-                    self.assertNotIn("claude-fable-5-1", module.active_usage_rates())
-                self.assertEqual(module.active_price_version(), "4.2.0")
+                    self.assertEqual(module.active_usage_rates()["claude-fable-5-1"],
+                                     module.STANDARD_USAGE_RATES["claude-fable-5-1"])
+                self.assertEqual(module.active_price_version(), "4.4.0")
                 with self.assertRaises(ValueError):
                     with module.usage_price_version("unregistered"):
                         pass
-                self.assertEqual(module.active_price_version(), "4.2.0")
+                self.assertEqual(module.active_price_version(), "4.4.0")
+
+    def test_price_deltas_restore_rates_without_mutating_other_versions(self):
+        for module in (codex_save, claude_save, opencode_save, pi_save):
+            current = copy.deepcopy(module.STANDARD_USAGE_RATES)
+            for version in ("4.2.0", "3.12.0", "3.11.1"):
+                with self.subTest(module=module.__name__, version=version):
+                    expected = copy.deepcopy(current)
+                    if version == "3.11.1":
+                        expected["claude-sonnet-5-5"]["cached_input"] = Decimal("0.20")
+                    with module.usage_price_version(version):
+                        restored = module.active_usage_rates()
+                        self.assertEqual(restored, expected)
+                        restored["claude-sonnet-5-5"]["cached_input"] = Decimal("999")
+                        self.assertEqual(module.active_usage_rates(), expected)
+                    self.assertEqual(module.STANDARD_USAGE_RATES, current)
+
+            # 将来さらに同じ単価が変わっても、変更のなかった版をまたいで旧値へ戻せる。
+            future = copy.deepcopy(current)
+            future["claude-sonnet-5-5"]["cached_input"] = Decimal("0.30")
+            future["future-model"] = {"input": Decimal("1")}
+            removed = future.pop("gpt-6-astra")
+            history = dict(module.PRICE_HISTORY)
+            history["4.4.0"] = {"next_version": "future", "changes": {
+                "claude-sonnet-5-5": {"cached_input": Decimal("0.10")},
+                "gpt-6-astra": removed}}
+            with mock.patch.object(module, "STANDARD_USAGE_RATES", future), \
+                    mock.patch.object(module, "PRICE_VERSION", "future"), \
+                    mock.patch.object(module, "PRICE_HISTORY", history):
+                for version, expected in (("future", "0.30"), ("4.2.0", "0.10"),
+                                          ("3.11.1", "0.20")):
+                    with module.usage_price_version(version):
+                        restored = module.active_usage_rates()
+                        self.assertEqual(restored["claude-sonnet-5-5"]["cached_input"],
+                                         Decimal(expected))
+                        self.assertEqual(restored["future-model"], {"input": Decimal("1")})
+                        if version == "future":
+                            self.assertNotIn("gpt-6-astra", restored)
+                        else:
+                            self.assertEqual(restored["gpt-6-astra"], current["gpt-6-astra"])
+                self.assertNotIn("gpt-6-astra", future)
 
     def test_cache_display_uses_token_weighted_input_and_preserves_cost(self):
         for module in (codex_save, claude_save, opencode_save, pi_save):
@@ -140,7 +181,7 @@ class SaverImprovements(unittest.TestCase):
         for module in (codex_save, claude_save, opencode_save, pi_save):
             with self.subTest(module=module.__name__):
                 self.assertEqual(set(module.PRICE_CHECKED_AT), set(module.STANDARD_USAGE_RATES))
-                self.assertEqual(set(module.PRICE_CHECKED_AT.values()), {"2026-10-28"})
+                self.assertEqual(set(module.PRICE_CHECKED_AT.values()), {"2026-10-28", "2026-11-18"})
 
     def test_price_frontmatter_only_lists_used_models_and_sources(self):
         for module in (codex_save, claude_save, opencode_save, pi_save):
@@ -178,7 +219,7 @@ class SaverImprovements(unittest.TestCase):
         self.assertIn('total_cost_usd: 0.000305', target.read_text())
         self.assertIn('price_checked_at:', target.read_text())
         # A legacy note without provenance must not silently pretend its price is known.
-        target.write_text(target.read_text().replace('  price_version: "4.2.0"\n', ''))
+        target.write_text(target.read_text().replace('  price_version: "4.4.0"\n', ''))
         before = target.read_bytes()
         with self.assertRaisesRegex(ValueError, "価格版がありません"):
             rebuild_session.rebuild(**args, pricing="preserve")

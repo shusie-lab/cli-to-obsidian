@@ -1,8 +1,10 @@
 from contextvars import ContextVar
 
-PRICE_VERSION = "4.2.0"
-PRICE_RECORDED_AT = "2026-10-27"
+PRICE_VERSION = "4.4.0"
+PRICE_RECORDED_AT = "2026-11-18"
 PRICE_CHECKED_AT = {
+    "gpt-6.2-astra": "2026-11-18",
+    "gpt-6.2-sol": "2026-11-18",
     'claude-fable-5-1': "2026-10-28",
     'deepseek-v4.1-flash': "2026-10-28",
     'gpt-6-astra': "2026-10-28",
@@ -24,32 +26,13 @@ PRICE_SOURCES = {
     "muse": "https://dev.meta.ai/docs/pricing-rate-limits/",
     "nemotron": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b",
 }
-# 過去表を現在表への差分として生成せず、独立した値で保持する。
+# 現在表から過去へ戻す差分。next_versionは直後の価格版を明示する。
+# changesは変更したtoken単価の旧値。削除モデルは全単価を残し、追加モデルは除外しない。
 PRICE_HISTORY = {
-    "3.12.0": {"recorded_at": "2026-10-25", "rates": {
-        'claude-fable-5-1': {'input': Decimal('10.00'), 'cached_input': Decimal('0.25'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00'), 'cache_write_input_1h': Decimal('20.00')},
-        'deepseek-v4.1-flash': {'input': Decimal('0.30'), 'cached_input': Decimal('0.006'), 'cache_write_input': Decimal('0.30'), 'output': Decimal('1.20')},
-        'gpt-6-astra': {'input': Decimal('10.00'), 'cached_input': Decimal('1.00'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00')},
-        'gpt-6.1-sol': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00')},
-        'gpt-6-luna': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50')},
-        'gemini-3.8-flash': {'input': Decimal('0.75'), 'cached_input': Decimal('0.075'), 'cache_write_input': Decimal('0.0416666666666667'), 'output': Decimal('3.75')},
-        'muse-spark-1.3-contributor-free': {'input': Decimal('0.10'), 'cached_input': Decimal('0.002'), 'cache_write_input': Decimal('0.10'), 'output': Decimal('0.20')},
-        'nemotron-3-ultra-free': {'input': Decimal('0.50'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('0.50'), 'output': Decimal('2.20')},
-        'claude-opus-5-5': {'input': Decimal('4.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('5.00'), 'output': Decimal('20.00'), 'cache_write_input_1h': Decimal('8.00')},
-        'claude-haiku-5-5': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50'), 'cache_write_input_1h': Decimal('0.20')},
-        'claude-sonnet-5-5': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00'), 'cache_write_input_1h': Decimal('4.00')},
-    }},
-    "3.11.1": {"recorded_at": "2026-10-21", "rates": {
-        'deepseek-v4.1-flash': {'input': Decimal('0.30'), 'cached_input': Decimal('0.006'), 'cache_write_input': Decimal('0.30'), 'output': Decimal('1.20')},
-        'gpt-6-astra': {'input': Decimal('10.00'), 'cached_input': Decimal('1.00'), 'cache_write_input': Decimal('12.50'), 'output': Decimal('50.00')},
-        'gpt-6.1-sol': {'input': Decimal('2.00'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00')},
-        'gpt-6-luna': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50')},
-        'gemini-3.8-flash': {'input': Decimal('0.75'), 'cached_input': Decimal('0.075'), 'cache_write_input': Decimal('0.0416666666666667'), 'output': Decimal('3.75')},
-        'muse-spark-1.3-contributor-free': {'input': Decimal('0.10'), 'cached_input': Decimal('0.002'), 'cache_write_input': Decimal('0.10'), 'output': Decimal('0.20')},
-        'nemotron-3-ultra-free': {'input': Decimal('0.50'), 'cached_input': Decimal('0.10'), 'cache_write_input': Decimal('0.50'), 'output': Decimal('2.20')},
-        'claude-opus-5-5': {'input': Decimal('4.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('5.00'), 'output': Decimal('20.00'), 'cache_write_input_1h': Decimal('8.00')},
-        'claude-haiku-5-5': {'input': Decimal('0.10'), 'cached_input': Decimal('0.01'), 'cache_write_input': Decimal('0.125'), 'output': Decimal('0.50'), 'cache_write_input_1h': Decimal('0.20')},
-        'claude-sonnet-5-5': {'input': Decimal('2.00'), 'cached_input': Decimal('0.20'), 'cache_write_input': Decimal('2.50'), 'output': Decimal('10.00'), 'cache_write_input_1h': Decimal('4.00')},
+    "4.2.0": {"recorded_at": "2026-10-27", "next_version": "4.4.0", "changes": {}},
+    "3.12.0": {"recorded_at": "2026-10-25", "next_version": "4.2.0", "changes": {}},
+    "3.11.1": {"recorded_at": "2026-10-21", "next_version": "3.12.0", "changes": {
+        "claude-sonnet-5-5": {"cached_input": Decimal("0.20")},
     }},
 }
 _PRICE_CONTEXT = ContextVar("obsidian_usage_price_version", default=PRICE_VERSION)
@@ -59,9 +42,20 @@ def active_price_version() -> str:
     return _PRICE_CONTEXT.get()
 
 
+def _usage_rates_for_version(version: str) -> dict:
+    if version == PRICE_VERSION:
+        return STANDARD_USAGE_RATES
+    history = PRICE_HISTORY[version]
+    # コピーに差分を適用し、現在表や他の価格版を変更しない。
+    rates = {model: dict(values) for model, values in
+             _usage_rates_for_version(history["next_version"]).items()}
+    for model, changes in history["changes"].items():
+        rates.setdefault(model, {}).update(changes)
+    return rates
+
+
 def active_usage_rates() -> dict:
-    version = active_price_version()
-    return STANDARD_USAGE_RATES if version == PRICE_VERSION else PRICE_HISTORY[version]["rates"]
+    return _usage_rates_for_version(active_price_version())
 
 
 @contextmanager

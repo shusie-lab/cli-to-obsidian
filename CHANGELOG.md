@@ -5,6 +5,16 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [4.4.0] - 2026-11-18
+
+### Added
+
+- GPT-6.2 Sol・GPT-6.2 Astraの標準API単価によるUSD参考換算に対応
+
+### Changed
+
+- 価格履歴を単価の変更点のみの保存にして重複データを削減。過去版でも後から追加されたモデルの参考換算に対応
+
 ## [4.3.0] - 2026-10-28
 
 ### Added

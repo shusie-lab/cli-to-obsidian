@@ -11,6 +11,22 @@
 # DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
 # https://api-docs.deepseek.com/quick_start/pricing/
 STANDARD_USAGE_RATES = {
+    # 2026-11-18確認。cache writeは30分保持のStandard単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.2-astra
+    "gpt-6.2-astra": {
+        "input": Decimal("8.00"),
+        "cached_input": Decimal("0.40"),
+        "cache_write_input": Decimal("10.00"),
+        "output": Decimal("40.00"),
+    },
+    # 2026-11-18確認。cache writeは30分保持のStandard単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.2-sol
+    "gpt-6.2-sol": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+    },
     # 2026-10-25: https://platform.claude.com/docs/en/models/fable-5-1/overview
     "claude-fable-5-1": {
         "input": Decimal("10.00"),
