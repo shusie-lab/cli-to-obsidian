@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "4.4.0"
+__version__ = "4.6.0"
 
 import json
 import math
@@ -19,7 +19,9 @@ import fcntl
 import hashlib
 import subprocess
 import tempfile
+from bisect import bisect_right
 from contextlib import contextmanager
+from decimal import Decimal
 from functools import wraps
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -40,6 +42,647 @@ OBSIDIAN_VAULT = Path(
 )
 DEFAULT_OUTPUT_DIR = "生成AI/ChatLog"
 DEFAULT_SOURCE = "antigravity-cli"
+APPLY_LONG_CONTEXT_PRICING = False
+
+# BEGIN GENERATED: usage-prices
+# 参考単価の正本。Opus 5.5のcache readは2026-10-06に公式資料で確認。
+# https://developers.openai.com/api/docs/pricing
+# https://platform.claude.com/docs/en/about-claude/pricing
+# https://dev.meta.ai/docs/pricing-rate-limits/
+# https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b
+# Gemini 3.8 Flash: 2026-10-06時点のStandard（年末までの割引価格）。
+# https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash
+# https://openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints
+# Haiku 5.5: 2026-10-09確認。10万token超は全token種別で5倍。
+# https://platform.claude.com/docs/en/models/haiku-5-5/overview
+# DeepSeek V4.1 Flash: 2026-10-16確認。固定の参考換算にはピーク単価を使用。
+# https://api-docs.deepseek.com/quick_start/pricing/
+STANDARD_USAGE_RATES = {
+    # 2026-11-18確認。cache writeは30分保持のStandard単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.2-astra
+    "gpt-6.2-astra": {
+        "input": Decimal("8.00"),
+        "cached_input": Decimal("0.40"),
+        "cache_write_input": Decimal("10.00"),
+        "output": Decimal("40.00"),
+    },
+    # 2026-11-18確認。cache writeは30分保持のStandard単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.2-sol
+    "gpt-6.2-sol": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+    },
+    # 2026-10-25: https://platform.claude.com/docs/en/models/fable-5-1/overview
+    "claude-fable-5-1": {
+        "input": Decimal("10.00"),
+        "cached_input": Decimal("0.25"),
+        "cache_write_input": Decimal("12.50"),
+        "output": Decimal("50.00"),
+        "cache_write_input_1h": Decimal("20.00"),
+    },
+    "deepseek-v4.1-flash": {
+        "input": Decimal("0.30"),
+        "cached_input": Decimal("0.006"),
+        # 自動キャッシュの書込分もcache missの入力単価で換算。
+        "cache_write_input": Decimal("0.30"),
+        "output": Decimal("1.20"),
+    },
+    "gpt-6-astra": {
+        "input": Decimal("10.00"),
+        "cached_input": Decimal("1.00"),
+        "cache_write_input": Decimal("12.50"),
+        "output": Decimal("50.00"),
+    },
+    "gpt-6.1-sol": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+    },
+    # GPT-6.1 Terra: 2026-10-27確認。cache writeは30分保持の標準単価。
+    # https://developers.openai.com/api/docs/models/gpt-6.1-terra
+    "gpt-6.1-terra": {
+        "input": Decimal("1.00"),
+        "cached_input": Decimal("0.05"),
+        "cache_write_input": Decimal("1.25"),
+        "output": Decimal("5.00"),
+    },
+    "gpt-6-luna": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.01"),
+        "cache_write_input": Decimal("0.125"),
+        "output": Decimal("0.50"),
+    },
+    # 2026-11-19確認。2026-11-30までのStandard割引価格（12月1日以降はinput 4.00 / cached 0.20 / output 20.00）。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-argon
+    # https://openrouter.ai/api/v1/models/google/gemini-4-argon/endpoints
+    "gemini-4-argon": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.1875"),
+        "output": Decimal("10.00"),
+    },
+    # 2026-11-19確認。Standard単価。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-neon
+    # https://openrouter.ai/api/v1/models/google/gemini-4-neon/endpoints
+    "gemini-4-neon": {
+        "input": Decimal("3.00"),
+        "cached_input": Decimal("0.15"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.0833333333333333"),
+        "output": Decimal("15.00"),
+    },
+    # 2026-11-19確認。Standard単価。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-hydrogen
+    # https://openrouter.ai/api/v1/models/google/gemini-4-hydrogen/endpoints
+    "gemini-4-hydrogen": {
+        "input": Decimal("1.50"),
+        "cached_input": Decimal("0.075"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.0833333333333333"),
+        "output": Decimal("7.50"),
+    },
+    "gemini-3.8-flash": {
+        "input": Decimal("0.75"),
+        "cached_input": Decimal("0.075"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        # Googleの時間単位のstorage priceとは別の掲載単位。
+        "cache_write_input": Decimal("0.0416666666666667"),
+        "output": Decimal("3.75"),
+    },
+    "muse-spark-1.3-contributor-free": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.002"),
+        "cache_write_input": Decimal("0.10"),
+        "output": Decimal("0.20"),
+    },
+    "nemotron-3-ultra-free": {
+        "input": Decimal("0.50"),
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("0.50"),
+        "output": Decimal("2.20"),
+    },
+    "claude-opus-5-5": {
+        "input": Decimal("4.00"),
+        "cached_input": Decimal("0.20"),
+        "cache_write_input": Decimal("5.00"),
+        "output": Decimal("20.00"),
+        "cache_write_input_1h": Decimal("8.00"),
+    },
+    "claude-haiku-5-5": {
+        "input": Decimal("0.10"),
+        "cached_input": Decimal("0.01"),
+        "cache_write_input": Decimal("0.125"),
+        "output": Decimal("0.50"),
+        "cache_write_input_1h": Decimal("0.20"),
+    },
+    "claude-sonnet-5-5": {
+        "input": Decimal("2.00"),
+        # 2026-10-25: https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+        "cached_input": Decimal("0.10"),
+        "cache_write_input": Decimal("2.50"),
+        "output": Decimal("10.00"),
+        "cache_write_input_1h": Decimal("4.00"),
+    },
+}
+
+# 従来の呼び出し名との互換alias。単価の正本は上の辞書1つだけ。
+USAGE_COST_USD_PER_1M_TOKEN_TYPE = STANDARD_USAGE_RATES
+# END GENERATED: usage-prices
+
+# BEGIN GENERATED: usage-price-history
+from contextvars import ContextVar
+
+PRICE_VERSION = "4.5.0"
+PRICE_RECORDED_AT = "2026-11-19"
+PRICE_CHECKED_AT = {
+    "gemini-4-argon": "2026-11-19",
+    "gemini-4-neon": "2026-11-19",
+    "gemini-4-hydrogen": "2026-11-19",
+    "gpt-6.2-astra": "2026-11-18",
+    "gpt-6.2-sol": "2026-11-18",
+    'claude-fable-5-1': "2026-10-28",
+    'deepseek-v4.1-flash': "2026-10-28",
+    'gpt-6-astra': "2026-10-28",
+    'gpt-6.1-sol': "2026-10-28",
+    'gpt-6.1-terra': "2026-10-28",
+    'gpt-6-luna': "2026-10-28",
+    'gemini-3.8-flash': "2026-10-28",
+    'muse-spark-1.3-contributor-free': "2026-10-28",
+    'nemotron-3-ultra-free': "2026-10-28",
+    'claude-opus-5-5': "2026-10-28",
+    'claude-haiku-5-5': "2026-10-28",
+    'claude-sonnet-5-5': "2026-10-28",
+}
+PRICE_SOURCES = {
+    "claude": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "gpt": "https://developers.openai.com/api/docs/pricing",
+    "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "muse": "https://dev.meta.ai/docs/pricing-rate-limits/",
+    "nemotron": "https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b",
+}
+# 現在表から過去へ戻す差分。next_versionは直後の価格版を明示する。
+# changesは変更したtoken単価の旧値。削除モデルは全単価を残し、追加モデルは除外しない。
+PRICE_HISTORY = {
+    "4.4.0": {"recorded_at": "2026-11-18", "next_version": "4.5.0", "changes": {}},
+    "4.2.0": {"recorded_at": "2026-10-27", "next_version": "4.4.0", "changes": {}},
+    "3.12.0": {"recorded_at": "2026-10-25", "next_version": "4.2.0", "changes": {}},
+    "3.11.1": {"recorded_at": "2026-10-21", "next_version": "3.12.0", "changes": {
+        "claude-sonnet-5-5": {"cached_input": Decimal("0.20")},
+    }},
+}
+_PRICE_CONTEXT = ContextVar("obsidian_usage_price_version", default=PRICE_VERSION)
+
+
+def active_price_version() -> str:
+    return _PRICE_CONTEXT.get()
+
+
+def _usage_rates_for_version(version: str) -> dict:
+    if version == PRICE_VERSION:
+        return STANDARD_USAGE_RATES
+    history = PRICE_HISTORY[version]
+    # コピーに差分を適用し、現在表や他の価格版を変更しない。
+    rates = {model: dict(values) for model, values in
+             _usage_rates_for_version(history["next_version"]).items()}
+    for model, changes in history["changes"].items():
+        rates.setdefault(model, {}).update(changes)
+    return rates
+
+
+def active_usage_rates() -> dict:
+    return _usage_rates_for_version(active_price_version())
+
+
+@contextmanager
+def usage_price_version(version: str):
+    if version != PRICE_VERSION and version not in PRICE_HISTORY:
+        raise ValueError("未登録の価格版: " + str(version))
+    token = _PRICE_CONTEXT.set(version)
+    try:
+        yield
+    finally:
+        _PRICE_CONTEXT.reset(token)
+
+
+def note_price_version(content: str) -> str | None:
+    frontmatter = re.match(r"\A---\s*\n(.*?)\n---", content, re.DOTALL)
+    if not frontmatter:
+        return None
+    usage = re.search(r"(?m)^usage:\n((?:[ \t].*\n|\n)*)", frontmatter.group(1) + "\n")
+    match = re.search(r'^  price_version: (.+)$', usage.group(1), re.M) if usage else None
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except ValueError:
+        value = match.group(1).strip()
+    return value if isinstance(value, str) else None
+
+
+def usage_price_fields(usage: dict) -> list[str]:
+    version = active_price_version()
+    recorded = PRICE_RECORDED_AT if version == PRICE_VERSION else PRICE_HISTORY[version]["recorded_at"]
+    models = sorted({reference_price_model(model) for model in usage.get("by_model", {})})
+    sources = {key: value for key, value in PRICE_SOURCES.items()
+               if any(model.startswith(key + "-") for model in models)}
+    # 過去料金の正確な適用開始日は確認できないため推定しない。
+    return ["  price_version: " + yaml_quote(version),
+            "  price_recorded_at: " + yaml_quote(recorded),
+            "  price_effective_from: null", "  price_checked_at:" + ("" if models else " {}"),
+            *("    " + yaml_quote(model) + ": " + (yaml_quote(PRICE_CHECKED_AT[model])
+              if version == PRICE_VERSION and model in PRICE_CHECKED_AT else "null")
+              for model in models), "  price_sources:" + ("" if sources else " {}"),
+            *("    " + yaml_quote(key) + ": " + yaml_quote(value) for key, value in sources.items())]
+# END GENERATED: usage-price-history
+
+# BEGIN GENERATED: usage-model
+def _normalize_usage_model(model: object) -> str:
+    """プロバイダ接頭辞などを除き、単価表と照合できるモデル名へ変換する。"""
+    name = str(model or "").strip().lower()
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    aliases = {
+        "claude-fable-5.1": "claude-fable-5-1",
+        "deepseek-flash": "deepseek-v4.1-flash",
+        "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash:free": "deepseek-v4.1-flash",
+        "gemini3.8-flash": "gemini-3.8-flash",
+        "gemini-4-argon-20261013": "gemini-4-argon",
+        "gemini-4-neon-20261118": "gemini-4-neon",
+        "gemini-4-hydrogen-20261112": "gemini-4-hydrogen",
+        "nemotron-3-ultra-550b-a55b:free": "nemotron-3-ultra-free",
+        "claude-opus-5.5": "claude-opus-5-5",
+        "claude-haiku-5.5": "claude-haiku-5-5",
+        "claude-sonnet-5.5": "claude-sonnet-5-5",
+        "muse-spark-1.3-contributor:free": "muse-spark-1.3-contributor-free",
+        "muse-spark-1.3-contributor": "muse-spark-1.3-contributor-free",
+    }
+    return aliases.get(name, name)
+# END GENERATED: usage-model
+
+# BEGIN GENERATED: usage-summary
+USAGE_FIELDS = (
+    "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+    "output_tokens", "reasoning_output_tokens", "total_tokens",
+)
+USAGE_TOKEN_FIELDS = USAGE_FIELDS
+
+
+def _empty_usage_totals() -> dict:
+    return {field: 0 for field in USAGE_FIELDS}
+
+
+def _decimal_cost(value: object) -> Decimal | None:
+    """数値・文字列金額を有限で非負のDecimalへ変換する。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
+def calculate_usage_cost(rates: dict, usage: dict, *, input_multiplier=1, output_multiplier=1) -> Decimal | None:
+    """各recordを換算し、キャッシュ・推論の内数を二重計上しない。"""
+    try:
+        values = [usage.get(key, 0) for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens")]
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            return None
+        total_input, cached, written, output = values
+        fresh = total_input - cached - written
+        if fresh < 0:
+            return None
+        return ((
+            (Decimal(fresh) * rates["input"] + Decimal(cached) * rates["cached_input"]
+             + Decimal(written) * rates["cache_write_input"]) * Decimal(str(input_multiplier))
+            + Decimal(output) * rates["output"] * Decimal(str(output_multiplier))
+        ) / Decimal(1_000_000)).normalize()
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return None
+
+
+def sum_reported_costs(reports) -> dict | None:
+    """CLIの回答単位の報告値を合計する。セッション累計は加算しない。"""
+    reports = [report for report in reports if report and report.get("scope") == "message_sum"]
+    if not reports:
+        return None
+    total = {"source": ", ".join(sorted({report["source"] for report in reports})),
+             "scope": "message_sum", "available_records": 0, "total_records": 0}
+    for report in reports:
+        total["total_records"] += report.get("total_records", 1)
+        total["available_records"] += report.get("available_records", 0)
+        amount = _decimal_cost(report.get("usd"))
+        if amount is not None:
+            total["usd"] = total.get("usd", Decimal(0)) + amount
+    if "usd" in total and total["available_records"] < total["total_records"]:
+        total["incomplete"] = True
+    return total
+
+
+def reported_cost_fields(report: dict | None) -> list[str]:
+    if not report:
+        return []
+    lines = ["reported_cost:", "  source: " + yaml_quote(report["source"]),
+             "  scope: " + yaml_quote(report["scope"])]
+    amount = _decimal_cost(report.get("usd"))
+    lines.append("  usd: " + (format(amount, "f") if amount is not None else "null"))
+    if report.get("incomplete"):
+        lines.append("  incomplete: true")
+    for key in ("available_records", "total_records"):
+        if key in report:
+            lines.append("  " + key + ": " + str(report[key]))
+    if report.get("observed_at"):
+        lines.append("  observed_at: " + yaml_quote(report["observed_at"]))
+    return lines
+
+
+def recover_reported_cost(content: str) -> dict | None:
+    """state喪失・再構成時にノートの最後のCLI報告値を復旧する。"""
+    fm = re.match(r"\A---\s*\n(.*?)\n---", content, re.S)
+    block = re.search(r"(?m)^reported_cost:\n((?:  .*\n)*)", fm.group(1) + "\n") if fm else None
+    if not block:
+        return None
+    fields = {}
+    for key, raw in re.findall(r"(?m)^  ([a-z_]+): (.*)$", block.group(1)):
+        try:
+            fields[key] = json.loads(raw, parse_float=Decimal)
+        except ValueError:
+            fields[key] = raw
+    if not isinstance(fields.get("source"), str) or fields.get("scope") not in {"session", "message_sum"}:
+        return None
+    amount = _decimal_cost(fields.get("usd"))
+    if amount is not None:
+        fields["usd"] = str(amount)
+    else:
+        fields.pop("usd", None)
+    return fields
+
+
+def reported_cost_label(report: dict) -> str:
+    amount = _format_usd(report.get("usd"))
+    if amount is None:
+        return "未取得"
+    return amount + ("（部分取得）" if report.get("incomplete") else "")
+
+
+def build_reported_cost_section(report: dict | None) -> str:
+    if not report:
+        return ""
+    scope = "セッション累計" if report.get("scope") == "session" else "回答の合計"
+    return "💵 **取得コスト (CLI報告値)**: " + reported_cost_label(report) + "（" + scope + "）\n"
+
+
+def summarize_usage(messages, *, estimate_missing: bool = True) -> dict | None:
+    """provider側で重複排除・正規化したrecordを、各recordの金額を維持して合計する。"""
+    total = _empty_usage_totals()
+    by_model = {}
+    count = priced = 0
+    total_cost = Decimal(0)
+    long_context = False
+    reports = []
+    model_reports = {}
+    for message in messages:
+        usage = message.get("usage") if message.get("type") == "assistant" else None
+        if not isinstance(usage, dict):
+            continue
+        count += 1
+        model = str(message.get("model") or "unknown")
+        entry = by_model.setdefault(model, _empty_usage_totals())
+        if usage.get("reported_cost_source"):
+            amount = _decimal_cost(usage.get("reported_cost_usd"))
+            report = {"source": usage["reported_cost_source"], "scope": "message_sum",
+                      "available_records": int(amount is not None), "total_records": 1}
+            if amount is not None:
+                report["usd"] = amount
+            reports.append(report)
+            model_reports.setdefault(model, []).append(report)
+        for field in USAGE_FIELDS:
+            value = int(usage.get(field, 0))
+            total[field] += value
+            entry[field] += value
+        long_context = long_context or bool(usage.get("long_context"))
+        value = _decimal_cost(usage.get("cost_usd"))
+        if value is None and estimate_missing:
+            value = _usage_cost(model, usage)
+        if value is not None:
+            priced += 1
+            total_cost += value
+            entry["cost_usd"] = entry.get("cost_usd", Decimal(0)) + value
+        else:
+            entry["cost_unavailable"] = True
+    if not count:
+        return None
+    for entry in by_model.values():
+        if "cost_usd" in entry and entry.pop("cost_unavailable", False):
+            entry["cost_incomplete"] = True
+    total["by_model"] = by_model
+    if reports:
+        total["reported_cost"] = sum_reported_costs(reports)
+        for model, items in model_reports.items():
+            by_model[model]["reported_cost"] = sum_reported_costs(items)
+    if priced:
+        total["total_cost_usd"] = total_cost
+        if priced < count:
+            total["cost_incomplete"] = True
+    else:
+        total["cost_unavailable"] = True
+    if long_context:
+        total["long_context"] = True
+    return total
+
+
+def usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    if not usage:
+        return []
+    lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields(usage)]
+    lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
+    if usage.get("tokens_incomplete"):
+        lines.append("  tokens_incomplete: true")
+    if "total_cost_usd" in usage:
+        lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
+        if usage.get("cost_incomplete"):
+            lines.append("  cost_incomplete: true")
+    else:
+        lines.append("  cost_unavailable: true")
+    scope = usage.get("scope")
+    if scope:
+        lines.append("  scope:")
+        for key in ("parent_tokens", "subagent_tokens", "unattributed_subagent_tokens"):
+            lines.append(f"    {key}: {int(scope.get(key, 0))}")
+    lines.append("  by_model:")
+    for model, entry in usage.get("by_model", {}).items():
+        lines.append(f"    {yaml_quote(model)}:")
+        lines.extend(f"      {field}: {int(entry.get(field, 0))}" for field in USAGE_FIELDS)
+        if "cost_usd" in entry:
+            lines.append(f"      cost_usd: {format(Decimal(str(entry['cost_usd'])), 'f')}")
+            if entry.get("cost_incomplete") or entry.get("cost_unavailable"):
+                lines.append("      cost_incomplete: true")
+        else:
+            lines.append("      cost_unavailable: true")
+        report = entry.get("reported_cost")
+        if report:
+            amount = _decimal_cost(report.get("usd"))
+            lines.append("      reported_cost_usd: " + (format(amount, "f") if amount is not None else "null"))
+            if report.get("incomplete"):
+                lines.append("      reported_cost_incomplete: true")
+    lines.extend(reported_cost_fields(usage.get("reported_cost")))
+    return lines
+
+
+def build_usage_frontmatter_fields(usage: dict | None) -> list[str]:
+    """増分saverの従来API。"""
+    return usage_frontmatter_fields(usage)
+
+
+def _format_usd(value: object) -> str | None:
+    amount = _decimal_cost(value)
+    return f"${format(amount, 'f')}" if amount is not None else None
+
+
+def _usage_cost_label(usage: dict, key: str) -> str:
+    amount = _format_usd(usage.get(key))
+    if amount is None:
+        return "換算不可"
+    partial = usage.get("cost_incomplete") or usage.get("cost_unavailable")
+    return amount + ("（部分換算）" if partial else "")
+
+
+def cache_hit_label(usage: dict) -> str:
+    """入力tokenに占めるcache readの割合。書込・出力は分子に含めない。"""
+    total = usage.get("input_tokens")
+    cached = usage.get("cached_input_tokens")
+    if (isinstance(total, bool) or isinstance(cached, bool)
+            or not isinstance(total, int) or not isinstance(cached, int)
+            or total <= 0 or cached < 0 or cached > total):
+        return "Cache: N/A"
+    return f"Cache: {Decimal(cached) * 100 / Decimal(total):.1f}%"
+
+
+def build_usage_section(usage: dict | None) -> str:
+    if not usage:
+        return "💰 **Usage (USD換算)**: N/A\n"
+    parts = [f"{model} {_usage_cost_label(entry, 'cost_usd')} · {cache_hit_label(entry)}" for model, entry in usage.get("by_model", {}).items()]
+    details = f" ({'、'.join(parts)})" if parts else ""
+    scope = usage.get("scope")
+    scope_line = ""
+    if scope:
+        scope_line = ("📊 **Usage集計範囲**: 親 " + f"{int(scope.get('parent_tokens', 0)):,} tok"
+            + "・子 " + f"{int(scope.get('subagent_tokens', 0)):,} tok"
+            + "（回答に紐付かない子 " + f"{int(scope.get('unattributed_subagent_tokens', 0)):,} tok）\n")
+    coverage = " · token部分取得" if usage.get("tokens_incomplete") else ""
+    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details} · {cache_hit_label(usage)}{coverage}\n"
+            + scope_line + build_reported_cost_section(usage.get("reported_cost")))
+
+
+def format_message_usage(usage: dict | None, subagent_usage: dict | None = None) -> str:
+    if not usage:
+        return ""
+    warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
+    coverage = "（部分取得）" if usage.get("tokens_incomplete") else ""
+    label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok{coverage} · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    if usage.get("reported_cost"):
+        label += " · 取得コスト: " + reported_cost_label(usage["reported_cost"])
+    if subagent_usage:
+        parts = [f"{model} {int(entry.get('total_tokens', 0)):,} tok・{_usage_cost_label(entry, 'cost_usd')}"
+                 for model, entry in sorted(subagent_usage.get("by_model", {}).items())]
+        if parts:
+            label += f" ({'、'.join(parts)})"
+    return label + " · " + cache_hit_label(usage)
+
+
+def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | None:
+    """換算済み小計を足す。再換算せず長文条件をrecord単位に維持する。"""
+    if not first:
+        return second
+    if not second:
+        return first
+    merged = _empty_usage_totals()
+    for field in USAGE_FIELDS:
+        merged[field] = int(first.get(field, 0)) + int(second.get(field, 0))
+    by_model = {}
+    for source in (first, second):
+        for model, entry in source.get("by_model", {}).items():
+            target = by_model.setdefault(model, _empty_usage_totals())
+            for field in USAGE_FIELDS:
+                target[field] += int(entry.get(field, 0))
+            if "cost_usd" in entry:
+                target["cost_usd"] = target.get("cost_usd", Decimal(0)) + Decimal(str(entry["cost_usd"]))
+            if entry.get("cost_unavailable") or entry.get("cost_incomplete"):
+                target["cost_unavailable"] = True
+    for entry in by_model.values():
+        if "cost_usd" in entry and entry.pop("cost_unavailable", False):
+            entry["cost_incomplete"] = True
+    merged["by_model"] = by_model
+    reported = sum_reported_costs(source.get("reported_cost") for source in (first, second))
+    if reported:
+        merged["reported_cost"] = reported
+    for model, entry in by_model.items():
+        reported = sum_reported_costs(source.get("by_model", {}).get(model, {}).get("reported_cost")
+                                     for source in (first, second))
+        if reported:
+            entry["reported_cost"] = reported
+    if "total_cost_usd" in first or "total_cost_usd" in second:
+        merged["total_cost_usd"] = sum((Decimal(str(source.get("total_cost_usd", 0))) for source in (first, second)), Decimal(0))
+        if any(source.get("cost_unavailable") or source.get("cost_incomplete") for source in (first, second)):
+            merged["cost_incomplete"] = True
+    else:
+        merged["cost_unavailable"] = True
+    if first.get("long_context") or second.get("long_context"):
+        merged["long_context"] = True
+    if first.get("tokens_incomplete") or second.get("tokens_incomplete"):
+        merged["tokens_incomplete"] = True
+    return merged
+# END GENERATED: usage-summary
+
+# BEGIN GENERATED: usage-reference-cost
+LONG_CONTEXT_INPUT_TOKENS = 272_000
+
+
+def reference_price_model(model: object) -> str:
+    name = _normalize_usage_model(model)
+    if (name not in active_usage_rates() and name.endswith("-free")
+            and name[:-len("-free")] in active_usage_rates()):
+        name = name[:-len("-free")]
+    return name
+
+
+def is_long_context_usage(model: object, usage: dict) -> bool:
+    """設定が有効な場合、登録済みGPTのリクエスト単位で長文料金を判定する。"""
+    name = reference_price_model(model)
+    tokens = usage.get("input_tokens", 0)
+    return (APPLY_LONG_CONTEXT_PRICING
+            and isinstance(tokens, int) and not isinstance(tokens, bool)
+            and name.startswith("gpt-") and name in active_usage_rates()
+            and tokens > LONG_CONTEXT_INPUT_TOKENS)
+
+
+def haiku_prompt_price_multiplier(model: object, usage: dict) -> int:
+    """通常入力・cache read/writeの合計が10万tokenを超えた場合は5倍。"""
+    tokens = usage.get("input_tokens", 0)
+    return 5 if (reference_price_model(model) == "claude-haiku-5-5"
+                 and isinstance(tokens, int) and not isinstance(tokens, bool)
+                 and tokens > 100_000) else 1
+
+
+def _usage_cost(model: object, usage: dict) -> Decimal | None:
+    """raw recordを正規化したtoken内訳から標準API参考換算を行う。"""
+    rates = active_usage_rates().get(reference_price_model(model))
+    if rates is None or usage.get("pricing_unknown"):
+        return None
+    long_context = is_long_context_usage(model, usage)
+    haiku_multiplier = haiku_prompt_price_multiplier(model, usage)
+    return calculate_usage_cost(
+        rates, usage, input_multiplier=2 if long_context else haiku_multiplier,
+        output_multiplier=Decimal("1.5") if long_context else haiku_multiplier,
+    )
+# END GENERATED: usage-reference-cost
 
 
 # BEGIN GENERATED: output-directory
@@ -1343,7 +1986,155 @@ def extract_model_name(content) -> str | None:
     return None
 
 
-def load_jsonl_messages(jsonl_path: Path) -> list:
+# BEGIN GENERATED: incremental-answer-usage
+def _answer_usage_groups(messages: list[dict]) -> list[tuple[int, dict | None, dict | None]]:
+    """User発話ごとにAgentMessageを回答単位へまとめる。"""
+    groups: list[tuple[int, dict | None, dict | None]] = []
+    turn_index = 0
+    last_model = None
+    last_turn_id = None
+    for message in messages:
+        turn_id = message.get("turn_id") or None
+        if message.get("type") == "user_message":
+            last_turn_id = turn_id
+            turn_index += 1
+            last_model = None
+            continue
+        if message.get("type") != "agent_message" or not str(message.get("message", "")).strip():
+            continue
+        if message.get("after_turn_boundary") or (turn_id and last_turn_id and turn_id != last_turn_id):
+            turn_index += 1
+            last_model = None
+        last_turn_id = turn_id or last_turn_id
+        model = format_model_name(message.get("model", ""), message.get("effort", ""))
+        if groups and model == last_model:
+            _, usage, subagent_usage = groups[-1]
+            groups[-1] = (
+                turn_index,
+                _merge_usage_summaries(usage, message.get("usage")),
+                _merge_usage_summaries(subagent_usage, message.get("subagent_usage")),
+            )
+        else:
+            groups.append((turn_index, message.get("usage"), message.get("subagent_usage")))
+            last_model = model
+    return groups
+
+
+def refresh_answer_usage_metadata(content: str, messages: list[dict]) -> str:
+    """遅れて書かれたusage recordを既存assistant calloutへ反映する。
+
+    本文・ユーザーcallout・既存のquota行は変更せず、assistant metadata内のUsage行だけを
+    親ターンとモデルの連続区間に沿って差し替える。過去に同じ回答が複数calloutへ
+    分割された場合は、その最後のcalloutにUsageを表示する。
+    """
+    groups = _answer_usage_groups(messages)
+    spans = _assistant_header_spans(content)
+    if not groups or not spans:
+        return content
+    lines = content.splitlines(keepends=True)
+    user_positions = []
+    active_fence = None
+    for index, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if active_fence is not None:
+            if (
+                marker is not None
+                and marker[0] == active_fence[0]
+                and marker[1] >= active_fence[1]
+                and not marker[2].strip()
+            ):
+                active_fence = None
+            continue
+        if marker is not None:
+            active_fence = marker[:2]
+            continue
+        if line.rstrip("\r\n") in ("> [!QUESTION] User", HIDDEN_USER_BOUNDARY):
+            user_positions.append(index)
+
+    groups_by_turn: dict[int, list[tuple[dict | None, dict | None]]] = {}
+    for turn_index, usage, subagent_usage in groups:
+        groups_by_turn.setdefault(turn_index, []).append((usage, subagent_usage))
+    spans_by_turn: dict[int, list[tuple[int, int]]] = {}
+    for start, end in spans:
+        turn_index = bisect_right(user_positions, start)
+        spans_by_turn.setdefault(turn_index, []).append((start, end))
+
+    replacements = []
+    for turn_index, turn_spans in spans_by_turn.items():
+        runs: list[list[tuple[int, int]]] = []
+        last_model = None
+        for start, end in turn_spans:
+            model = next((line for line in lines[start + 1:end] if line.startswith("> <small>🤖 ")), "")
+            if runs and model == last_model:
+                runs[-1].append((start, end))
+            else:
+                runs.append([(start, end)])
+            last_model = model
+        turn_groups = groups_by_turn.get(turn_index, [])
+        if len(runs) != len(turn_groups):
+            logger.warning("回答Usageのcallout対応を特定できません: turn=%s", turn_index)
+            continue
+        for run, (usage, subagent_usage) in zip(runs, turn_groups):
+            usage_text = format_message_usage(usage, subagent_usage)
+            for run_index, (start, end) in enumerate(run):
+                metadata_lines = [
+                    line for line in lines[start:end]
+                    if not re.match(r"^> <small>Usage: .*?</small>\r?\n?$", line)
+                ]
+                if run_index == len(run) - 1 and usage_text:
+                    newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+                    timing_index = next((index for index, line in enumerate(metadata_lines)
+                                         if line.startswith("> <small>⏱ 回答所要時間: ")), len(metadata_lines))
+                    metadata_lines.insert(timing_index, f"> <small>{usage_text}</small>{newline}")
+                replacements.append((start, end, metadata_lines))
+    for start, end, metadata_lines in sorted(replacements, reverse=True):
+        lines[start:end] = metadata_lines
+    return "".join(lines)
+# END GENERATED: incremental-answer-usage
+
+
+def agy_usage_model(value: object) -> str:
+    """agyのGeminiモデル名から、価格照合に使うモデルIDを返す。"""
+    name = _normalize_usage_model(value)
+    match = re.fullmatch(
+        r"(gemini-4-(?:argon|neon|hydrogen)|gemini-3\.8-flash)"
+        r"(?:-(?:low|medium|high|xhigh|max)| \((?:low|medium|high|xhigh|max)\))?",
+        name.replace(" ", "-", 2) if name.startswith("gemini ") else name,
+    )
+    return match[1] if match else name or "unknown"
+
+
+def agy_response_model(row: dict, selected_model: str | None) -> str:
+    model = row.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else selected_model or ""
+
+
+def agy_usage_record(row: dict, selected_model: str | None) -> dict:
+    model = agy_response_model(row, selected_model)
+    fresh, cached, output = (row.get(key) for key in ("input_tokens", "cache_read_tokens", "output_tokens"))
+    usage = None
+    if all(type(value) is int and value >= 0 for value in (fresh, cached, output)):
+        usage = {"input_tokens": fresh + cached, "cached_input_tokens": cached,
+                 "output_tokens": output, "total_tokens": fresh + cached + output}
+    return {"type": "assistant", "model": agy_usage_model(model), "usage": usage}
+
+
+def summarize_agy_usage(records: list[dict]) -> dict | None:
+    usage = summarize_usage(records)
+    if usage is not None:
+        missing = {record["model"] for record in records if record["usage"] is None}
+        if missing:
+            usage["tokens_incomplete"] = True
+            if "total_cost_usd" in usage:
+                usage["cost_incomplete"] = True
+            for model in missing & usage["by_model"].keys():
+                entry = usage["by_model"][model]
+                if "cost_usd" in entry:
+                    entry["cost_incomplete"] = True
+    return usage
+
+
+def load_jsonl_messages(jsonl_path: Path, *, usage_records: list[dict] | None = None) -> list:
     """
     JSONL ファイルを読み込み、type が USER_INPUT/PLANNER_RESPONSE の行だけを返す。
     PLANNER_RESPONSE のうち、tool_calls が存在する（中間ステップ）ものは除外する。
@@ -1369,6 +2160,8 @@ def load_jsonl_messages(jsonl_path: Path) -> list:
     # step_index で最新のものを保持（JSONLには更新行が含まれる場合があるため）
     unique_messages: dict[int, dict] = {}
     for msg in all_msgs:
+        if not isinstance(msg, dict):
+            continue
         idx = msg.get("step_index")
         try:
             # JSONL の世代によって数値と数値文字列が混在しても同じ step として扱う。
@@ -1382,10 +2175,12 @@ def load_jsonl_messages(jsonl_path: Path) -> list:
 
     current_model = None
     final_messages = []
+    pending_usage = []
     for i, msg in enumerate(sorted_msgs):
         msg_type = msg.get("type")
         
         if msg_type == "USER_INPUT":
+            pending_usage.clear()
             model_name = extract_model_name(msg.get("content"))
             if model_name:
                 current_model = model_name
@@ -1400,6 +2195,10 @@ def load_jsonl_messages(jsonl_path: Path) -> list:
                 })
 
         elif msg_type == "PLANNER_RESPONSE":
+            if usage_records is not None and msg.get("status") == "DONE":
+                record = agy_usage_record(msg, current_model)
+                usage_records.append(record)
+                pending_usage.append(record)
             # ツール呼び出しがある中間ステップは除外
             if msg.get("tool_calls"):
                 continue
@@ -1432,8 +2231,11 @@ def load_jsonl_messages(jsonl_path: Path) -> list:
                     "type": "agent_message",
                     "message": full_text,
                     "timestamp": msg.get("created_at", ""),
-                    "model": current_model or "",
+                    "model": agy_response_model(msg, current_model),
                 })
+                if pending_usage:
+                    final_messages[-1]["usage"] = summarize_agy_usage(pending_usage)
+                    pending_usage.clear()
 
     # この形式のcreated_atは完了時刻と確定できないため、時間は推測しない。
     return annotate_answer_timings(final_messages)
@@ -1658,6 +2460,17 @@ def quota_value(quota: dict | None, group: str, window: str, field: str):
     return quota.get(group, {}).get(window, {}).get(field, None if field == "remaining" else "")
 
 
+def format_quota_observations(first: object, last: object) -> str:
+    first_dt = _try_parse_datetime(first)
+    last_dt = _try_parse_datetime(last)
+    observations = [
+        f"{label} {observed:%Y-%m-%d %H:%M}"
+        for label, observed in (("First", first_dt), ("Latest", last_dt))
+        if observed is not None
+    ]
+    return " (" + " · ".join(observations) + " JST)" if observations else ""
+
+
 def build_quota_section(initial_quota: dict | None, final_quota: dict | None) -> str:
     lines = ["📊 **Quota**:"]
     for group, label in (("gemini", "Gemini"), ("claude", "Claude")):
@@ -1673,10 +2486,17 @@ def build_quota_section(initial_quota: dict | None, final_quota: dict | None) ->
                 value = f"{initial:.1f}% ➔ {final:.1f}%"
             else:
                 value = f"{(final if final is not None else initial):.1f}%"
-            values.append(f"{short_label}: {value}{reset_text}")
+            observations = format_quota_observations(
+                quota_value(initial_quota, group, window, "observed_at"),
+                quota_value(final_quota, group, window, "observed_at"),
+            )
+            values.append(f"{short_label}: {value}{observations}{reset_text}")
         if values:
             lines.append(f"- **{label}**: " + " / ".join(values))
     return "\n".join(lines) + "\n" if len(lines) > 1 else "📊 **Quota**: N/A\n"
+
+
+QUOTA_SECTION_PATTERN = r"\A[ \t]*📊 \*\*Quota\*\*:(?:[ \t]*N/A)?\n(?:[ \t]*-[^\n]*(?:\n|$))*"
 
 
 def add_quota_metadata(content: str, initial_quota: dict | None, final_quota: dict | None) -> str:
@@ -1697,12 +2517,25 @@ def add_quota_metadata(content: str, initial_quota: dict | None, final_quota: di
     kept.extend(build_quota_frontmatter_fields(initial_quota, final_quota))
     frontmatter, body = "\n".join(kept), content[match.end():]
     section = build_quota_section(initial_quota, final_quota)
-    pattern = r"\A[ \t]*📊 \*\*Quota\*\*:(?:[ \t]*N/A)?\n(?:[ \t]*-[^\n]*(?:\n|$))*"
-    if re.search(pattern, body):
-        body = re.sub(pattern, lambda _: section, body, count=1)
+    if re.match(QUOTA_SECTION_PATTERN, body):
+        body = re.sub(QUOTA_SECTION_PATTERN, lambda _: section, body, count=1)
     elif initial_quota or final_quota:
         body = section + "\n" + body.lstrip()
     return "---\n" + frontmatter + "\n---\n" + body
+
+
+def refresh_agy_usage_metadata(content: str, usage: dict, messages: list[dict]) -> str:
+    match = re.match(r"\A---\n(.*?)\n---\n", content, re.DOTALL)
+    if not match:
+        return content
+    frontmatter = re.sub(r"(?m)^usage:[^\n]*\n(?:[ \t][^\n]*\n)*", "", match[1] + "\n")
+    body = content[match.end():]
+    quota = re.match(QUOTA_SECTION_PATTERN, body)
+    offset = quota.end() if quota else 0
+    section = re.sub(r"\A💰 \*\*Usage \(USD換算\)\*\*:[^\n]*\n\n?", "", body[offset:])
+    body = body[:offset] + build_usage_section(usage) + "\n" + section
+    updated = "---\n" + frontmatter + "\n".join(usage_frontmatter_fields(usage)) + "\n---\n" + body
+    return refresh_answer_usage_metadata(updated, messages)
 
 
 # ============================================================
@@ -2072,7 +2905,8 @@ def _handle_stop_event(hook_input: dict) -> None:
     if not jsonl_path:
         mark_save_skipped("transcript_missing")
         return
-    all_messages = load_jsonl_messages(jsonl_path)
+    usage_records = []
+    all_messages = load_jsonl_messages(jsonl_path, usage_records=usage_records)
 
     state = load_state(session_id)
     try:
@@ -2135,11 +2969,18 @@ def _handle_stop_event(hook_input: dict) -> None:
             # 回答が未閉鎖のコードフェンスを含んでも、観測記録は本文より前に置く。
             frontmatter = re.match(r"\A---\s*\n.*?\n---(?:\r?\n|$)", refreshed, re.DOTALL)
             offset = frontmatter.end() if frontmatter else 0
+            quota = re.match(QUOTA_SECTION_PATTERN, refreshed[offset:])
+            if quota:
+                offset += quota.end()
             lines = [refreshed[:offset], marker + "\n", refreshed[offset:]]
         refreshed = "".join(lines)
     if refreshed != content:
         refreshed = update_markdown_metadata(refreshed, now_jst(), 0, state.get("last_id", last_id),
                                               state.get("initial_quota"), state.get("final_quota"))
+    usage = summarize_agy_usage(usage_records)
+    if usage is not None:
+        refreshed = refresh_agy_usage_metadata(refreshed, usage, all_messages)
+    if refreshed != content:
         atomic_write_md(path, refreshed)
     save_state(session_id, state)
 

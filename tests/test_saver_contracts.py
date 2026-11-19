@@ -360,7 +360,9 @@ class SaverContracts(unittest.TestCase):
         prices = {"gpt-6.2-astra": "0.00028", "gpt-6.2-sol": "0.00007", "deepseek-v4.1-flash": "0.000009", "gpt-6-astra": "0.00035", "gpt-6.1-sol": "0.00007",
                   "gpt-6.1-terra": "0.000035", "gpt-6-luna": "0.0000035", "muse-spark-1.3-contributor-free": "0.000002",
                   "nemotron-3-ultra-free": "0.000016", "claude-opus-5-5": "0.00014",
-                  "claude-sonnet-5-5": "0.00007", "claude-haiku-5-5": "0.0000035", "gemini-3.8-flash": "0.00002625",
+                  "claude-sonnet-5-5": "0.00007", "claude-haiku-5-5": "0.0000035",
+                  "gemini-4-argon": "0.00007", "gemini-4-neon": "0.000105", "gemini-4-hydrogen": "0.0000525",
+                  "gemini-3.8-flash": "0.00002625",
                   "claude-fable-5-1": "0.00035"}
         for provider in ("codex", "claude", "opencode", "pi"):
             self.assertEqual(set(self.modules[provider].STANDARD_USAGE_RATES), set(prices))
@@ -465,6 +467,37 @@ class SaverContracts(unittest.TestCase):
                     large = {"input_tokens": 300_000, "output_tokens": 120}
                     self.assertEqual(module._usage_cost(model, large), Decimal("0.22545"))
                     self.assertFalse(module.is_long_context_usage(model, large))
+
+    def test_gemini4_rates_openrouter_prefix_large_input_and_history(self):
+        cases = (
+            ("gemini-4-argon", ("2.00", "0.10", "0.1875", "10.00")),
+            ("gemini-4-neon", ("3.00", "0.15", "0.0833333333333333", "15.00")),
+            ("gemini-4-hydrogen", ("1.50", "0.075", "0.0833333333333333", "7.50")),
+        )
+        dates = ("20261013", "20261118", "20261112")
+        for provider in ("agy", "codex", "claude", "opencode", "pi"):
+            module = self.modules[provider]
+            for (model, rates), date in zip(cases, dates):
+                self.assertIsNone(module._usage_cost(model + "-20261119", {"input_tokens": 10}))
+                for alias in (model, "google/" + model, model + "-" + date, "google/" + model + "-" + date):
+                    with self.subTest(provider=provider, model=alias):
+                        self.assertEqual(module.reference_price_model(alias), model)
+                        for usage, expected in zip((
+                            {"input_tokens": 1_000_000},
+                            {"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000},
+                            {"input_tokens": 1_000_000, "cache_write_input_tokens": 1_000_000},
+                            {"output_tokens": 1_000_000},
+                        ), rates):
+                            self.assertEqual(module._usage_cost(alias, usage), Decimal(expected))
+                        large = {"input_tokens": 300_000, "output_tokens": 100}
+                        with patch.object(module, "APPLY_LONG_CONTEXT_PRICING", True):
+                            self.assertFalse(module.is_long_context_usage(alias, large))
+                            expected_large = (300_000 * Decimal(rates[0]) + 100 * Decimal(rates[3])) / 1_000_000
+                            self.assertEqual(module._usage_cost(alias, large), expected_large)
+                        with module.usage_price_version("4.4.0"):
+                            self.assertEqual(module._usage_cost(alias, {"input_tokens": 10}),
+                                             Decimal(rates[0]) / 100_000)
+                        self.assertEqual(module.PRICE_CHECKED_AT[model], "2026-11-19")
 
     def test_removed_price_models_keep_tokens_without_reference_estimate(self):
         for provider in ("codex", "claude", "opencode", "pi"):
@@ -699,14 +732,14 @@ class SaverContracts(unittest.TestCase):
         self.save("codex", rows)
         self.assertEqual(path.read_text(), content)
 
-    def save_agy_stop(self, rows, received, session="observed", **fields):
+    def save_agy_stop(self, rows, received, session="observed", *, quota=None, **fields):
         module = self.modules["agy"]
         transcript = self.root / (session + ".jsonl")
         transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         payload = {"conversationId": session, "transcriptPath": str(transcript),
                    "workspacePaths": ["/tmp/example"], "fullyIdle": True, "terminationReason": "model_stop"}
         payload.update(fields)
-        with patch.object(module, "now_jst", return_value=received), patch.object(module, "retrieve_quota", return_value=None):
+        with patch.object(module, "now_jst", return_value=received), patch.object(module, "retrieve_quota", return_value=quota):
             module.handle_stop_event(payload)
         return Path(module.load_state(session)["output_path"])
 
@@ -728,6 +761,50 @@ class SaverContracts(unittest.TestCase):
         content = path.read_text()
         self.assertEqual(content.count("回答所要時間: 2分15秒"), 1)
         self.assertEqual(content.count("回答所要時間: 3分20秒"), 1)
+
+    def test_agy_answer_heading_prefers_response_model_and_falls_back_to_selection(self):
+        user, answer = self.rows("agy")
+        user["content"] = (
+            "<USER_REQUEST>質問</USER_REQUEST>"
+            "<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` "
+            "from None to Gemini 4 Neon (High).</USER_SETTINGS_CHANGE>"
+        )
+        answer["model"] = "gemini-4-hydrogen-medium"
+        next_user, next_answer = self.rows("agy", 2, "次の質問", "次の回答")
+        next_answer["model"] = " "
+        content = self.save_agy_stop([user, answer, next_user, next_answer], self.created).read_text()
+        self.assertIn("> <small>🤖 gemini-4-hydrogen-medium</small>", content)
+        self.assertIn("> <small>🤖 Gemini 4 Neon (High)</small>", content)
+
+    def test_agy_usage_counts_tool_steps_and_refreshes_late_metadata(self):
+        rows = self.rows("agy")
+        user, answer = rows
+        user["content"] = "依頼"
+        counts = {"input_tokens": 100, "cache_read_tokens": 200, "output_tokens": 48}
+        tool = dict(answer, status="DONE", tool_calls=[{"name": "read_file"}],
+                    model="gemini-4-neon-high", **counts)
+        answer.update(step_index=3, status="DONE", model="gemini-4-neon-high")
+        rows = [user, dict(tool, input_tokens=999), tool, answer]
+        quota = {"gemini": {"weekly": {"remaining": 80.0, "reset": ""}}}
+        path = self.save_agy_stop(rows, self.created, quota=quota)
+        partial = path.read_text()
+        self.assertIn("  tokens_incomplete: true", partial)
+        self.assertIn("  total_cost_usd: 0.00105", partial)
+        self.assertIn("Usage: 348 tok（部分取得）", partial)
+        self.assertEqual(partial.count("💰 **Usage (USD換算)**:"), 1)
+
+        rows.append(dict(answer, **counts))
+        self.save_agy_stop(rows, self.created + timedelta(seconds=10))
+        complete = path.read_text()
+        self.assertNotIn("tokens_incomplete", complete)
+        self.assertIn("  total_cost_usd: 0.0021", complete)
+        self.assertIn("Usage: 696 tok", complete)
+        self.assertEqual(complete.count("Usage: 696 tok"), 1)
+        self.assertEqual(complete.count("💰 **Usage (USD換算)**:"), 1)
+        self.assertEqual(complete.count("📊 **Quota**:"), 1)
+        self.assertIn("80.0%", complete)
+        self.save_agy_stop(rows, self.created + timedelta(seconds=20))
+        self.assertEqual(path.read_text(), complete)
 
     def test_agy_only_current_turn_is_observed_and_no_quota_delay_is_added(self):
         module = self.modules["agy"]

@@ -100,9 +100,9 @@ class TestSyncShared(unittest.TestCase):
         for block in ("utilities", "logging-setup", "session-storage", "note-metadata",
                       "find-existing-markdown", "markdown-rendering", "full-session-display"):
             self.assertEqual(set(sync_shared.BLOCK_TARGETS[block]), scripts, block)
-        self.assertEqual(set(sync_shared.BLOCK_TARGETS["usage-summary"]), scripts - {"agy_save.py"})
-        self.assertEqual(set(sync_shared.BLOCK_TARGETS["usage-reference-cost"]),
-                         scripts - {"agy_save.py"})
+        for block in ("usage-summary", "usage-reference-cost", "usage-prices",
+                      "usage-price-history", "usage-model"):
+            self.assertEqual(set(sync_shared.BLOCK_TARGETS[block]), scripts, block)
 
     def test_check_detects_a_stale_generated_block(self):
         with tempfile.TemporaryDirectory() as directory:

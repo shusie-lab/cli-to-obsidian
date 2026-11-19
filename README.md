@@ -22,7 +22,7 @@ Codex・OpenCode・Pi・Claude Code・Antigravityの回答が終わるたびに�
 
 ## 対応ツール
 
-**Codex対応を中心に開発しています。** 開発者自身がメインで利用し、日々の開発・動作確認の中心にしています。OpenCodeとPiは今後対応を充実させる予定です。Claude Codeは実利用の経験が少なく、Antigravityは以前メインで使っていましたが現在はほぼ利用していないため、どちらも参考実装として公開しています。
+**Codex対応を中心に開発しています。** Antigravity CLIも実際の会話ログで動作を確認しています。OpenCodeとPiは今後対応を充実させる予定です。Claude Codeは実利用の経験が少ないため、参考実装として公開しています。
 
 | ツール・導入手順 | 位置づけ | 利用できる環境 | token数・USD参考換算 | quota残量の記録 | 配置するファイル |
 | --- | --- | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ Codex・OpenCode・Pi・Claude Code・Antigravityの回答が終わるたびに�
 | [OpenCode](docs/setup/opencode.md) | 今後拡充 | CLI・アプリ（v2プラグイン） | 対応 | なし | 2個 |
 | [Pi](docs/setup/pi.md) | 今後拡充 | CLI（extension） | 対応 | なし | 2個 |
 | [Claude Code](docs/setup/claude-code.md) | 参考実装 | CLI | 対応 | statusLine設定時に対応 | 1個 |
-| [Antigravity](docs/setup/antigravity.md) | 参考実装 | CLI・Antigravityアプリ | なし | 対応 | 1個 |
+| [Antigravity](docs/setup/antigravity.md) | CLIの実ログで検証 | CLI・Antigravityアプリ | ログにtoken数がある場合に対応 | 初回・最新の観測時刻も表示 | 1個 |
 
 USD参考換算は登録済みモデルが対象です。単価が未登録の場合も、会話と取得できたtoken数は保存します。
 
@@ -102,7 +102,7 @@ Markdownの出力形式では、[Obsidian AI Exporter](https://github.com/sho765
 
 ## バージョン管理
 
-このソースのバージョンは4.4.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`と[VERSION](./VERSION)を揃え、公開時に対応するGitタグを付けます。変更履歴は[CHANGELOG](./CHANGELOG.md)に記録しています。
+このソースのバージョンは4.6.0です。リリースはリポジトリ全体で共通のバージョン番号を使用し、[Semantic Versioning](https://semver.org/lang/ja/)に従います。各スクリプトの`__version__`と[VERSION](./VERSION)を揃え、公開時に対応するGitタグを付けます。変更履歴は[CHANGELOG](./CHANGELOG.md)に記録しています。
 
 ## ライセンス
 

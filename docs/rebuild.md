@@ -43,7 +43,7 @@ export OBSIDIAN_VAULT="$HOME/obsidian"
 /usr/bin/python3 rebuild_session.py claude SESSION_ID --output-dir /private/tmp/rebuilt --price-version 3.11.1
 ```
 
-`--output-dir`で`preserve`を指定した場合、その出力先にある既存ノートを参照します。日付から価格版は推測しません。過去表で再構成しても、次の通常hookでは現在表へ戻るため、価格を固定した検証結果は別の出力先へ保存してください。Antigravityは価格版指定に対応しません。
+`--output-dir`で`preserve`を指定した場合、その出力先にある既存ノートを参照します。日付から価格版は推測しません。過去表で再構成しても、次の通常hookでは現在表へ戻るため、価格を固定した検証結果は別の出力先へ保存してください。
 
 ## 元履歴の場所
 

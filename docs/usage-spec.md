@@ -12,10 +12,15 @@
 | Claude Code | 親・子それぞれのmessage IDごとの最後の`message.usage`を集計。 | 子の`parentUuid`が一つの親ターンに結び付く場合のみ回答へ加算。親・子・回答に紐付かない子のtoken内訳も表示します。 |
 | OpenCode | SQLiteのassistantレコードをmessage IDごとに集計。本文のないツール専用レコードも含めます。 | 同じユーザー発話内の連続する同一モデルの回答をまとめ、本文のないUsageも近い回答へ加算します。 |
 | Pi | 全分岐のentryをIDごとに集計。圧縮・分岐要約・追加Usage・Usage付きツール結果も含めます。 | 現在の分岐のUsageのみ表示。同一ターン・同一モデルを優先して近い回答へ加算します。 |
+| Antigravity | transcriptの完了済み`PLANNER_RESPONSE`をstep番号ごとに集計。ツール呼び出しだけの応答も含めます。 | 同じユーザー発話内の中間ステップを次の表示回答に加算します。表示回答へ紐付かないステップはセッション計に含めます。 |
 
 Codexの子Usageは対象の`session_id`と一致するレコードに限定します。Claudeの子は`親transcript拡張子なし/subagents/agent-*.jsonl`から読み、別sessionId・symlinkを除外します。子の本文は親ノートへ混ぜません。Piでモデルを特定できないUsageは`unknown`としてtokenのみ集計します。
 
 共通形式の`input_tokens`はキャッシュ読込・書込を含む入力総数、`reasoning_output_tokens`は出力の内数です。これらを二重加算しません。遅れて書き込まれたUsageは次の保存で反映します。
+
+Antigravityのtranscriptには通常入力・キャッシュ読込・出力が個別に記録されます。換算には応答のモデルIDを優先し、なければユーザー発話に記録された選択モデルを使います。取得項目にキャッシュ書込・推論出力の内訳は含まれません。tokenを取得できた応答と取得できない応答が混在する場合は`tokens_incomplete: true`を記録します。モデルが不明・未登録の場合も取得できたtoken数は集計します。
+
+Antigravityの回答見出しは応答行の`model`を優先し、値が空ならユーザー発話に記録されたモデル選択を使います。どちらの情報もない場合はモデル名を省略します。回答の使用量は中間ステップも含め、それぞれのステップのモデルで換算します。
 
 ## USD参考換算とCLI報告コスト
 
@@ -23,7 +28,7 @@ Codexの子Usageは対象の`session_id`と一致するレコードに限定し�
 
 | 値 | 記録先 | 対象・扱い |
 | --- | --- | --- |
-| USD参考換算 | `usage.total_cost_usd`、`usage.by_model.*.cost_usd` | Codex・Claude・OpenCode・Pi。`usage.cost_basis: reference`で意味を示します。 |
+| USD参考換算 | `usage.total_cost_usd`、`usage.by_model.*.cost_usd` | Codex・Claude・OpenCode・Pi・Antigravity。`usage.cost_basis: reference`で意味を示します。 |
 | CLI報告コスト | `reported_cost.usd` | OpenCode・Piは回答の取得値の合計（`scope: message_sum`）、ClaudeはstatusLineのセッション累計の最新観測値（`scope: session`）です。 |
 
 OpenCodeはassistantの`cost`、Piは`usage.cost.total`、ClaudeはstatusLineの`cost.total_cost_usd`を取得します。Claudeは再通知ごとに加算せず、回答へ推測配分しません。OpenCode・Piは回答calloutにも取得コストを表示します。
@@ -42,14 +47,14 @@ OpenCodeはassistantの`cost`、Piは`usage.cost.total`、ClaudeはstatusLineの
 | --- | --- |
 | GPT | GPT-6.2 Astra、GPT-6.2 Sol、GPT-6 Astra、GPT-6.1 Sol、GPT-6.1 Terra、GPT-6 Luna |
 | Claude | Fable 5.1、Opus 5.5、Sonnet 5.5、Haiku 5.5 |
-| Gemini | Gemini 3.8 Flash |
+| Gemini | Gemini 4 Argon、Gemini 4 Neon、Gemini 4 Hydrogen、Gemini 3.8 Flash |
 | DeepSeek | DeepSeek V4.1 Flash（`deepseek-flash`も対応） |
 | その他 | Muse Spark 1.3 Contributor、Nemotron 3 Ultra |
 
 - GPTの272K超入力: Codexは先頭の`APPLY_LONG_CONTEXT_PRICING = False`で倍率なしです。`True`にするとリクエスト単位で入力・キャッシュ系2倍、出力1.5倍となり、対象回答に`⚠︎ 272K+`を表示します。Claude・OpenCode・Piの既定は`True`です。CLI報告コストには掛けません。
 - Claude: cache writeの5分・1時間を区別します。Haiku 5.5は1リクエストの入力総数が10万token超の場合に全種別5倍、Opus 5.5・Sonnet 5.5は20万token超でも標準単価です。Fast・地域・TTL等の価格条件を確定できない場合は換算を省略します。
 - DeepSeek: 登録済みピーク単価を固定で使用し、時刻によるオフピーク切り替えは行いません。
-- Gemini: 登録表は2026年末までのStandard割引価格を基にしています。cache writeはOpenRouter掲載のtoken単価を使い、Googleの時間単位の保管料は加算しません。
+- Geminiの参考単価は、Gemini 4 Argonが2026年11月末まで、Gemini 3.8 Flashが2026年末までのStandard割引価格、Gemini 4 Neon・Gemini 4 HydrogenがStandard単価です。日付付きIDは`gemini-4-argon-20261013`・`gemini-4-neon-20261118`・`gemini-4-hydrogen-20261112`に対応します。cache writeはOpenRouter掲載のtoken単価を使い、Googleの時間単位の保管料は加算しません。
 - Batch・Flex・Priority・ツール料金などは参考換算に含めません。単価は自動更新しません。
 
 収録単価・価格版・確認日・出典は、[check_usage_prices.py](../check_usage_prices.py)・[rebuild_session.py](../rebuild_session.py)・[claude_save.py](../claude_save.py)を同じディレクトリへ置き、次で確認できます。
@@ -65,6 +70,13 @@ Usageには全体・モデル別・回答別の`Cache: xx.x%`（キャッシュ�
 ## quota残量
 
 Codexはtranscript、Claudeは任意のstatusLine入力の`rate_limits`、Antigravityは`/quota`から取得します。weekly・5hなど取得できた枠だけを記録し、最初と最後の観測値を`first_observed`・`last_observed`へ保存します。「最初」は会話開始時ではなく最初に取得できた値です。
+
+Antigravityは新しい発言の保存時に`/quota`を呼び出します。本文のQuota欄では、Gemini・Claudeの利用枠ごとに、保存済みの`observed_at`から初回（First）と最新（Latest）の日時をJSTで表示します。観測時刻のない枠では時刻表示を省略します。
+
+```markdown
+📊 **Quota**:
+- **Gemini**: W: 90.0% ➔ 80.0% (First 2026-11-19 23:05 · Latest 2026-11-20 00:20 JST)
+```
 
 quotaはアカウント全体の残量です。差分を会話の消費量とは扱わず、回答別の差分も表示しません。未提供の枠は省略し、会話保存は続けます。ClaudeのstatusLineはquotaがなくてもコストがあれば表示し、どちらもなければ空表示です。新形式の保存時に旧`quota`・`quota_claude`の数値形式を置換します。
 

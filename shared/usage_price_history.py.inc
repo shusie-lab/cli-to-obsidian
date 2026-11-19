@@ -1,8 +1,11 @@
 from contextvars import ContextVar
 
-PRICE_VERSION = "4.4.0"
-PRICE_RECORDED_AT = "2026-11-18"
+PRICE_VERSION = "4.5.0"
+PRICE_RECORDED_AT = "2026-11-19"
 PRICE_CHECKED_AT = {
+    "gemini-4-argon": "2026-11-19",
+    "gemini-4-neon": "2026-11-19",
+    "gemini-4-hydrogen": "2026-11-19",
     "gpt-6.2-astra": "2026-11-18",
     "gpt-6.2-sol": "2026-11-18",
     'claude-fable-5-1': "2026-10-28",
@@ -29,6 +32,7 @@ PRICE_SOURCES = {
 # 現在表から過去へ戻す差分。next_versionは直後の価格版を明示する。
 # changesは変更したtoken単価の旧値。削除モデルは全単価を残し、追加モデルは除外しない。
 PRICE_HISTORY = {
+    "4.4.0": {"recorded_at": "2026-11-18", "next_version": "4.5.0", "changes": {}},
     "4.2.0": {"recorded_at": "2026-10-27", "next_version": "4.4.0", "changes": {}},
     "3.12.0": {"recorded_at": "2026-10-25", "next_version": "4.2.0", "changes": {}},
     "3.11.1": {"recorded_at": "2026-10-21", "next_version": "3.12.0", "changes": {

@@ -193,13 +193,12 @@ def rebuild(provider, session_id, output_dir=None, transcript=None, database=Non
                 payload["workspacePaths"] = [info["cwd"]]
         created = frontmatter_value(old_content, "created") or old_state.get("start_time") or old_state.get("created") or info.get("created")
         selected_price = price_version
-        if provider != "agy":
-            if pricing == "preserve" and selected_price is None:
-                selected_price = module.note_price_version(old_content)
-                if selected_price is None:
-                    raise ValueError("既存ノートに価格版がありません。--price-version を明示してください")
-            selected_price = selected_price or module.PRICE_VERSION
-        price_context = module.usage_price_version(selected_price) if provider != "agy" else nullcontext()
+        if pricing == "preserve" and selected_price is None:
+            selected_price = module.note_price_version(old_content)
+            if selected_price is None:
+                raise ValueError("既存ノートに価格版がありません。--price-version を明示してください")
+        selected_price = selected_price or module.PRICE_VERSION
+        price_context = module.usage_price_version(selected_price)
         with price_context, tempfile.TemporaryDirectory(prefix="obsidian-rebuild-") as temporary:
             with isolated(module, Path(temporary)):
                 old_source = frontmatter_value(old_content, "source")
@@ -315,8 +314,6 @@ def main(argv=None):
     parser.add_argument("--price-version", help="明示した登録価格版で再構成（版のない過去ノートにも使用可）")
     parser.add_argument("--dry-run", action="store_true", help="隔離領域で生成し、保存予定の差分を表示して終了")
     args = parser.parse_args(argv)
-    if args.provider == "agy" and (args.pricing != "current" or args.price_version):
-        parser.error("AntigravityはUSD換算に対応していません")
     if ((args.provider == "opencode" and args.transcript)
             or (args.provider != "opencode" and args.database)):
         parser.error("--transcript/--database の対象が一致しません")

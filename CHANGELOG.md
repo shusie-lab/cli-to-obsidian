@@ -5,6 +5,24 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [4.6.0] - 2026-11-20
+
+### Added
+
+- AntigravityのQuota欄に、各利用枠の初回・最新の残量観測時刻（JST）を表示
+
+### Changed
+
+- Antigravityの回答見出しに、応答ログが報告したモデル名を優先して表示
+
+## [4.5.0] - 2026-11-19
+
+### Added
+
+- Gemini 4 Argon・Gemini 4 Neon・Gemini 4 Hydrogenの標準API単価によるUSD参考換算に対応
+- Gemini 4 Argon・Neon・Hydrogenの確認済みの日付付きモデルIDをUSD参考換算に使用
+- Antigravityの会話ログに記録された入力・キャッシュ読込・出力トークンとUSD参考換算を保存
+
 ## [4.4.0] - 2026-11-18
 
 ### Added

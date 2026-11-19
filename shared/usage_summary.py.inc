@@ -174,6 +174,8 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
         return []
     lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields(usage)]
     lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
+    if usage.get("tokens_incomplete"):
+        lines.append("  tokens_incomplete: true")
     if "total_cost_usd" in usage:
         lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
         if usage.get("cost_incomplete"):
@@ -245,7 +247,8 @@ def build_usage_section(usage: dict | None) -> str:
         scope_line = ("📊 **Usage集計範囲**: 親 " + f"{int(scope.get('parent_tokens', 0)):,} tok"
             + "・子 " + f"{int(scope.get('subagent_tokens', 0)):,} tok"
             + "（回答に紐付かない子 " + f"{int(scope.get('unattributed_subagent_tokens', 0)):,} tok）\n")
-    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details} · {cache_hit_label(usage)}\n"
+    coverage = " · token部分取得" if usage.get("tokens_incomplete") else ""
+    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details} · {cache_hit_label(usage)}{coverage}\n"
             + scope_line + build_reported_cost_section(usage.get("reported_cost")))
 
 
@@ -253,7 +256,8 @@ def format_message_usage(usage: dict | None, subagent_usage: dict | None = None)
     if not usage:
         return ""
     warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
-    label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    coverage = "（部分取得）" if usage.get("tokens_incomplete") else ""
+    label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok{coverage} · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
     if usage.get("reported_cost"):
         label += " · 取得コスト: " + reported_cost_label(usage["reported_cost"])
     if subagent_usage:
@@ -303,4 +307,6 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
         merged["cost_unavailable"] = True
     if first.get("long_context") or second.get("long_context"):
         merged["long_context"] = True
+    if first.get("tokens_incomplete") or second.get("tokens_incomplete"):
+        merged["tokens_incomplete"] = True
     return merged

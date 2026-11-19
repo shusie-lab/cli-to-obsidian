@@ -11,13 +11,13 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 BLOCK_TARGETS = {
-    "usage-price-history": ("codex_save.py", "claude_save.py", "opencode_save.py", "pi_save.py"),
+    "usage-price-history": ("agy_save.py", "codex_save.py", "claude_save.py", "opencode_save.py", "pi_save.py"),
     "jsonl-snapshot": ("codex_save.py", "claude_save.py"),
     "full-session-display": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "full-session-storage": ("opencode_save.py", "pi_save.py"),
-    "usage-summary": ("claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
+    "usage-summary": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "full-session-search": ("opencode_save.py", "pi_save.py"),
-    "usage-model": ("claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
+    "usage-model": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "output-directory": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "session-storage": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "incremental-utilities": ("agy_save.py", "claude_save.py", "codex_save.py"),
@@ -33,13 +33,13 @@ BLOCK_TARGETS = {
     "incremental-main": ("agy_save.py", "claude_save.py", "codex_save.py"),
     "utilities": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "logging-setup": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
-    "usage-prices": ("claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
+    "usage-prices": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "note-metadata": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
     "full-session-rendering": ("opencode_save.py", "pi_save.py"),
     "incremental-rendering": ("agy_save.py", "claude_save.py", "codex_save.py"),
-    "incremental-answer-usage": ("claude_save.py", "codex_save.py"),
+    "incremental-answer-usage": ("agy_save.py", "claude_save.py", "codex_save.py"),
     "incremental-storage": ("agy_save.py", "claude_save.py", "codex_save.py"),
-    "usage-reference-cost": ("claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
+    "usage-reference-cost": ("agy_save.py", "claude_save.py", "codex_save.py", "opencode_save.py", "pi_save.py"),
 }
 
 

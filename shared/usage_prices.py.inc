@@ -68,6 +68,36 @@ STANDARD_USAGE_RATES = {
         "cache_write_input": Decimal("0.125"),
         "output": Decimal("0.50"),
     },
+    # 2026-11-19確認。2026-11-30までのStandard割引価格（12月1日以降はinput 4.00 / cached 0.20 / output 20.00）。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-argon
+    # https://openrouter.ai/api/v1/models/google/gemini-4-argon/endpoints
+    "gemini-4-argon": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.1875"),
+        "output": Decimal("10.00"),
+    },
+    # 2026-11-19確認。Standard単価。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-neon
+    # https://openrouter.ai/api/v1/models/google/gemini-4-neon/endpoints
+    "gemini-4-neon": {
+        "input": Decimal("3.00"),
+        "cached_input": Decimal("0.15"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.0833333333333333"),
+        "output": Decimal("15.00"),
+    },
+    # 2026-11-19確認。Standard単価。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-hydrogen
+    # https://openrouter.ai/api/v1/models/google/gemini-4-hydrogen/endpoints
+    "gemini-4-hydrogen": {
+        "input": Decimal("1.50"),
+        "cached_input": Decimal("0.075"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.0833333333333333"),
+        "output": Decimal("7.50"),
+    },
     "gemini-3.8-flash": {
         "input": Decimal("0.75"),
         "cached_input": Decimal("0.075"),

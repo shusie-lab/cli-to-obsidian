@@ -1630,7 +1630,11 @@ Response text
         self.assertIn("quota:\n  \"gemini\":", content)
         self.assertIn("first_observed:\n        remaining_percent: 90.0", content)
         self.assertIn("last_observed:\n        remaining_percent: 80.0", content)
-        self.assertIn("W: 90.0% ➔ 80.0% / 5h: 60.0% ➔ 50.0%", content)
+        self.assertRegex(
+            content,
+            r"W: 90\.0% ➔ 80\.0% \(First [^\n]+ · Latest [^\n]+ JST\)"
+            r" / 5h: 60\.0% ➔ 50\.0% \(First [^\n]+ · Latest [^\n]+ JST\)",
+        )
         self.assertNotIn("(Quota:", content)
 
     def test_agy_without_new_messages_does_not_refresh_quota(self):
@@ -1718,7 +1722,10 @@ Response text
                 }]}},
             }))
 
-        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(90)):
+        first = agy_save.parse_datetime("2026-11-19T23:05:00+09:00")
+        latest = agy_save.parse_datetime("2026-11-20T00:20:00+09:00")
+        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(90)), \
+                mock.patch.object(agy_save, "now_jst", return_value=first):
             agy_save.handle_stop_event(hook)
         output_path = Path(agy_save.load_state(session_id)["output_path"])
         agy_save.state_path(session_id).unlink()
@@ -1728,7 +1735,8 @@ Response text
             {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "次の回答", "tool_calls": []},
         ])
         transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(80)):
+        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(80)), \
+                mock.patch.object(agy_save, "now_jst", return_value=latest):
             agy_save.handle_stop_event(hook)
 
         state = agy_save.load_state(session_id)
@@ -1740,6 +1748,10 @@ Response text
         self.assertIn("last_observed:\n        remaining_percent: 80.0", content)
         self.assertIn("W: 90.0% ➔ 80.0%", content)
         self.assertEqual(content.count("W: 90.0% ➔ 80.0%"), 1)
+        self.assertIn(
+            "W: 90.0% ➔ 80.0% (First 2026-11-19 23:05 · Latest 2026-11-20 00:20 JST)",
+            content,
+        )
 
     def test_agy_quota_section_replacement_removes_old_rows(self):
         content = """---

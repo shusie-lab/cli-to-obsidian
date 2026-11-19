@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """Pi extensionから渡された会話を Obsidian に保存する。"""
 
-__version__ = "4.4.0"
+__version__ = "4.6.0"
 
 import argparse
 import sys
@@ -110,6 +110,36 @@ STANDARD_USAGE_RATES = {
         "cache_write_input": Decimal("0.125"),
         "output": Decimal("0.50"),
     },
+    # 2026-11-19確認。2026-11-30までのStandard割引価格（12月1日以降はinput 4.00 / cached 0.20 / output 20.00）。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-argon
+    # https://openrouter.ai/api/v1/models/google/gemini-4-argon/endpoints
+    "gemini-4-argon": {
+        "input": Decimal("2.00"),
+        "cached_input": Decimal("0.10"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.1875"),
+        "output": Decimal("10.00"),
+    },
+    # 2026-11-19確認。Standard単価。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-neon
+    # https://openrouter.ai/api/v1/models/google/gemini-4-neon/endpoints
+    "gemini-4-neon": {
+        "input": Decimal("3.00"),
+        "cached_input": Decimal("0.15"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.0833333333333333"),
+        "output": Decimal("15.00"),
+    },
+    # 2026-11-19確認。Standard単価。
+    # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-hydrogen
+    # https://openrouter.ai/api/v1/models/google/gemini-4-hydrogen/endpoints
+    "gemini-4-hydrogen": {
+        "input": Decimal("1.50"),
+        "cached_input": Decimal("0.075"),
+        # OpenRouter Standardのinput_cache_writeを100万token単位へ変換。
+        "cache_write_input": Decimal("0.0833333333333333"),
+        "output": Decimal("7.50"),
+    },
     "gemini-3.8-flash": {
         "input": Decimal("0.75"),
         "cached_input": Decimal("0.075"),
@@ -161,9 +191,12 @@ USAGE_COST_USD_PER_1M_TOKEN_TYPE = STANDARD_USAGE_RATES
 # BEGIN GENERATED: usage-price-history
 from contextvars import ContextVar
 
-PRICE_VERSION = "4.4.0"
-PRICE_RECORDED_AT = "2026-11-18"
+PRICE_VERSION = "4.5.0"
+PRICE_RECORDED_AT = "2026-11-19"
 PRICE_CHECKED_AT = {
+    "gemini-4-argon": "2026-11-19",
+    "gemini-4-neon": "2026-11-19",
+    "gemini-4-hydrogen": "2026-11-19",
     "gpt-6.2-astra": "2026-11-18",
     "gpt-6.2-sol": "2026-11-18",
     'claude-fable-5-1': "2026-10-28",
@@ -190,6 +223,7 @@ PRICE_SOURCES = {
 # 現在表から過去へ戻す差分。next_versionは直後の価格版を明示する。
 # changesは変更したtoken単価の旧値。削除モデルは全単価を残し、追加モデルは除外しない。
 PRICE_HISTORY = {
+    "4.4.0": {"recorded_at": "2026-11-18", "next_version": "4.5.0", "changes": {}},
     "4.2.0": {"recorded_at": "2026-10-27", "next_version": "4.4.0", "changes": {}},
     "3.12.0": {"recorded_at": "2026-10-25", "next_version": "4.2.0", "changes": {}},
     "3.11.1": {"recorded_at": "2026-10-21", "next_version": "3.12.0", "changes": {
@@ -1117,6 +1151,9 @@ def _normalize_usage_model(model: object) -> str:
         "deepseek-v4.1-flash-free": "deepseek-v4.1-flash",
         "deepseek-v4.1-flash:free": "deepseek-v4.1-flash",
         "gemini3.8-flash": "gemini-3.8-flash",
+        "gemini-4-argon-20261013": "gemini-4-argon",
+        "gemini-4-neon-20261118": "gemini-4-neon",
+        "gemini-4-hydrogen-20261112": "gemini-4-hydrogen",
         "nemotron-3-ultra-550b-a55b:free": "nemotron-3-ultra-free",
         "claude-opus-5.5": "claude-opus-5-5",
         "claude-haiku-5.5": "claude-haiku-5-5",
@@ -1305,6 +1342,8 @@ def usage_frontmatter_fields(usage: dict | None) -> list[str]:
         return []
     lines = ["usage:", "  cost_basis: \"reference\"", *usage_price_fields(usage)]
     lines.extend(f"  {field}: {int(usage.get(field, 0))}" for field in USAGE_FIELDS)
+    if usage.get("tokens_incomplete"):
+        lines.append("  tokens_incomplete: true")
     if "total_cost_usd" in usage:
         lines.append(f"  total_cost_usd: {format(Decimal(str(usage['total_cost_usd'])), 'f')}")
         if usage.get("cost_incomplete"):
@@ -1376,7 +1415,8 @@ def build_usage_section(usage: dict | None) -> str:
         scope_line = ("📊 **Usage集計範囲**: 親 " + f"{int(scope.get('parent_tokens', 0)):,} tok"
             + "・子 " + f"{int(scope.get('subagent_tokens', 0)):,} tok"
             + "（回答に紐付かない子 " + f"{int(scope.get('unattributed_subagent_tokens', 0)):,} tok）\n")
-    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details} · {cache_hit_label(usage)}\n"
+    coverage = " · token部分取得" if usage.get("tokens_incomplete") else ""
+    return (f"💰 **Usage (USD換算)**: Total: {_usage_cost_label(usage, 'total_cost_usd')}{details} · {cache_hit_label(usage)}{coverage}\n"
             + scope_line + build_reported_cost_section(usage.get("reported_cost")))
 
 
@@ -1384,7 +1424,8 @@ def format_message_usage(usage: dict | None, subagent_usage: dict | None = None)
     if not usage:
         return ""
     warning = " ⚠︎ 272K+" if usage.get("long_context") else ""
-    label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
+    coverage = "（部分取得）" if usage.get("tokens_incomplete") else ""
+    label = f"Usage: {int(usage.get('total_tokens', 0)):,} tok{coverage} · {_usage_cost_label(usage, 'total_cost_usd')}{warning}"
     if usage.get("reported_cost"):
         label += " · 取得コスト: " + reported_cost_label(usage["reported_cost"])
     if subagent_usage:
@@ -1434,6 +1475,8 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
         merged["cost_unavailable"] = True
     if first.get("long_context") or second.get("long_context"):
         merged["long_context"] = True
+    if first.get("tokens_incomplete") or second.get("tokens_incomplete"):
+        merged["tokens_incomplete"] = True
     return merged
 # END GENERATED: usage-summary
 

@@ -15,7 +15,7 @@
 ## 共通コードの管理
 
 5本のMarkdown整形・日時・ログ・frontmatter・state・ロック・atomic書き込み・既存Markdown探索、
-4本のUsage集計・金額表示・モデル別名・参考単価を`shared/`の正本で管理します。
+5本のUsage集計・金額表示・モデル別名・参考単価を`shared/`の正本で管理します。
 Codex・Antigravity・Claude Codeは増分描画とcursor復旧を、OpenCode・Piはsnapshot描画を共有します。
 入力解析・重複排除・quota取得・価格条件・Usageの集計範囲は各saverに残します。変更後に
 `/usr/bin/python3 sync_shared.py`で各`*_save.py`へ埋め込みます。生成後の各スクリプトは
