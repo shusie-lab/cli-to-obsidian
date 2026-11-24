@@ -1603,7 +1603,8 @@ Response text
         transcript = self.test_dir / "agy_quota.jsonl"
         rows = [
             {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>質問</USER_REQUEST>"},
-            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "回答", "tool_calls": []},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "回答", "tool_calls": [],
+             "model": "gemini-3.8-flash-medium"},
         ]
         transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         hook = {"conversationId": "public-agy-quota", "transcriptPath": str(transcript)}
@@ -1616,7 +1617,8 @@ Response text
             agy_save.handle_stop_event(hook)
             rows.extend([
                 {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>次の質問</USER_REQUEST>"},
-                {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "次の回答", "tool_calls": []},
+                {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "次の回答", "tool_calls": [],
+                 "model": "gemini-3.8-flash-medium"},
             ])
             transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
             agy_save.handle_stop_event(hook)
@@ -1699,7 +1701,8 @@ Response text
         transcript = self.test_dir / "agy-quota-recovery.jsonl"
         rows = [
             {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>最初の質問</USER_REQUEST>"},
-            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "最初の回答", "tool_calls": []},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "最初の回答", "tool_calls": [],
+             "model": "gemini-3.8-flash-medium"},
         ]
         transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         hook = {
@@ -1732,7 +1735,8 @@ Response text
 
         rows.extend([
             {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>次の質問</USER_REQUEST>"},
-            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "次の回答", "tool_calls": []},
+            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "次の回答", "tool_calls": [],
+             "model": "gemini-3.8-flash-medium"},
         ])
         transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(80)), \
@@ -1789,7 +1793,8 @@ quota: 5.00
             {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>旧質問</USER_REQUEST>"},
             {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "旧回答", "tool_calls": []},
             {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>新質問</USER_REQUEST>"},
-            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "新回答", "tool_calls": []},
+            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "新回答", "tool_calls": [],
+             "model": "gemini-3.8-flash-medium"},
         ]), encoding="utf-8")
         existing = agy_save.create_md_file(session_id, str(self.test_dir), datetime.now(JST))
         existing_content = existing.read_text(encoding="utf-8").replace(

@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "4.6.0"
+__version__ = "4.6.1"
 
 import json
 import math
@@ -2327,6 +2327,14 @@ def get_new_messages(messages: list, last_id: str) -> list:
 # ============================================================
 # quota（agy の読み取り専用 /quota コマンド）
 # ============================================================
+def agy_quota_group(model: str) -> str | None:
+    """応答モデルに対応する利用枠を識別する。"""
+    match = re.match(r"^(gemini|claude|gpt)(?=$|[\s_-]|\d)", _normalize_usage_model(model))
+    if match:
+        return "gemini" if match[1] == "gemini" else "claude"
+    return None
+
+
 def parse_quota_data(data: dict) -> dict:
     """agy の ``/quota --output-format json`` 応答を保存用形式へ正規化する。"""
     if not isinstance(data, dict):
@@ -2929,14 +2937,23 @@ def _handle_stop_event(hook_input: dict) -> None:
         current_quota = retrieve_quota()
         if current_quota:
             state["initial_quota"] = merge_first_quota(state.get("initial_quota"), current_quota)
-            current_quota = merge_first_quota(current_quota, state.get("final_quota") or {})
-            state["final_quota"] = current_quota
+            state["final_quota"] = merge_first_quota(current_quota, state.get("final_quota") or {})
+
+    # Usageの対象には、本文を持たないツール呼び出しの応答も含まれる。
+    response_models = {record["model"] for record in usage_records}
+    response_models.update(message["model"] for message in all_messages if message["type"] == "agent_message")
+    used_groups = {agy_quota_group(model) for model in response_models}
+    initial_quota = {group: windows for group, windows in (state.get("initial_quota") or {}).items()
+                     if group in used_groups}
+    final_quota = {group: windows for group, windows in (state.get("final_quota") or {}).items()
+                   if group in used_groups}
+    if new_messages:
         new_last_id, appended, updated = append_messages(
             path,
             new_messages,
             now_jst(),
-            current_quota=current_quota or state.get("final_quota"),
-            initial_quota=state.get("initial_quota"),
+            current_quota=final_quota,
+            initial_quota=initial_quota,
         )
         if new_last_id:
             state["last_id"] = new_last_id
@@ -2976,7 +2993,12 @@ def _handle_stop_event(hook_input: dict) -> None:
         refreshed = "".join(lines)
     if refreshed != content:
         refreshed = update_markdown_metadata(refreshed, now_jst(), 0, state.get("last_id", last_id),
-                                              state.get("initial_quota"), state.get("final_quota"))
+                                              initial_quota, final_quota)
+    elif response_models:
+        # 既存ノートも対象にし、表示する枠が変わったときだけQuota欄を更新する。
+        saved_first, saved_last = recover_quota_frontmatter(content)
+        if saved_first.keys() != initial_quota.keys() or saved_last.keys() != final_quota.keys():
+            refreshed = add_quota_metadata(refreshed, initial_quota, final_quota)
     usage = summarize_agy_usage(usage_records)
     if usage is not None:
         refreshed = refresh_agy_usage_metadata(refreshed, usage, all_messages)

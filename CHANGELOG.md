@@ -5,6 +5,12 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [4.6.1] - 2026-11-24
+
+### Fixed
+
+- Antigravityの会話ノートのQuota欄とプロパティに、その会話で使用したモデルの利用枠だけを保存
+
 ## [4.6.0] - 2026-11-20
 
 ### Added

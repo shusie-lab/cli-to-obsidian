@@ -806,6 +806,40 @@ class SaverContracts(unittest.TestCase):
         self.save_agy_stop(rows, self.created + timedelta(seconds=20))
         self.assertEqual(path.read_text(), complete)
 
+    def test_agy_shows_quota_only_for_model_groups_used_in_responses(self):
+        module = self.modules["agy"]
+        user, answer = self.rows("agy")
+        user["content"] += (
+            "<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` "
+            "from None to Claude Sonnet 5.5.</USER_SETTINGS_CHANGE>"
+        )
+        answer.update(model="gemini-3.8-flash-medium", status="DONE", step_index=3)
+        rows = [user, answer]
+        quota = {
+            "gemini": {"weekly": {"remaining": 80.0}},
+            "claude": {"weekly": {"remaining": 100.0}},
+        }
+        path = self.save_agy_stop(rows, self.created, quota=quota)
+        content = path.read_text()
+        self.assertIn("- **Gemini**: W: 80.0%", content)
+        self.assertNotIn("- **Claude**:", content)
+        self.assertEqual(set(module.recover_quota_frontmatter(content)[0]), {"gemini"})
+        self.assertEqual(module.load_state("observed")["initial_quota"], quota)
+
+        # 旧版の表示は、新しい発言も残量取得もなしで修正できる。
+        path.write_text(module.add_quota_metadata(content, quota, quota))
+        self.save_agy_stop(rows, self.created + timedelta(seconds=10))
+        self.assertEqual(path.read_text(), content)
+
+        # GPTとClaudeは共通枠。ログへ後から追加された中間応答も使用に含める。
+        rows.append(dict(answer, step_index=2, model="openai/gpt-oss-120b",
+                         content="", tool_calls=[{"name": "read_file"}]))
+        self.save_agy_stop(rows, self.created + timedelta(seconds=20))
+        mixed = path.read_text()
+        self.assertIn("- **Gemini**: W: 80.0%", mixed)
+        self.assertIn("- **Claude**: W: 100.0%", mixed)
+        self.assertEqual(module.recover_quota_frontmatter(mixed), (quota, quota))
+
     def test_agy_only_current_turn_is_observed_and_no_quota_delay_is_added(self):
         module = self.modules["agy"]
         rows = self.rows("agy") + self.rows("agy", 2, "次の質問", "次の回答")

@@ -224,6 +224,9 @@ def rebuild(provider, session_id, output_dir=None, transcript=None, database=Non
                             seed["reported_cost"] = report
                     if provider in {"claude", "agy"}:
                         first, last = module.recover_quota_frontmatter(old_content)
+                        if provider == "agy":
+                            first = module.merge_first_quota(first, old_state.get("initial_quota") or {})
+                            last = module.merge_first_quota(last, old_state.get("final_quota") or {})
                         seed.update(initial_quota=first or old_state.get("initial_quota", {}),
                                     final_quota=last or old_state.get("final_quota", {}))
                     if provider == "agy":

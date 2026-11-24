@@ -71,7 +71,7 @@ Usageには全体・モデル別・回答別の`Cache: xx.x%`（キャッシュ�
 
 Codexはtranscript、Claudeは任意のstatusLine入力の`rate_limits`、Antigravityは`/quota`から取得します。weekly・5hなど取得できた枠だけを記録し、最初と最後の観測値を`first_observed`・`last_observed`へ保存します。「最初」は会話開始時ではなく最初に取得できた値です。
 
-Antigravityは新しい発言の保存時に`/quota`を呼び出します。本文のQuota欄では、Gemini・Claudeの利用枠ごとに、保存済みの`observed_at`から初回（First）と最新（Latest）の日時をJSTで表示します。観測時刻のない枠では時刻表示を省略します。
+Antigravityは新しい発言の保存時に`/quota`を呼び出します。本文のQuota欄とプロパティには、会話で使用を確認できたモデルの利用枠を記録します。ClaudeとGPTは共通の利用枠です。本文では、保存済みの`observed_at`から初回（First）と最新（Latest）の日時をJSTで表示します。観測時刻のない枠では時刻表示を省略します。
 
 ```markdown
 📊 **Quota**:
