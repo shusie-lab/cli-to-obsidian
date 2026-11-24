@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "4.6.1"
+__version__ = "4.6.2"
 
 import json
 import math
@@ -17,6 +17,7 @@ import sys
 import os
 import fcntl
 import hashlib
+import signal
 import subprocess
 import tempfile
 from bisect import bisect_right
@@ -2406,17 +2407,27 @@ def retrieve_quota() -> dict | None:
     このコマンドは会話ターンを作らず、quota も消費しない。失敗しても保存処理は続行する。
     """
     try:
-        completed = subprocess.run(
+        with subprocess.Popen(
             ["agy", "--output-format", "json", "--print=/quota"],
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
-            timeout=AGY_QUOTA_TIMEOUT_SECONDS,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(f"agy /quota が終了コード {completed.returncode} で失敗")
-        data = json.loads(completed.stdout)
+            start_new_session=True,
+        ) as process:
+            try:
+                stdout, _ = process.communicate(timeout=AGY_QUOTA_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                # 起動した言語サーバーも含めて終了し、出力パイプを再度待たない。
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                raise
+        if process.returncode != 0:
+            raise RuntimeError(f"agy /quota が終了コード {process.returncode} で失敗")
+        data = json.loads(stdout)
         if not isinstance(data, dict):
             raise RuntimeError("agy /quota がJSONオブジェクトを返しませんでした")
         if data.get("status") != "SUCCESS" or data.get("num_turns") != 0:
@@ -2540,7 +2551,7 @@ def refresh_agy_usage_metadata(content: str, usage: dict, messages: list[dict]) 
     body = content[match.end():]
     quota = re.match(QUOTA_SECTION_PATTERN, body)
     offset = quota.end() if quota else 0
-    section = re.sub(r"\A💰 \*\*Usage \(USD換算\)\*\*:[^\n]*\n\n?", "", body[offset:])
+    section = re.sub(r"\A\n*💰 \*\*Usage \(USD換算\)\*\*:[^\n]*\n\n?", "", body[offset:])
     body = body[:offset] + build_usage_section(usage) + "\n" + section
     updated = "---\n" + frontmatter + "\n".join(usage_frontmatter_fields(usage)) + "\n---\n" + body
     return refresh_answer_usage_metadata(updated, messages)
@@ -2896,6 +2907,14 @@ def handle_stop_event(hook_input: dict, *, observe_completion: bool = True) -> N
     _handle_stop_event(dict(hook_input, _stop_received_at=received_at))
 
 
+def session_quotas(state: dict, used_groups: set) -> tuple[dict, dict]:
+    def for_used_groups(key: str) -> dict:
+        return {group: windows for group, windows in (state.get(key) or {}).items()
+                if group in used_groups}
+
+    return for_used_groups("initial_quota"), for_used_groups("final_quota")
+
+
 @session_locked("conversationId")
 def _handle_stop_event(hook_input: dict) -> None:
     session_id = hook_input.get("conversationId", "")
@@ -2933,20 +2952,12 @@ def _handle_stop_event(hook_input: dict) -> None:
 
     all_messages = apply_stop_completion(all_messages, state, path.read_text(encoding="utf-8"), last_id, hook_input)
     new_messages = get_new_messages(all_messages, last_id)
-    if new_messages:
-        current_quota = retrieve_quota()
-        if current_quota:
-            state["initial_quota"] = merge_first_quota(state.get("initial_quota"), current_quota)
-            state["final_quota"] = merge_first_quota(current_quota, state.get("final_quota") or {})
 
     # Usageの対象には、本文を持たないツール呼び出しの応答も含まれる。
     response_models = {record["model"] for record in usage_records}
     response_models.update(message["model"] for message in all_messages if message["type"] == "agent_message")
     used_groups = {agy_quota_group(model) for model in response_models}
-    initial_quota = {group: windows for group, windows in (state.get("initial_quota") or {}).items()
-                     if group in used_groups}
-    final_quota = {group: windows for group, windows in (state.get("final_quota") or {}).items()
-                   if group in used_groups}
+    initial_quota, final_quota = session_quotas(state, used_groups)
     if new_messages:
         new_last_id, appended, updated = append_messages(
             path,
@@ -2995,9 +3006,9 @@ def _handle_stop_event(hook_input: dict) -> None:
         refreshed = update_markdown_metadata(refreshed, now_jst(), 0, state.get("last_id", last_id),
                                               initial_quota, final_quota)
     elif response_models:
-        # 既存ノートも対象にし、表示する枠が変わったときだけQuota欄を更新する。
-        saved_first, saved_last = recover_quota_frontmatter(content)
-        if saved_first.keys() != initial_quota.keys() or saved_last.keys() != final_quota.keys():
+        # state保存後に停止した場合も、次のStopでノートに反映する。
+        saved_quota = recover_quota_frontmatter(content)
+        if build_quota_frontmatter_fields(*saved_quota) != build_quota_frontmatter_fields(initial_quota, final_quota):
             refreshed = add_quota_metadata(refreshed, initial_quota, final_quota)
     usage = summarize_agy_usage(usage_records)
     if usage is not None:
@@ -3005,6 +3016,20 @@ def _handle_stop_event(hook_input: dict) -> None:
     if refreshed != content:
         atomic_write_md(path, refreshed)
     save_state(session_id, state)
+
+    # quota取得がStopフックの期限までに終わらなくても、本文と利用量は保存済み。
+    if new_messages:
+        current_quota = retrieve_quota()
+        if current_quota:
+            state["initial_quota"] = merge_first_quota(state.get("initial_quota"), current_quota)
+            state["final_quota"] = merge_first_quota(current_quota, state.get("final_quota") or {})
+            save_state(session_id, state)
+            observed_quota = session_quotas(state, used_groups)
+            if observed_quota != (initial_quota, final_quota):
+                refreshed = add_quota_metadata(refreshed, *observed_quota)
+                if usage is not None:
+                    refreshed = refresh_agy_usage_metadata(refreshed, usage, all_messages)
+                atomic_write_md(path, refreshed)
 
 
 # メイン

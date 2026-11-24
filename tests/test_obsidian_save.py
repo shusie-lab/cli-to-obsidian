@@ -1509,6 +1509,12 @@ Response text
         self.assertEqual(quota["claude"]["5h"]["remaining"], 35.0)
         self.assertEqual(quota["gemini"]["weekly"]["reset"], "2026-08-14 09:00")
 
+    def agy_quota_process(self, stdout):
+        process = mock.MagicMock(returncode=0)
+        process.__enter__.return_value = process
+        process.communicate.return_value = (stdout, None)
+        return process
+
     def test_agy_retrieve_quota_uses_read_only_official_command(self):
         response = {
             "status": "SUCCESS",
@@ -1522,17 +1528,30 @@ Response text
                 }],
             }]}},
         }
-        completed = mock.Mock(returncode=0, stdout=json.dumps(response))
+        process = self.agy_quota_process(json.dumps(response))
 
-        with mock.patch.object(agy_save.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(agy_save.subprocess, "Popen", return_value=process) as popen:
             quota = agy_save.retrieve_quota()
 
         self.assertEqual(quota["gemini"]["weekly"]["remaining"], 80.0)
         self.assertEqual(
-            run.call_args.args[0],
+            popen.call_args.args[0],
             ["agy", "--output-format", "json", "--print=/quota"],
         )
-        self.assertEqual(run.call_args.kwargs["timeout"], agy_save.AGY_QUOTA_TIMEOUT_SECONDS)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        process.communicate.assert_called_once_with(timeout=agy_save.AGY_QUOTA_TIMEOUT_SECONDS)
+
+    def test_agy_quota_timeout_kills_process_group_without_waiting_for_more_output(self):
+        process = self.agy_quota_process("")
+        process.pid = 12345
+        process.communicate.side_effect = subprocess.TimeoutExpired("agy", 20)
+        with mock.patch.object(agy_save.subprocess, "Popen", return_value=process), \
+                mock.patch.object(agy_save.os, "killpg") as killpg:
+            self.assertIsNone(agy_save.retrieve_quota())
+        killpg.assert_called_once_with(process.pid, agy_save.signal.SIGKILL)
+        process.communicate.assert_called_once()
+        process.__exit__.assert_called_once()
 
     def test_agy_rejects_malformed_quota_responses_without_raising(self):
         malformed_values = [
@@ -1552,35 +1571,43 @@ Response text
         for value in malformed_values:
             self.assertEqual(agy_save.parse_quota_data(value), {})
 
-        for stdout in (b"\xff", "[]"):
-            completed = mock.Mock(returncode=0, stdout=stdout)
-            with mock.patch.object(agy_save.subprocess, "run", return_value=completed):
+        for stdout in ("{", "[]"):
+            process = self.agy_quota_process(stdout)
+            with mock.patch.object(agy_save.subprocess, "Popen", return_value=process):
                 self.assertIsNone(agy_save.retrieve_quota())
 
     def test_agy_malformed_quota_does_not_block_conversation_save(self):
         transcript = self.test_dir / "agy-malformed-quota.jsonl"
         transcript.write_text("".join(json.dumps(row) + "\n" for row in [
             {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>質問</USER_REQUEST>"},
-            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "回答", "tool_calls": []},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "回答", "tool_calls": [],
+             "status": "DONE", "model": "gemini-3.8-flash-medium",
+             "input_tokens": 10, "cache_read_tokens": 0, "output_tokens": 20},
         ]), encoding="utf-8")
-        completed = mock.Mock(returncode=0, stdout=json.dumps([]))
+        process = self.agy_quota_process("[]")
         hook = {
             "conversationId": "agy-malformed-quota",
             "transcriptPath": str(transcript),
             "workspacePaths": [str(self.test_dir)],
         }
-        with mock.patch.object(agy_save.subprocess, "run", return_value=completed):
-            agy_save.handle_stop_event(hook)
 
-        state = agy_save.load_state(hook["conversationId"])
-        content = Path(state["output_path"]).read_text(encoding="utf-8")
-        self.assertIn("質問", content)
-        self.assertIn("回答", content)
-        self.assertNotIn("📊 **Quota**:", content)
+        def start_quota(*args, **kwargs):
+            state = agy_save.load_state(hook["conversationId"])
+            content = Path(state["output_path"]).read_text(encoding="utf-8")
+            self.assertTrue(state["last_id"])
+            self.assertIn("質問", content)
+            self.assertIn("回答", content)
+            self.assertIn("Usage: 30 tok", content)
+            self.assertNotIn("📊 **Quota**:", content)
+            return process
+
+        with mock.patch.object(agy_save.subprocess, "Popen", side_effect=start_quota) as popen:
+            agy_save.handle_stop_event(hook)
+        popen.assert_called_once()
 
     def test_agy_quota_is_saved_in_public_saver(self):
         def quota_response(weekly_remaining, five_hour_remaining):
-            return mock.Mock(returncode=0, stdout=json.dumps({
+            return self.agy_quota_process(json.dumps({
                 "status": "SUCCESS",
                 "num_turns": 0,
                 "command": {"data": {"groups": [{
@@ -1611,7 +1638,7 @@ Response text
 
         with mock.patch.object(
             agy_save.subprocess,
-            "run",
+            "Popen",
             side_effect=[quota_response(90, 60), quota_response(80, 50)],
         ):
             agy_save.handle_stop_event(hook)
@@ -1671,6 +1698,30 @@ Response text
         self.assertEqual(state_after.get("final_quota"), state.get("final_quota"))
         self.assertEqual(Path(state_after["output_path"]).read_text(encoding="utf-8"), content_before)
 
+    def test_agy_next_stop_restores_newer_quota_from_state(self):
+        session_id = "agy-interrupted-quota-write"
+        transcript = self.test_dir / "agy-interrupted-quota-write.jsonl"
+        transcript.write_text(json.dumps({
+            "step_index": 1, "type": "PLANNER_RESPONSE", "content": "既存回答",
+            "model": "gemini-3.8-flash-medium",
+        }) + "\n", encoding="utf-8")
+        hook = {"conversationId": session_id, "transcriptPath": str(transcript)}
+        first = {"gemini": {"weekly": {"remaining": 90.0}}}
+        latest = {"gemini": {"weekly": {"remaining": 80.0}}}
+        with mock.patch.object(agy_save, "retrieve_quota", return_value=first):
+            agy_save.handle_stop_event(hook)
+        state = agy_save.load_state(session_id)
+        path = Path(state["output_path"])
+        self.assertIn("W: 90.0%", path.read_text(encoding="utf-8"))
+
+        state["final_quota"] = latest
+        agy_save.save_state(session_id, state)
+        with mock.patch.object(agy_save, "retrieve_quota", side_effect=AssertionError("quota refresh")):
+            agy_save.handle_stop_event(hook)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("90.0% ➔ 80.0%", content)
+        self.assertEqual(content.count("既存回答"), 1)
+
     def test_quota_frontmatter_roundtrip(self):
         first = {"gemini": {"weekly": {"remaining": 90.0, "reset": "2026-08-14 09:00",
                                       "observed_at": "2026-08-07T10:00:00+09:00"}}}
@@ -1712,7 +1763,7 @@ Response text
         }
 
         def quota_response(remaining):
-            return mock.Mock(returncode=0, stdout=json.dumps({
+            return self.agy_quota_process(json.dumps({
                 "status": "SUCCESS",
                 "num_turns": 0,
                 "command": {"data": {"groups": [{
@@ -1727,7 +1778,7 @@ Response text
 
         first = agy_save.parse_datetime("2026-11-19T23:05:00+09:00")
         latest = agy_save.parse_datetime("2026-11-20T00:20:00+09:00")
-        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(90)), \
+        with mock.patch.object(agy_save.subprocess, "Popen", return_value=quota_response(90)), \
                 mock.patch.object(agy_save, "now_jst", return_value=first):
             agy_save.handle_stop_event(hook)
         output_path = Path(agy_save.load_state(session_id)["output_path"])
@@ -1739,7 +1790,7 @@ Response text
              "model": "gemini-3.8-flash-medium"},
         ])
         transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-        with mock.patch.object(agy_save.subprocess, "run", return_value=quota_response(80)), \
+        with mock.patch.object(agy_save.subprocess, "Popen", return_value=quota_response(80)), \
                 mock.patch.object(agy_save, "now_jst", return_value=latest):
             agy_save.handle_stop_event(hook)
 

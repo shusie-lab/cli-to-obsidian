@@ -5,6 +5,13 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [4.6.2] - 2026-11-25
+
+### Fixed
+
+- Antigravityの利用枠取得を制御端末から切り離し、バックグラウンドでStopフックが停止する問題を修正
+- 利用枠の取得前に会話本文とUsageを保存し、取得が中断されても会話を残す
+
 ## [4.6.1] - 2026-11-24
 
 ### Fixed
