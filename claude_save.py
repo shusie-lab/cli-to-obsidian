@@ -8,7 +8,7 @@ Claude Code CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "4.6.2"
+__version__ = "4.6.3"
 
 from bisect import bisect_right
 import json
@@ -1900,27 +1900,47 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
 # END GENERATED: usage-summary
 
 # BEGIN GENERATED: note-metadata
+FRONTMATTER = re.compile(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", re.M | re.S)
+
+
+def frontmatter_key(line: str) -> str | None:
+    match = re.match(r"""^(['"]?)([a-zA-Z0-9_-]+)\1[ \t]*:(?=[ \t]|$)""", line)
+    return match[2] if match else None
+
+
+def build_note_fields(
+    session_id: str, cwd: str, created: datetime, *,
+    source: str | None = None, tags: list[str] | None = None,
+) -> dict[str, list[str]]:
+    source = SOURCE_NAME if source is None else source
+    tag_lines = ["tags:"]
+    for tag in tags if tags is not None else ["ai-conversation", source]:
+        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
+        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
+        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
+        tag_lines.append(f"  - {value}")
+    return {
+        "source": [f"source: {source}"],
+        "session_id": [f"session_id: {yaml_quote(session_id)}"],
+        "project": [f"project: {yaml_quote(cwd)}"],
+        "created": [f"created: {yaml_quote(format_iso(created))}"],
+        "tags": tag_lines,
+    }
+
+
 def build_common_frontmatter(
     session_id: str, cwd: str, created: datetime, modified: datetime,
     count: int, title: str | None = None, *, source: str | None = None,
     tags: list[str] | None = None, extra_fields=(),
 ) -> str:
-    source = SOURCE_NAME if source is None else source
+    fields = build_note_fields(session_id, cwd, created, source=source, tags=tags)
     lines = [
-        "---", f"source: {source}",
+        "---", *fields["source"],
         *([f"title: {yaml_quote(title)}"] if title is not None else []),
-        f"session_id: {yaml_quote(session_id)}", f"project: {yaml_quote(cwd)}",
-        f"created: {yaml_quote(format_iso(created))}",
-        f"modified: {yaml_quote(format_iso(modified))}", "tags:",
+        *fields["session_id"], *fields["project"], *fields["created"],
+        f"modified: {yaml_quote(format_iso(modified))}", *fields["tags"],
+        f"message_count: {count}", *extra_fields, "---",
     ]
-    for tag in tags if tags is not None else ["ai-conversation", source]:
-        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
-        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
-        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
-        lines.append(f"  - {value}")
-    lines.append(f"message_count: {count}")
-    lines.extend(extra_fields)
-    lines.append("---")
     return "\n".join(lines) + "\n\n"
 
 
@@ -1934,8 +1954,11 @@ def note_output_path(session_id: str, cwd: str, created: datetime) -> Path:
 
 def read_markdown_metadata(path: Path) -> dict:
     """標準ライブラリで、このプロジェクトのfrontmatterの識別項目だけを読む。"""
-    content = path.read_text(encoding="utf-8")
-    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    return parse_markdown_metadata(path.read_text(encoding="utf-8"))
+
+
+def parse_markdown_metadata(content: str) -> dict:
+    match = FRONTMATTER.match(content)
     if not match:
         return {}
     result = {}
@@ -2551,6 +2574,11 @@ def recover_incremental_state(session_id: str, cwd: str, state: dict, cursor_key
     return state
 
 
+def incremental_note_fields(session_id: str, cwd: str, state: dict) -> dict[str, list[str]]:
+    return build_note_fields(session_id, state.get("cwd", cwd), parse_datetime(state.get("start_time"), now_jst()),
+                             source=state.get("source"), tags=state.get("tags"))
+
+
 def ensure_incremental_note(session_id: str, cwd: str, state: dict, cursor_key: str,
                             read_cursor, has_body: bool, create_note):
     """保存済みノートの識別を保持し、本文がある場合だけ新規作成・再作成する。"""
@@ -2644,31 +2672,30 @@ def update_frontmatter_fields(
     *,
     extra_removed_keys: tuple[str, ...] = (),
     extra_fields: tuple[str, ...] = (),
+    note_fields: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], str] | None:
     """frontmatterの共通項目を更新し、項目行と本文を返す。"""
-    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    fm_match = FRONTMATTER.match(content)
     if not fm_match:
         return None
 
     fm_lines = fm_match.group(1).splitlines()
-    body_text = content[fm_match.end():]
-    title_match = re.search(r"(?m)^# (?:User: )?(.+?)\s*$", body_text)
-    title = unescape_markdown_heading(title_match.group(1)) if title_match else None
+    body_text = re.sub(r"\A(?:[ \t]*\n)+", "", content[fm_match.end():])
+    existing_keys = set()
     keys_to_remove = {"modified", "message_count", *extra_removed_keys}
-    if title is not None:
-        keys_to_remove.add("title")
     new_fm_lines = []
     skip_list = False
     old_count = 0
     for line in fm_lines:
-        if line.startswith("message_count:"):
+        key = frontmatter_key(line)
+        if key == "message_count":
             try:
                 old_count = int(line.split(":", 1)[1].strip())
             except ValueError:
                 pass
-        key_match = re.match(r"^([a-zA-Z0-9_-]+):", line)
-        if key_match:
-            if key_match.group(1) in keys_to_remove:
+        if key is not None:
+            existing_keys.add(key)
+            if key in keys_to_remove:
                 skip_list = True
                 continue
             skip_list = False
@@ -2681,8 +2708,14 @@ def update_frontmatter_fields(
             skip_list = False
         new_fm_lines.append(line)
 
-    if title is not None:
-        new_fm_lines.append(f"title: {yaml_quote(title)}")
+    if "title" not in existing_keys:
+        title_match = re.search(r"(?m)^# (?:User: )?(.+?)\s*$", body_text)
+        if title_match:
+            title = unescape_markdown_heading(title_match.group(1))
+            new_fm_lines.append(f"title: {yaml_quote(title)}")
+    for key, lines in (note_fields or {}).items():
+        if key not in existing_keys:
+            new_fm_lines.extend(lines)
     new_fm_lines.append(f"modified: {yaml_quote(format_iso(modified_dt))}")
     new_fm_lines.append(f"message_count: {old_count + appended}")
     new_fm_lines.extend(extra_fields)
@@ -2720,6 +2753,8 @@ def update_markdown_metadata(
     usage: dict | None = None,
     initial_quota: dict | None = None,
     final_quota: dict | None = None,
+    *,
+    note_fields: dict[str, list[str]] | None = None,
 ) -> str:
     """本文のfrontmatterとcursorを更新し、書き込み前の全文を返す。"""
     preserved_usage = []
@@ -2738,6 +2773,7 @@ def update_markdown_metadata(
         source, modified_dt, appended,
         extra_fields=tuple(build_quota_frontmatter_fields(initial_quota, final_quota)
                            + (build_usage_frontmatter_fields(usage) if usage is not None else preserved_usage)),
+        note_fields=note_fields,
     )
     if updated is None:
         return content
@@ -2772,13 +2808,15 @@ def append_messages(
     usage: dict | None = None,
     initial_quota: dict | None = None,
     final_quota: dict | None = None,
+    *,
+    note_fields: dict[str, list[str]] | None = None,
 ) -> tuple[int, bool]:
     content = path.read_text(encoding="utf-8")
     rendered, appended, changed = render_incremental_messages(content, messages)
     if not changed:
         return 0, False
     final_content = update_markdown_metadata(rendered, modified_dt, appended, last_line,
-                                             usage, initial_quota, final_quota)
+                                              usage, initial_quota, final_quota, note_fields=note_fields)
     atomic_write_md(path, final_content)
     return appended, True
 
@@ -2908,6 +2946,7 @@ def _save_claude_parent(hook_input: dict, child_snapshots=None) -> None:
             usage=current_usage,
             initial_quota=state.get("initial_quota"),
             final_quota=state.get("final_quota"),
+            note_fields=incremental_note_fields(session_id, cwd, state),
         )
         if updated:
             state["last_line"] = new_last_line

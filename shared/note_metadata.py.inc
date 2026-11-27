@@ -1,24 +1,44 @@
+FRONTMATTER = re.compile(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", re.M | re.S)
+
+
+def frontmatter_key(line: str) -> str | None:
+    match = re.match(r"""^(['"]?)([a-zA-Z0-9_-]+)\1[ \t]*:(?=[ \t]|$)""", line)
+    return match[2] if match else None
+
+
+def build_note_fields(
+    session_id: str, cwd: str, created: datetime, *,
+    source: str | None = None, tags: list[str] | None = None,
+) -> dict[str, list[str]]:
+    source = SOURCE_NAME if source is None else source
+    tag_lines = ["tags:"]
+    for tag in tags if tags is not None else ["ai-conversation", source]:
+        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
+        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
+        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
+        tag_lines.append(f"  - {value}")
+    return {
+        "source": [f"source: {source}"],
+        "session_id": [f"session_id: {yaml_quote(session_id)}"],
+        "project": [f"project: {yaml_quote(cwd)}"],
+        "created": [f"created: {yaml_quote(format_iso(created))}"],
+        "tags": tag_lines,
+    }
+
+
 def build_common_frontmatter(
     session_id: str, cwd: str, created: datetime, modified: datetime,
     count: int, title: str | None = None, *, source: str | None = None,
     tags: list[str] | None = None, extra_fields=(),
 ) -> str:
-    source = SOURCE_NAME if source is None else source
+    fields = build_note_fields(session_id, cwd, created, source=source, tags=tags)
     lines = [
-        "---", f"source: {source}",
+        "---", *fields["source"],
         *([f"title: {yaml_quote(title)}"] if title is not None else []),
-        f"session_id: {yaml_quote(session_id)}", f"project: {yaml_quote(cwd)}",
-        f"created: {yaml_quote(format_iso(created))}",
-        f"modified: {yaml_quote(format_iso(modified))}", "tags:",
+        *fields["session_id"], *fields["project"], *fields["created"],
+        f"modified: {yaml_quote(format_iso(modified))}", *fields["tags"],
+        f"message_count: {count}", *extra_fields, "---",
     ]
-    for tag in tags if tags is not None else ["ai-conversation", source]:
-        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
-        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
-        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
-        lines.append(f"  - {value}")
-    lines.append(f"message_count: {count}")
-    lines.extend(extra_fields)
-    lines.append("---")
     return "\n".join(lines) + "\n\n"
 
 
@@ -32,8 +52,11 @@ def note_output_path(session_id: str, cwd: str, created: datetime) -> Path:
 
 def read_markdown_metadata(path: Path) -> dict:
     """標準ライブラリで、このプロジェクトのfrontmatterの識別項目だけを読む。"""
-    content = path.read_text(encoding="utf-8")
-    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    return parse_markdown_metadata(path.read_text(encoding="utf-8"))
+
+
+def parse_markdown_metadata(content: str) -> dict:
+    match = FRONTMATTER.match(content)
     if not match:
         return {}
     result = {}

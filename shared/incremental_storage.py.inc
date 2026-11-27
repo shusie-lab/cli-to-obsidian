@@ -21,6 +21,11 @@ def recover_incremental_state(session_id: str, cwd: str, state: dict, cursor_key
     return state
 
 
+def incremental_note_fields(session_id: str, cwd: str, state: dict) -> dict[str, list[str]]:
+    return build_note_fields(session_id, state.get("cwd", cwd), parse_datetime(state.get("start_time"), now_jst()),
+                             source=state.get("source"), tags=state.get("tags"))
+
+
 def ensure_incremental_note(session_id: str, cwd: str, state: dict, cursor_key: str,
                             read_cursor, has_body: bool, create_note):
     """保存済みノートの識別を保持し、本文がある場合だけ新規作成・再作成する。"""

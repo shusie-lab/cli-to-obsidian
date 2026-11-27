@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -144,6 +145,46 @@ class SaverContracts(unittest.TestCase):
                 metadata = module.read_markdown_metadata(path)
                 self.assertEqual(metadata["source"], before_source)
                 self.assertIn("custom-tag", metadata["tags"])
+                self.assertIn("次の回答", path.read_text())
+
+    def test_followup_keeps_manual_note_properties_and_updates_message_count(self):
+        for provider in PROVIDERS:
+            with self.subTest(provider=provider):
+                rows = self.rows(provider)
+                path = self.save(provider, rows)
+                custom = (
+                    "'title' : >-\n  手動タイトル\n  2行目",
+                    "project: '/manual/project' # コメント",
+                    "aliases:\n- 別名",
+                    "custom field:\n  message_count: 99",
+                )
+                content = path.read_text().replace('title: "質問"', custom[0])
+                content = content.replace('project: "/tmp/example"', "\n".join(custom[1:]))
+                path.write_text(content)
+                rows += self.rows(provider, 2, user="次の質問", answer="次の回答")
+                self.assertEqual(self.save(provider, rows), path)
+                content = path.read_text()
+                for field in custom:
+                    self.assertIn(field + "\n", content)
+                self.assertNotIn('title: "質問"', content)
+                self.assertIn("\nmessage_count: 4\n", content)
+                self.assertIn("次の回答", content)
+                self.assertEqual(self.save(provider, rows), path)
+                self.assertEqual(path.read_text(), content)
+
+    def test_followup_recreates_missing_note_properties(self):
+        for provider, module in self.modules.items():
+            with self.subTest(provider=provider):
+                rows = self.rows(provider)
+                path = self.save(provider, rows)
+                before = module.read_markdown_metadata(path)
+                pattern = r"(?m)^(?:title|project|source|created|session_id|tags):[^\n]*\n(?:  - [^\n]*\n)*"
+                content, removed = re.subn(pattern, "", path.read_text())
+                self.assertEqual(removed, 6)
+                path.write_text(content)
+                rows += self.rows(provider, 2, user="次の質問", answer="次の回答")
+                self.assertEqual(self.save(provider, rows), path)
+                self.assertEqual(module.read_markdown_metadata(path), before)
                 self.assertIn("次の回答", path.read_text())
 
     def test_state_loss_preserves_original_created_and_prevents_duplicate_body(self):

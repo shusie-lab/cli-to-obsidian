@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """OpenCode プラグインから渡された会話を Obsidian に保存する。"""
 
-__version__ = "4.6.2"
+__version__ = "4.6.3"
 
 import argparse
 import sys
@@ -655,6 +655,37 @@ def cleanup_old_states() -> None:
 def atomic_write(path: Path, content: str) -> None:
     """既存snapshot saver APIを共通atomic writeへ接続する。"""
     atomic_write_text(path, content)
+
+
+def merge_snapshot_frontmatter(existing: str, rendered: str) -> str:
+    """既存のプロパティを行ごと引き継ぎ、保存処理が管理する項目だけを更新する。"""
+    old = FRONTMATTER.match(existing)
+    new = FRONTMATTER.match(rendered)
+    if old is None or new is None:
+        return rendered
+
+    dynamic_keys = {"modified", "message_count", "usage", "reported_cost"}
+    kept = []
+    existing_keys = set()
+    skip = False
+    for line in old[1].splitlines():
+        key = frontmatter_key(line)
+        if key is not None:
+            skip = key in dynamic_keys
+            if not skip:
+                existing_keys.add(key)
+        elif line and not line.startswith((" ", "\t", "- ", "#")):
+            skip = False
+        if not skip or not line.strip() or line.startswith("#"):
+            kept.append(line)
+
+    for line in new[1].splitlines():
+        key = frontmatter_key(line)
+        if key is not None:
+            skip = key in existing_keys
+        if not skip:
+            kept.append(line)
+    return rendered[:new.start(1)] + "\n".join(kept) + "\n" + rendered[new.end(1):]
 
 
 def read_payload(path: str | None) -> dict:
@@ -1378,27 +1409,47 @@ def _merge_usage_summaries(first: dict | None, second: dict | None) -> dict | No
 # END GENERATED: usage-summary
 
 # BEGIN GENERATED: note-metadata
+FRONTMATTER = re.compile(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", re.M | re.S)
+
+
+def frontmatter_key(line: str) -> str | None:
+    match = re.match(r"""^(['"]?)([a-zA-Z0-9_-]+)\1[ \t]*:(?=[ \t]|$)""", line)
+    return match[2] if match else None
+
+
+def build_note_fields(
+    session_id: str, cwd: str, created: datetime, *,
+    source: str | None = None, tags: list[str] | None = None,
+) -> dict[str, list[str]]:
+    source = SOURCE_NAME if source is None else source
+    tag_lines = ["tags:"]
+    for tag in tags if tags is not None else ["ai-conversation", source]:
+        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
+        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
+        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
+        tag_lines.append(f"  - {value}")
+    return {
+        "source": [f"source: {source}"],
+        "session_id": [f"session_id: {yaml_quote(session_id)}"],
+        "project": [f"project: {yaml_quote(cwd)}"],
+        "created": [f"created: {yaml_quote(format_iso(created))}"],
+        "tags": tag_lines,
+    }
+
+
 def build_common_frontmatter(
     session_id: str, cwd: str, created: datetime, modified: datetime,
     count: int, title: str | None = None, *, source: str | None = None,
     tags: list[str] | None = None, extra_fields=(),
 ) -> str:
-    source = SOURCE_NAME if source is None else source
+    fields = build_note_fields(session_id, cwd, created, source=source, tags=tags)
     lines = [
-        "---", f"source: {source}",
+        "---", *fields["source"],
         *([f"title: {yaml_quote(title)}"] if title is not None else []),
-        f"session_id: {yaml_quote(session_id)}", f"project: {yaml_quote(cwd)}",
-        f"created: {yaml_quote(format_iso(created))}",
-        f"modified: {yaml_quote(format_iso(modified))}", "tags:",
+        *fields["session_id"], *fields["project"], *fields["created"],
+        f"modified: {yaml_quote(format_iso(modified))}", *fields["tags"],
+        f"message_count: {count}", *extra_fields, "---",
     ]
-    for tag in tags if tags is not None else ["ai-conversation", source]:
-        # Preserve the conventional plain form where it is an unambiguous YAML scalar.
-        safe = re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(tag))
-        value = str(tag) if safe and str(tag).lower() not in {"true", "false", "null", "yes", "no", "on", "off"} else yaml_quote(tag)
-        lines.append(f"  - {value}")
-    lines.append(f"message_count: {count}")
-    lines.extend(extra_fields)
-    lines.append("---")
     return "\n".join(lines) + "\n\n"
 
 
@@ -1412,8 +1463,11 @@ def note_output_path(session_id: str, cwd: str, created: datetime) -> Path:
 
 def read_markdown_metadata(path: Path) -> dict:
     """標準ライブラリで、このプロジェクトのfrontmatterの識別項目だけを読む。"""
-    content = path.read_text(encoding="utf-8")
-    match = re.match(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    return parse_markdown_metadata(path.read_text(encoding="utf-8"))
+
+
+def parse_markdown_metadata(content: str) -> dict:
+    match = FRONTMATTER.match(content)
     if not match:
         return {}
     result = {}
@@ -1975,9 +2029,9 @@ def find_existing_md(session_id: str) -> Path | None:
 # END GENERATED: find-existing-markdown
 
 # BEGIN GENERATED: full-session-search
-def recover_snapshot_metadata(path: Path | None, state: dict, created: object) -> dict:
+def recover_snapshot_metadata(content: str, state: dict, created: object) -> dict:
     """既存frontmatterを優先し、state消失や環境設定変更でもノートの識別を保持する。"""
-    metadata = read_markdown_metadata(path) if path is not None and path.exists() else {}
+    metadata = parse_markdown_metadata(content)
     source = metadata.get("source") or state.get("source") or SOURCE_NAME
     return {
         "created": parse_datetime(metadata.get("created") or state.get("created") or created),
@@ -2228,7 +2282,8 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
         mark_save_skipped("no_content")
         logger.debug("本文がないため保存をスキップ %s", session_id[:8])
         return output_path
-    metadata = recover_snapshot_metadata(output_path, state, payload.get("created"))
+    existing = output_path.read_text(encoding="utf-8") if output_path is not None and output_path.exists() else ""
+    metadata = recover_snapshot_metadata(existing, state, payload.get("created"))
     hash_messages = [
         {
             "id": item.get("id", ""),
@@ -2258,10 +2313,11 @@ def _handle_payload(payload: Dict[str, Any]) -> Optional[Path]:
     created = metadata["created"]
     if output_path is None:
         output_path = note_output_path(session_id, cwd, created)
-    atomic_write(output_path, render_markdown(
+    rendered = render_markdown(
         session_id, cwd, created, messages, usage_records=usage_records.values(),
         source=metadata["source"], tags=metadata["tags"]
-    ))
+    )
+    atomic_write(output_path, merge_snapshot_frontmatter(existing, rendered))
     state.update({
         "output_path": str(output_path),
         "created": format_iso(created),

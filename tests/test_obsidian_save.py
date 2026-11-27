@@ -1722,6 +1722,28 @@ Response text
         self.assertIn("90.0% ➔ 80.0%", content)
         self.assertEqual(content.count("既存回答"), 1)
 
+    def test_agy_preserves_title_edited_while_fetching_quota(self):
+        session_id = "agy-title-during-quota"
+        transcript = self.test_dir / (session_id + ".jsonl")
+        rows = [
+            {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>最初の質問</USER_REQUEST>"},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "回答", "model": "gemini-3.8-flash-medium"},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        def edit_title_and_report_quota():
+            path = Path(agy_save.load_state(session_id)["output_path"])
+            content = path.read_text(encoding="utf-8")
+            self.assertIn('title: "最初の質問"', content)
+            path.write_text(content.replace('title: "最初の質問"', 'title: "手動タイトル"'), encoding="utf-8")
+            return {"gemini": {"weekly": {"remaining": 90.0}}}
+
+        with mock.patch.object(agy_save, "retrieve_quota", side_effect=edit_title_and_report_quota):
+            agy_save.handle_stop_event({"conversationId": session_id, "transcriptPath": str(transcript)})
+        content = Path(agy_save.load_state(session_id)["output_path"]).read_text(encoding="utf-8")
+        self.assertIn('title: "手動タイトル"', content)
+        self.assertIn("W: 90.0%", content)
+
     def test_quota_frontmatter_roundtrip(self):
         first = {"gemini": {"weekly": {"remaining": 90.0, "reset": "2026-08-14 09:00",
                                       "observed_at": "2026-08-07T10:00:00+09:00"}}}

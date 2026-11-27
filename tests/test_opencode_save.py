@@ -473,7 +473,9 @@ class TestOpenCodeSave(unittest.TestCase):
             "messages": first_turn + second_turn,
         })
         self.assertEqual([message["id"] for message in opencode_save.load_state(session_id)["messages"]], ["u1", "a1", "u2", "a2"])
-        self.assertLess(path.read_text(encoding="utf-8").index("質問1"), path.read_text(encoding="utf-8").index("質問2"))
+        _, frontmatter, body = path.read_text(encoding="utf-8").split("---\n", 2)
+        self.assertIn('title: "質問2"', frontmatter)
+        self.assertLess(body.index("質問1"), body.index("質問2"))
 
     def test_full_sync_prefers_ids_when_assistant_text_repeats(self):
         def message(message_id, role, text, timestamp):

@@ -5,6 +5,12 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [4.6.3] - 2026-11-27
+
+### Fixed
+
+- 5つのCLIの会話追記で、手動編集したタイトルやプロジェクト、独自のプロパティを保持し、欠けている標準のプロパティを補う
+
 ## [4.6.2] - 2026-11-25
 
 ### Fixed

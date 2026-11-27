@@ -195,7 +195,7 @@ class PiSaveTests(unittest.TestCase):
                 self.assertEqual(self.pi.handle_payload(p), path)
                 content = path.read_text()
                 self.assertNotIn('Lunaの回答', content)
-                self.assertNotIn('title:', content)
+                self.assertIn('title: "質問"', content)
                 self.assertNotIn('[!QUESTION]', content)
                 self.assertNotIn('[!NOTE]', content)
                 self.assertIn('message_count: 0', content)

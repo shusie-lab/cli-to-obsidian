@@ -43,6 +43,8 @@ export OBSIDIAN_SOURCE="codex-work"
 
 プロジェクト名がない場合は `{YYYYMMDD}_{HHMMSS}_{session_id}.md` です。`session_id` はファイル名として安全な文字に変換されます。過去に保存された先頭8文字形式のファイルも自動探索され、追記が継続されます。
 
+通常の会話保存では、`title` や `project`、タグ、独自に追加したプロパティを保持します。標準プロパティのキーがなければ、会話履歴や保存状態から補います。更新日時・メッセージ数・Usage・Quota などは保存時に更新します。
+
 ## Templaterテンプレート（任意）
 
 会話記録のファイル名を変えずに、Obsidian上ではfrontmatterの`title`を使って会話を探したり表示したりするための、[ChatLogLink.md](../templates/templater/ChatLogLink.md)と[ChatLogリンク表示名更新.md](../templates/templater/ChatLogリンク表示名更新.md)を使えます。ObsidianのTemplaterプラグインを有効にし、設定したテンプレートフォルダへファイルをコピーしてください。たとえば両方を`~/Downloads`へダウンロードし、テンプレートフォルダが`~/obsidian/Templates`の場合は次のようにします。
