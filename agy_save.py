@@ -8,7 +8,7 @@ Antigravity CLI の会話履歴を Obsidian に自動保存するフックスク
   - Stop : セッション終了時（またはアイドル移行時）に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "4.6.3"
+__version__ = "4.6.4"
 
 import json
 import math
@@ -2923,7 +2923,7 @@ def apply_stop_completion(messages: list[dict], state: dict, content: str,
         pending = state.get("pending_answer_completion") == key
         if fresh or pending:
             normal_stop = (hook_input.get("fullyIdle") is True
-                           and hook_input.get("terminationReason") == "model_stop"
+                           and hook_input.get("terminationReason") in ("model_stop", "NO_TOOL_CALL")
                            and not hook_input.get("error"))
             if normal_stop:
                 completions.setdefault(key, received_at)

@@ -893,14 +893,16 @@ class SaverContracts(unittest.TestCase):
             return None
         with patch.object(module, "now_jst", side_effect=lambda: clock[0]), patch.object(module, "retrieve_quota", side_effect=slow_quota):
             module.handle_stop_event({"conversationId": "delay", "transcriptPath": str(transcript),
-                                      "fullyIdle": True, "terminationReason": "model_stop"})
+                                      "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"})
         content = Path(module.load_state("delay")["output_path"]).read_text()
         self.assertEqual(content.count("回答所要時間: 取得不可"), 1)
         self.assertEqual(content.count("回答所要時間: 2分15秒"), 1)
 
     def test_agy_busy_error_or_incomplete_stop_does_not_complete_answer(self):
-        for fields in ({"fullyIdle": False}, {"terminationReason": "error"},
-                       {"terminationReason": "max_steps_exceeded"}, {"error": "failed"},
+        for fields in ({"terminationReason": "NO_TOOL_CALL", "fullyIdle": False},
+                       {"terminationReason": "NO_TOOL_CALL", "error": "failed"},
+                       {"terminationReason": "USER_CANCELED"}, {"terminationReason": "MAX_INVOCATIONS"},
+                       {"terminationReason": "error"}, {"terminationReason": "max_steps_exceeded"},
                        {"fullyIdle": None}, {"terminationReason": None}):
             with self.subTest(fields=fields):
                 session = "not-complete-" + str(len(list(self.root.glob("not-complete-*.jsonl"))))

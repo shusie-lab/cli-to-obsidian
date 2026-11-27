@@ -5,6 +5,12 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) を参考にし、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
+## [4.6.4] - 2026-11-27
+
+### Fixed
+
+- Antigravity CLIで正常終了した回答の所要時間が「取得不可」になる問題を修正
+
 ## [4.6.3] - 2026-11-27
 
 ### Fixed

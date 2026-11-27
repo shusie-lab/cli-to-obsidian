@@ -3,7 +3,7 @@ from __future__ import annotations
 
 """Pi extensionから渡された会話を Obsidian に保存する。"""
 
-__version__ = "4.6.3"
+__version__ = "4.6.4"
 
 import argparse
 import sys

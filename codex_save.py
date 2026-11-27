@@ -8,7 +8,7 @@ Codex CLI の会話履歴を Obsidian に自動保存するフックスクリプ
   - Stop : ターン終了時に Markdown ファイルの作成・追記を行う
 """
 
-__version__ = "4.6.3"
+__version__ = "4.6.4"
 
 from decimal import Decimal
 from bisect import bisect_right

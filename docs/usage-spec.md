@@ -90,7 +90,7 @@ quotaはアカウント全体の残量です。差分を会話の消費量とは
 | Claude Code | `turn_duration`終了記録。Stopより後の記録は次の保存で反映。 |
 | OpenCode | 回答の`time.completed`。 |
 | Pi | 回答終了時に履歴へ保存されるentryの時刻。 |
-| Antigravity | `model_stop`・`fullyIdle: true`・エラーなしのStop受信時刻。hook起動までの遅れは含み、ロック待ち・quota取得などの保存処理は含みません。 |
+| Antigravity | 終了理由が `model_stop` または `NO_TOOL_CALL` で、`fullyIdle: true` かつエラーなしのStop受信時刻。hook起動までの遅れは含み、ロック待ち・quota取得などの保存処理は含みません。 |
 
 開始・完了時刻がない、不正、逆転している場合は`取得不可`とします。Antigravityの観測済み時刻はstate・ノート内コメントに保持し、再通知・復旧・再構成でも引き継ぎます。未観測の過去履歴に現在時刻を付けることはありません。
 
